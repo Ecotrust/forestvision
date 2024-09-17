@@ -1,0 +1,32 @@
+# Ignore data files and directories
+*.tif
+*.img
+*.png
+*.pth
+*.lyr
+*vat.cpg
+*vat.dbf
+*.aux.xml
+*.img.xml
+*.zip
+*.rar
+*log_*
+*.log
+data/*
+logs/*
+lightning_logs/*
+
+# Ignore Python compiled files
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+
+# Ignore virtual environment files
+env/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore IDE files
+.vscode/

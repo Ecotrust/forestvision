@@ -1,0 +1,45 @@
+name: forestsegnet2
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - earthengine-api
+  - folium
+  - geopandas
+  - geemap
+  - jupyter
+  - kornia
+  - matplotlib
+  - numpy
+  - pandas
+  - python=3.10
+  - pytorch=2.2.2
+  - pytorch-cuda=11.8
+  - torchvision==0.17.2
+  - lightning
+  - pydantic=1.9.2
+  - rasterio
+  - rasterstats
+  - richdem
+  - rio-cogeo
+  - scikit-image
+  - scikit-learn
+  - scipy
+  - seaborn
+  - shapely
+  - sphinx
+  - torchvision
+  - torchmetrics 
+  - tqdm
+  - pysheds
+  - xarray
+  - xee
+  - pip
+  - pip:
+      - torchgeo[all]
+      - geetools==0.6.14
+      - python-dotenv>=0.5.1
