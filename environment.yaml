@@ -1,4 +1,4 @@
-name: forestsegnet2
+name: forestvision
 
 channels:
   - pytorch
@@ -8,10 +8,7 @@ channels:
 
 dependencies:
   - earthengine-api
-  - folium
   - geopandas
-  - geemap
-  - jupyter
   - kornia
   - matplotlib
   - numpy
@@ -20,26 +17,13 @@ dependencies:
   - pytorch=2.2.2
   - pytorch-cuda=11.8
   - torchvision==0.17.2
-  - lightning
-  - pydantic=1.9.2
+  - lightning[all]
   - rasterio
-  - rasterstats
-  - richdem
   - rio-cogeo
-  - scikit-image
   - scikit-learn
-  - scipy
-  - seaborn
   - shapely
-  - sphinx
-  - torchvision
   - torchmetrics 
   - tqdm
-  - pysheds
-  - xarray
-  - xee
   - pip
   - pip:
       - torchgeo[all]
-      - geetools==0.6.14
-      - python-dotenv>=0.5.1

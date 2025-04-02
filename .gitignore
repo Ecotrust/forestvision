@@ -12,7 +12,7 @@
 *.rar
 *log_*
 *.log
-data/*
+data/*/
 logs/*
 lightning_logs/*
 
@@ -24,9 +24,13 @@ __pycache__/
 
 # Ignore virtual environment files
 env/
+.env 
 
 # Ignore Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
 # Ignore IDE files
 .vscode/
+
+# docs
+docs/_build

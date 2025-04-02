@@ -1,7 +1,7 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="forestsegnet2",
+    name="forestvision",
     packages=find_packages(),
     version="0.1",
     description="",
