@@ -8,9 +8,6 @@ cover change, loss, gain, and related metrics.
 from typing import Any, Callable, Dict, Optional, Union
 import warnings
 import ee
-import ee.deprecation
-import pystac
-import geopandas
 from rasterio.crs import CRS
 from torchgeo.datasets import BoundingBox
 

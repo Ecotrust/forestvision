@@ -1,0 +1,15 @@
+earthengine-api
+geopandas
+kornia
+torch>=2.5.1
+torchvision>=0.20.1
+lightning[all]
+torchgeo[all]
+rasterio
+scikit-learn
+numpy
+pandas
+matplotlib
+shapely>=2.0
+torchmetrics
+tqdm
