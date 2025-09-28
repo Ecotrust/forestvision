@@ -4,8 +4,6 @@
 from typing import Any, Callable, Dict, Optional, Union
 
 import ee
-import pystac
-import geopandas
 from rasterio.crs import CRS
 from torchgeo.datasets import BoundingBox
 

@@ -4,8 +4,6 @@ from .geelandsat import GEELandsat8, GEELandsatTimeSeries, GEELandTrendr, GEELan
 from .geealphaearth import GEEAlphaEarth
 from .geedw import GEEDynamicWorld
 from .emapragb import eMapRAGB
-from .geegladfch import GLADForestCanopyHeight
-from .geemetagch import GEEMetaHRGCH
 from .geegfc import GEEGlobalForestChange
 from .osugnn import GNNForestAttr
 from .forestown import ForestOwnership
@@ -25,8 +23,6 @@ __all__ = [
     "GEEDynamicWorld",
     "GEEAlphaEarth",
     "eMapRAGB",
-    "GLADForestCanopyHeight",
-    "GEEMetaHRGCH",
     "GEEGlobalForestChange",
     "GNNForestAttr",
     "ForestOwnership",

@@ -392,7 +392,6 @@ class GEERasterDataset(CloudRasterDataset):
 
     def __init__(
         self,
-        # tiles: Optional[Union[geopandas.GeoDataFrame, pystac.Collection]] = None,
         roi: Optional[BoundingBox] = None,
         path: Optional[str] = None,
         res: Union[int, None] = None,

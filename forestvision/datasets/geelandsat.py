@@ -243,7 +243,6 @@ class GEELandsatFTV(GEERasterDataset):
         roi: BoundingBox,
         season: str = "leafon",
         spectral_index: str = "NBR",
-        # tiles: Optional[Union[geopandas.GeoDataFrame, pystac.Collection]] = None,
         path: Optional[str] = None,
         crs: Optional[CRS] = CRS.from_epsg(5070),
         res: float = 30,

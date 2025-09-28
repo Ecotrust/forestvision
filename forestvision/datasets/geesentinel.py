@@ -8,8 +8,6 @@ preprocessing capabilities.
 from typing import Any, Callable, Dict, Optional
 
 import ee
-import pystac
-import geopandas
 from rasterio.crs import CRS
 from torchgeo.datasets import BoundingBox
 
