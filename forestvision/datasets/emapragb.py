@@ -83,6 +83,30 @@ class eMapRAGB(RasterDataset):
             self.filename_regex = rf".*{year}"
         super().__init__(paths, crs, res, transforms=transforms, cache=cache)
 
+    @property
+    def res(self) -> float:
+        """Get the resolution of the dataset.
+
+        Returns:
+            float: Resolution in meters per pixel.
+        """
+        # Handle both single float and tuple cases
+        if hasattr(self, '_res') and self._res is not None:
+            if isinstance(self._res, tuple):
+                # Return the x resolution (first element of tuple)
+                return float(self._res[0])
+            return float(self._res)
+        return 30.0
+
+    @res.setter
+    def res(self, value: float) -> None:
+        """Set the resolution of the dataset.
+
+        Args:
+            value (float): Resolution in meters per pixel.
+        """
+        self._res = value
+
     def plot(
         self,
         sample: dict[str, Any],
