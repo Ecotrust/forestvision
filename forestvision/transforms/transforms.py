@@ -70,9 +70,20 @@ class Normalize:
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         data = sample[self.on_key].float()
         nodata_mask = data == self.nodata
+        
+        # Add channel dimension if needed (for 2D masks)
+        if data.ndim == 2:
+            data = data.unsqueeze(0)  # (H, W) -> (1, H, W)
+        
         data = tvF.normalize(data, self.mean, self.std)
+        
+        # Remove channel dimension if we added it and it's a mask
+        if self.on_key == "mask" and data.shape[0] == 1:
+            data = data.squeeze(0)  # (1, H, W) -> (H, W)
+            
         if self.nodata is not None:
             data[nodata_mask] = self.nodata
+            
         sample[self.on_key] = data
         return sample
 
