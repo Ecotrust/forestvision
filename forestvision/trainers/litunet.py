@@ -175,15 +175,18 @@ class RegressionUNet(BaseTask):
 
     def on_train_epoch_end(self):
         fig = self.plot_batch(self.training_step_outputs)
-        self.logger.experiment.add_figure("train_images", fig, self.global_step)
+        if self.logger is not None:
+            self.logger.experiment.add_figure("train_images", fig, self.global_step)
 
     def on_validation_epoch_end(self):
         fig = self.plot_batch(self.validation_step_outputs)
-        self.logger.experiment.add_figure("val_images", fig, self.global_step)
+        if self.logger is not None:
+            self.logger.experiment.add_figure("val_images", fig, self.global_step)
 
     def on_test_epoch_end(self):
         fig = self.plot_batch(self.test_step_outputs)
-        self.logger.experiment.add_figure("test_images", fig, self.global_step)
+        if self.logger is not None:
+            self.logger.experiment.add_figure("test_images", fig, self.global_step)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(
