@@ -1,6 +1,5 @@
 import os
 import logging
-from glob import glob
 from typing import Any
 
 import ee
@@ -11,8 +10,7 @@ from torch.utils.data import DataLoader
 from torchgeo.datasets import stack_samples, GeoDataset
 from torchvision.transforms import v2
 from geopandas import GeoDataFrame
-import rasterio
-from rasterio.errors import RasterioError
+from dotenv import load_dotenv
 
 from forestvision.datasets import (
     eMapRAGB,
@@ -26,6 +24,12 @@ from forestvision.samplers import TileGeoSampler
 from forestvision.deploy import AnyRasterDataset
 
 torch.set_float32_matmul_precision("medium")
+
+
+# Load GEE project name from .env file
+load_dotenv()
+GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
+TARGET_PATH = os.getenv("TARGET_PATH")
 
 
 def download_dataset(
@@ -137,8 +141,8 @@ class eMapREmulatorDataModule(CloudDataModule):
         patch_size: int | tuple[int, int] = 64,
         epoch_length: int | None = None,
         num_workers: int = 10,
-        target_path: str = None,
-        ee_project: str | None = None,
+        target_path: str | None = TARGET_PATH,
+        ee_project: str | None = GEE_PROJECT_NAME,
         **kwargs: Any,
     ) -> None:
         """Initialize a new eMapREmulatorDataModule instance.
