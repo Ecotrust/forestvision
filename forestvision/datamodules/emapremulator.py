@@ -100,31 +100,6 @@ def get_stats(
     return stats.compute()
 
 
-def find_file_by_pattern(pattern: str) -> str:
-    """Find a file by glob pattern.
-
-    Args:
-        pattern (str): The glob pattern to search for.
-
-    Returns:
-        str: The path to the first matching file.
-
-    Raises:
-        FileNotFoundError: If no files match the pattern.
-    """
-    files = glob(os.path.join(pattern))
-    if not files:
-        raise FileNotFoundError(
-            f"No files found matching pattern: {pattern}. "
-            f"Please check that the files exist and the pattern is correct."
-        )
-    if len(files) > 1:
-        logging.warning(
-            f"Multiple files found for pattern {pattern}, using first one: {files[0]}"
-        )
-    return files[0]
-
-
 class eMapREmulatorDataModule(CloudDataModule):
     """LightningDataModule implementation to emulate eMapR AGLB data."""
 
