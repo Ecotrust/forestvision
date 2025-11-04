@@ -71,15 +71,32 @@ class Normalize:
         data = sample[self.on_key].float()
         nodata_mask = data == self.nodata
         
-        # Add channel dimension if needed (for 2D masks)
-        if data.ndim == 2:
-            data = data.unsqueeze(0)  # (H, W) -> (1, H, W)
+        # Handle different tensor shapes for masks vs images
+        if self.on_key == "mask":
+            # For masks, we need to preserve the batch dimension
+            # Masks typically come as (B, H, W) or (H, W)
+            if data.ndim == 2:
+                # Add batch and channel dimensions: (H, W) -> (1, 1, H, W)
+                data = data.unsqueeze(0).unsqueeze(0)
+            elif data.ndim == 3:
+                # Add channel dimension: (B, H, W) -> (B, 1, H, W)
+                data = data.unsqueeze(1)
+        else:
+            # For images, add batch dimension if needed
+            if data.ndim == 3:
+                # Add batch dimension: (C, H, W) -> (1, C, H, W)
+                data = data.unsqueeze(0)
         
         data = tvF.normalize(data, self.mean, self.std)
         
-        # Remove channel dimension if we added it and it's a mask
-        if self.on_key == "mask" and data.shape[0] == 1:
-            data = data.squeeze(0)  # (1, H, W) -> (H, W)
+        # Remove extra dimensions we added
+        if self.on_key == "mask":
+            # Remove channel dimension: (B, 1, H, W) -> (B, H, W)
+            data = data.squeeze(1)
+        else:
+            # Remove batch dimension if we added it: (1, C, H, W) -> (C, H, W)
+            if sample[self.on_key].ndim == 3:
+                data = data.squeeze(0)
             
         if self.nodata is not None:
             data[nodata_mask] = self.nodata
