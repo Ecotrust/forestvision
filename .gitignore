@@ -13,6 +13,7 @@
 *log_*
 *.log
 data/*/
+data/dev
 logs/*
 lightning_logs/*
 
