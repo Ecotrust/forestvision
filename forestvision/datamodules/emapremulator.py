@@ -1,16 +1,17 @@
 import os
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 import ee
 from tqdm import tqdm
+from dotenv import load_dotenv
+from geopandas import GeoDataFrame
+
 import torch
 from kornia.enhance import Denormalize
 from torch.utils.data import DataLoader
 from torchgeo.datasets import stack_samples, GeoDataset
 from torchvision.transforms import v2
-from geopandas import GeoDataFrame
-from dotenv import load_dotenv
 
 from forestvision.datasets import (
     eMapRAGB,
@@ -177,13 +178,10 @@ class eMapREmulatorDataModule(CloudDataModule):
         serialized = {}
         for key, value in stats_dict.items():
             if isinstance(value, torch.Tensor):
-                # Convert tensor to list for YAML compatibility
                 serialized[key] = value.tolist()
             elif isinstance(value, dict):
-                # Recursively serialize nested dictionaries
                 serialized[key] = eMapREmulatorDataModule._serialize_stats(value)
             else:
-                # Keep primitive types as-is
                 serialized[key] = value
         return serialized
 
@@ -208,13 +206,10 @@ class eMapREmulatorDataModule(CloudDataModule):
         deserialized = {}
         for key, value in stats_dict.items():
             if isinstance(value, list):
-                # Convert list back to tensor
                 deserialized[key] = torch.tensor(value)
             elif isinstance(value, dict):
-                # Recursively deserialize nested dictionaries
                 deserialized[key] = eMapREmulatorDataModule._deserialize_stats(value)
             else:
-                # Keep primitive types as-is
                 deserialized[key] = value
         return deserialized
 
@@ -304,6 +299,10 @@ class eMapREmulatorDataModule(CloudDataModule):
         self.root = root
         self.target_path = target_path or TARGET_PATH
         self.hparams_dict = hparams or {}
+        self.train_tiles_path = train_tiles_path
+        self.val_tiles_path = val_tiles_path
+        self.test_tiles_path = test_tiles_path
+        self.predict_tiles_path = predict_tiles_path
 
         # Initialize datasets to None - will be created in setup()
         self.input_dataset = None
@@ -324,10 +323,6 @@ class eMapREmulatorDataModule(CloudDataModule):
         self.val_tiles = None
         self.test_tiles = None
         self.predict_tiles = None
-        self.train_tiles_path = train_tiles_path
-        self.val_tiles_path = val_tiles_path
-        self.test_tiles_path = test_tiles_path
-        self.predict_tiles_path = predict_tiles_path
 
         # Track if stats were loaded from hparams
         self.stats_from_hparams = False
@@ -438,7 +433,6 @@ class eMapREmulatorDataModule(CloudDataModule):
         Args:
             overwrite: Whether to overwrite existing data and statistics
         """
-        # Setup training inputs to ensure datasets are created
         self.setup("fit")
 
         logging.info("Preparing training dataset...")
@@ -464,7 +458,7 @@ class eMapREmulatorDataModule(CloudDataModule):
                     overwrite=overwrite,
                 )
 
-                # Serialize stats for logging to hparams
+                # Serialize stats to log into hparams
                 self.serialized_input_stats = self._serialize_stats(self.input_stats)
                 self.serialized_target_stats = self._serialize_stats(self.target_stats)
 
@@ -581,32 +575,26 @@ class eMapREmulatorDataModule(CloudDataModule):
         Raises:
             ValueError: If year is not provided for predict stage
         """
-        # Create target dataset
         if self.target_path:
             self.target_dataset = eMapRAGB(year=self.year, paths=self.target_path)
         else:
             self.target_dataset = eMapRAGB(year=self.year)
 
         if stage in ["fit", "validate"]:
-            # Setup training and validation datasets
             self._setup_fit_stage()
 
         elif stage == "test":
-            # Setup test dataset
             self._setup_test_stage()
 
         elif stage == "predict":
             if year is None:
                 raise ValueError("year parameter required for predict stage")
-            # Setup prediction dataset
             self._setup_predict_stage(year)
 
-        # Setup transforms after datasets are created
         self.setup_transforms()
 
     def _setup_fit_stage(self) -> None:
         """Setup datasets for training and validation stages."""
-        # Load tile geometries
         self.train_tiles = GPDFeatureCollection(
             os.path.join(self.root, self.train_tiles_path)
         )
@@ -614,7 +602,6 @@ class eMapREmulatorDataModule(CloudDataModule):
             os.path.join(self.root, self.val_tiles_path)
         )
 
-        # Create input datasets
         dataset_class_name = self.inputs_class.__name__.lower()
         training_inputs_path = os.path.join(
             self.root, f"training/{dataset_class_name}/{self.year}"
@@ -637,18 +624,16 @@ class eMapREmulatorDataModule(CloudDataModule):
             download=True,
         )
 
-        # Create combined datasets for training and validation
+        # Combine mask & inputs
         self.train_dataset = self.target_dataset & self.input_dataset
         self.val_dataset = self.target_dataset & self.val_input_dataset
 
     def _setup_test_stage(self) -> None:
         """Setup datasets for testing stage."""
-        # Load test tile geometries
         self.test_tiles = GPDFeatureCollection(
             os.path.join(self.root, self.test_tiles_path)
         )
 
-        # Create test input dataset
         dataset_class_name = self.inputs_class.__name__.lower()
         test_inputs_path = os.path.join(
             self.root, f"test/{dataset_class_name}/{self.year}"
@@ -661,7 +646,7 @@ class eMapREmulatorDataModule(CloudDataModule):
             download=True,
         )
 
-        # Create combined test dataset
+        # Combine mask & inputs
         self.test_dataset = self.target_dataset & self.test_input_dataset
 
     def _setup_predict_stage(self, year: int) -> None:
@@ -670,12 +655,10 @@ class eMapREmulatorDataModule(CloudDataModule):
         Args:
             year (int): The year to predict for
         """
-        # Load prediction tile geometries
         self.predict_tiles = GPDFeatureCollection(
             os.path.join(self.root, self.predict_tiles_path)
         )
 
-        # Create prediction input dataset
         dataset_class_name = self.inputs_class.__name__.lower()
         predict_inputs_path = os.path.join(self.root, f"predict/{dataset_class_name}")
 
@@ -687,7 +670,6 @@ class eMapREmulatorDataModule(CloudDataModule):
             is_image=True,
         )
 
-        # Create combined prediction dataset
         self.predict_dataset = self.target_dataset & self.predict_inputs_dataset
 
     def cleanup(self) -> None:
@@ -700,7 +682,7 @@ class eMapREmulatorDataModule(CloudDataModule):
         self.input_stats = None
         self.target_stats = None
 
-        # Clear datasets if they exist
+        # Clear datasets if exist
         for attr in [
             "input_dataset",
             "val_input_dataset",
@@ -714,12 +696,12 @@ class eMapREmulatorDataModule(CloudDataModule):
             if hasattr(self, attr):
                 setattr(self, attr, None)
 
-        # Clear samplers if they exist
+        # Clear samplers if exist
         for attr in ["train_sampler", "val_sampler", "test_sampler", "predict_sampler"]:
             if hasattr(self, attr):
                 setattr(self, attr, None)
 
-        # Clear tiles if they exist
+        # Clear tiles if exist
         for attr in ["train_tiles", "val_tiles", "test_tiles", "predict_tiles"]:
             if hasattr(self, attr):
                 setattr(self, attr, None)
