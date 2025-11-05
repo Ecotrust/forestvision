@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Any
+from typing import Any, Dict, Optional, Union
 
 import ee
 from tqdm import tqdm
@@ -26,7 +26,7 @@ from forestvision.deploy import AnyRasterDataset
 torch.set_float32_matmul_precision("medium")
 
 
-# Load GEE project name from .env file
+# Load from .env file
 load_dotenv()
 GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
 TARGET_PATH = os.getenv("TARGET_PATH")
@@ -69,6 +69,7 @@ def get_stats(
     dataset: GeoDataset,
     tiles: GeoDataFrame,
     nodata: int | None = None,
+    path: str | None = None,
     overwrite: bool = False,
 ) -> dict:
     """Compute dataset statistics including mean and standard deviation.
@@ -95,6 +96,7 @@ def get_stats(
     stats = DatasetStats(
         dataset,
         sampler,
+        path=path,
         batch_size=5,
         num_workers=40,
         channels=channels,
@@ -105,10 +107,116 @@ def get_stats(
 
 
 class eMapREmulatorDataModule(CloudDataModule):
-    """LightningDataModule implementation to emulate eMapR AGLB data."""
+    """LightningDataModule implementation to emulate eMapR AGLB data.
+
+    This data module supports integrated serialization with auto-loading of statistics
+    from hyperparameters, enabling efficient resume training and inference without
+    recomputing dataset statistics.
+
+    Key Features:
+    - Computes input and target dataset statistics (mean, std) for normalization
+    - Serializes statistics to YAML-compatible format for logging
+    - Auto-loads statistics from hparams during resume/inference
+    - Maintains backward compatibility with existing workflows
+
+    Usage Examples:
+
+    First Training Run (computes and logs stats):
+        >>> datamodule = eMapREmulatorDataModule(
+        ...     root="data",
+        ...     year=2020,
+        ...     train_tiles_path="tiles/train.geojson",
+        ...     val_tiles_path="tiles/val.geojson"
+        ... )
+        >>> datamodule.prepare_data()  # Computes and logs stats to trainer
+        >>> trainer.fit(model, datamodule)
+
+    Resume Training or Inference (loads from hparams):
+        >>> # Load hparams from checkpoint or previous run
+        >>> hparams = {"datamodule": {"input_stats": {...}, "target_stats": {...}}}
+        >>> datamodule = eMapREmulatorDataModule(
+        ...     root="data",
+        ...     year=2020,
+        ...     train_tiles_path="tiles/train.geojson",
+        ...     val_tiles_path="tiles/val.geojson",
+        ...     hparams=hparams  # Stats loaded from hparams, no recomputation
+        ... )
+        >>> datamodule.prepare_data()  # Skips computation, uses hparams stats
+        >>> trainer.fit(model, datamodule)
+
+    Manual Stat Loading:
+        >>> # Load stats from file and pass as hparams
+        >>> import torch
+        >>> input_stats = torch.load("input_stats.pt")
+        >>> target_stats = torch.load("target_stats.pt")
+        >>> hparams = {"datamodule": {"input_stats": input_stats, "target_stats": target_stats}}
+        >>> datamodule = eMapREmulatorDataModule(..., hparams=hparams)
+    """
 
     input_stats = None
     target_stats = None
+
+    @staticmethod
+    def _serialize_stats(stats_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively serialize torch tensors in statistics dictionary to YAML-compatible types.
+
+        Converts torch tensors to lists or primitive values for safe YAML serialization.
+
+        Args:
+            stats_dict: Dictionary containing statistics with torch tensors
+
+        Returns:
+            Dictionary with torch tensors converted to lists/primitives
+
+        Example:
+            >>> stats = {"mean": torch.tensor([1.0, 2.0]), "std": torch.tensor([0.1, 0.2])}
+            >>> serialized = eMapREmulatorDataModule._serialize_stats(stats)
+            >>> print(serialized)
+            {'mean': [1.0, 2.0], 'std': [0.1, 0.2]}
+        """
+        serialized = {}
+        for key, value in stats_dict.items():
+            if isinstance(value, torch.Tensor):
+                # Convert tensor to list for YAML compatibility
+                serialized[key] = value.tolist()
+            elif isinstance(value, dict):
+                # Recursively serialize nested dictionaries
+                serialized[key] = eMapREmulatorDataModule._serialize_stats(value)
+            else:
+                # Keep primitive types as-is
+                serialized[key] = value
+        return serialized
+
+    @staticmethod
+    def _deserialize_stats(stats_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively deserialize statistics dictionary from YAML-compatible types to torch tensors.
+
+        Converts lists and primitive values back to torch tensors for use in normalization.
+
+        Args:
+            stats_dict: Dictionary containing serialized statistics
+
+        Returns:
+            Dictionary with lists/primitives converted to torch tensors
+
+        Example:
+            >>> serialized = {'mean': [1.0, 2.0], 'std': [0.1, 0.2]}
+            >>> deserialized = eMapREmulatorDataModule._deserialize_stats(serialized)
+            >>> print(deserialized)
+            {'mean': tensor([1., 2.]), 'std': tensor([0.1000, 0.2000])}
+        """
+        deserialized = {}
+        for key, value in stats_dict.items():
+            if isinstance(value, list):
+                # Convert list back to tensor
+                deserialized[key] = torch.tensor(value)
+            elif isinstance(value, dict):
+                # Recursively deserialize nested dictionaries
+                deserialized[key] = eMapREmulatorDataModule._deserialize_stats(value)
+            else:
+                # Keep primitive types as-is
+                deserialized[key] = value
+        return deserialized
 
     def _collate_fn(self, batch):
         """Custom collate function that removes frozen dataclasses before GPU transfer.
@@ -141,8 +249,13 @@ class eMapREmulatorDataModule(CloudDataModule):
         patch_size: int | tuple[int, int] = 64,
         epoch_length: int | None = None,
         num_workers: int = 10,
-        target_path: str | None = TARGET_PATH,
-        ee_project: str | None = GEE_PROJECT_NAME,
+        target_path: str | None = None,
+        test_tiles_path: str | None = None,
+        val_tiles_path: str | None = None,
+        predict_tiles_path: str | None = None,
+        train_tiles_path: str | None = None,
+        ee_project: str | None = None,
+        hparams: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize a new eMapREmulatorDataModule instance.
@@ -155,25 +268,42 @@ class eMapREmulatorDataModule(CloudDataModule):
             epoch_length (int | None): Length of each training epoch.
             num_workers (int): Number of workers for parallel data loading.
             target_path (str | None): Path to target dataset. If None, uses default eMapRAGB path.
+            test_tiles_path (str | None): Path to test tiles GeoJSON file.
+            val_tiles_path (str | None): Path to validation tiles GeoJSON file.
+            predict_tiles_path (str | None): Path to prediction tiles GeoJSON file.
+            train_tiles_path (str | None): Path to training tiles GeoJSON file.
             ee_project (str | None): Google Earth Engine project name for initialization.
+            hparams (Optional[Dict[str, Any]]): Optional hyperparameters dictionary containing
+                precomputed statistics. If provided, stats will be loaded from hparams instead
+                of being recomputed. Expected format:
+                hparams["datamodule"]["input_stats"] and hparams["datamodule"]["target_stats"]
             **kwargs: Additional arguments passed to parent class.
+
+        Example:
+            >>> # First run - computes and logs stats
+            >>> datamodule = eMapREmulatorDataModule(root="data", year=2020)
+            >>>
+            >>> # Resume/inference run - loads from hparams
+            >>> datamodule = eMapREmulatorDataModule(
+            ...     root="data",
+            ...     year=2020,
+            ...     hparams={"datamodule": {"input_stats": {...}, "target_stats": {...}}}
+            ... )
         """
         # Initialize Earth Engine if project name is provided
-        if ee_project:
-            try:
-                ee.Initialize(project=ee_project)
-                logging.info(f"Earth Engine initialized with project: {ee_project}")
-            except ImportError:
-                raise ImportError(
-                    "earthengine-api is not installed. Please install it to use GEE datasets."
-                )
-            except Exception as e:
-                logging.warning(f"Failed to initialize Earth Engine: {e}")
-                raise
+        ee_project = ee_project or GEE_PROJECT_NAME
+
+        try:
+            ee.Initialize(project=ee_project)
+            logging.info(f"Earth Engine initialized with project: {ee_project}")
+        except Exception as e:
+            logging.warning(f"Failed to initialize Earth Engine: {e}")
+            raise
 
         self.year = year
         self.root = root
-        self.target_path = target_path
+        self.target_path = target_path or TARGET_PATH
+        self.hparams_dict = hparams or {}
 
         # Initialize datasets to None - will be created in setup()
         self.input_dataset = None
@@ -194,6 +324,13 @@ class eMapREmulatorDataModule(CloudDataModule):
         self.val_tiles = None
         self.test_tiles = None
         self.predict_tiles = None
+        self.train_tiles_path = train_tiles_path
+        self.val_tiles_path = val_tiles_path
+        self.test_tiles_path = test_tiles_path
+        self.predict_tiles_path = predict_tiles_path
+
+        # Track if stats were loaded from hparams
+        self.stats_from_hparams = False
 
         self.inputs_class = GEELandsatFTV
         self.init_transforms = ReplaceNodataVal(-32768, 0, on_key="image")
@@ -211,8 +348,42 @@ class eMapREmulatorDataModule(CloudDataModule):
         """Setup transforms for datasets.
 
         Configures normalization transforms for both input and target datasets
-        based on precomputed statistics.
+        based on precomputed statistics. First checks if stats are available in hparams,
+        otherwise falls back to computed stats.
+
+        Workflow:
+        1. Check if hparams contains precomputed stats
+        2. If yes, deserialize and use them (skip computation)
+        3. If no, use existing computed stats or compute new ones
         """
+        # Check if stats are available in hparams (highest priority)
+        if (
+            self.hparams_dict
+            and "datamodule" in self.hparams_dict
+            and "input_stats" in self.hparams_dict["datamodule"]
+            and "target_stats" in self.hparams_dict["datamodule"]
+        ):
+
+            logging.info("Loading statistics from hparams...")
+            try:
+                # Deserialize stats from hparams
+                self.input_stats = self._deserialize_stats(
+                    self.hparams_dict["datamodule"]["input_stats"]
+                )
+                self.target_stats = self._deserialize_stats(
+                    self.hparams_dict["datamodule"]["target_stats"]
+                )
+                self.stats_from_hparams = True
+                logging.info("Statistics successfully loaded from hparams")
+            except Exception as e:
+                logging.warning(f"Failed to deserialize stats from hparams: {e}")
+                self.stats_from_hparams = False
+                # Fall back to existing stats or computation
+                if self.input_stats is None or self.target_stats is None:
+                    logging.info("Falling back to stat computation")
+                    return  # Let prepare_data() handle computation
+
+        # Apply transforms using available stats
         if self.target_stats is not None:
             self.target_dataset.transforms = v2.Compose(
                 [
@@ -271,19 +442,47 @@ class eMapREmulatorDataModule(CloudDataModule):
         self.setup("fit")
 
         logging.info("Preparing training dataset...")
+
+        # Skip stat computation if stats were already loaded from hparams
+        if self.stats_from_hparams:
+            logging.info("Skipping stat computation - using stats from hparams")
+            return
+
         if self.input_stats is None or self.target_stats is None or overwrite:
             try:
                 self.input_stats = get_stats(
                     self.input_dataset,
                     self.train_tiles.data,
                     nodata=0,
+                    path=self.input_stats,
                     overwrite=overwrite,
                 )
                 self.target_stats = get_stats(
                     self.target_dataset,
                     self.train_tiles.data,
+                    path=self.target_stats,
                     overwrite=overwrite,
                 )
+
+                # Serialize stats for logging to hparams
+                self.serialized_input_stats = self._serialize_stats(self.input_stats)
+                self.serialized_target_stats = self._serialize_stats(self.target_stats)
+
+                # Log stats to trainer if available
+                if hasattr(self, "trainer") and self.trainer is not None:
+                    hparams_to_log = {
+                        "datamodule": {
+                            "input_stats": self.serialized_input_stats,
+                            "target_stats": self.serialized_target_stats,
+                        }
+                    }
+                    if (
+                        hasattr(self.trainer, "logger")
+                        and self.trainer.logger is not None
+                    ):
+                        self.trainer.logger.log_hyperparams(hparams_to_log)
+                        logging.info("Statistics logged to trainer hyperparameters")
+
             except Exception as e:
                 logging.error(f"Failed to compute statistics: {e}")
                 raise
@@ -409,10 +608,10 @@ class eMapREmulatorDataModule(CloudDataModule):
         """Setup datasets for training and validation stages."""
         # Load tile geometries
         self.train_tiles = GPDFeatureCollection(
-            os.path.join(self.root, "tiles/train_64p30m.geojson")
+            os.path.join(self.root, self.train_tiles_path)
         )
         self.val_tiles = GPDFeatureCollection(
-            os.path.join(self.root, "tiles/val_64p30m.geojson")
+            os.path.join(self.root, self.val_tiles_path)
         )
 
         # Create input datasets
@@ -442,14 +641,11 @@ class eMapREmulatorDataModule(CloudDataModule):
         self.train_dataset = self.target_dataset & self.input_dataset
         self.val_dataset = self.target_dataset & self.val_input_dataset
 
-        # Load stats if available
-        self._load_stats_if_available(training_inputs_path)
-
     def _setup_test_stage(self) -> None:
         """Setup datasets for testing stage."""
         # Load test tile geometries
         self.test_tiles = GPDFeatureCollection(
-            os.path.join(self.root, "tiles/test_64p30m.geojson")
+            os.path.join(self.root, self.test_tiles_path)
         )
 
         # Create test input dataset
@@ -476,7 +672,7 @@ class eMapREmulatorDataModule(CloudDataModule):
         """
         # Load prediction tile geometries
         self.predict_tiles = GPDFeatureCollection(
-            os.path.join(self.root, "tiles/predict_256p236s_vp_validation.geojson")
+            os.path.join(self.root, self.predict_tiles_path)
         )
 
         # Create prediction input dataset
@@ -493,29 +689,6 @@ class eMapREmulatorDataModule(CloudDataModule):
 
         # Create combined prediction dataset
         self.predict_dataset = self.target_dataset & self.predict_inputs_dataset
-
-    def _load_stats_if_available(self, inputs_path: str) -> None:
-        """Load statistics if they exist.
-
-        Args:
-            inputs_path (str): Path to input dataset directory
-        """
-        input_stats_path = os.path.join(inputs_path, "stats.pt")
-        target_stats_path = os.path.join(self.target_dataset.paths, "stats.pt")
-
-        if os.path.exists(input_stats_path) and os.path.exists(target_stats_path):
-            try:
-                self.input_stats = torch.load(input_stats_path)
-                self.target_stats = torch.load(target_stats_path)
-            except (FileNotFoundError, EOFError, RuntimeError) as e:
-                logging.warning(f"Failed to load stats files: {e}")
-                self.input_stats = None
-                self.target_stats = None
-            except Exception as e:
-                logging.error(f"Unexpected error loading stats files: {e}")
-                self.input_stats = None
-                self.target_stats = None
-                raise
 
     def cleanup(self) -> None:
         """Clean up loaded resources and statistics to free memory.
