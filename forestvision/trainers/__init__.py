@@ -1,1 +1,1 @@
-from .litunet import RegressionUNet
+from .litunet import RegressionUNet, SegmentationUNet

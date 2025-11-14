@@ -3,9 +3,14 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchmetrics import (
-    MeanSquaredError,
     MetricCollection,
+    Accuracy,
+    CohenKappa,
+    JaccardIndex,
+    ConfusionMatrix,
+    MeanSquaredError,
     MeanAbsoluteError,
     R2Score,
 )
@@ -13,6 +18,7 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torchvision.transforms.functional as tvF
 from torchgeo.trainers import BaseTask
 from kornia.enhance import Denormalize
+from segmentation_models_pytorch.losses import FocalLoss
 
 from ..models import UNet
 from ..datasets import minmax_scaling
@@ -254,6 +260,330 @@ class RegressionUNet(BaseTask):
                     )
             row_idx += 1
 
+        plt.tight_layout()
+        return fig
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class SegmentationUNet(BaseTask):
+
+    target_key = "mask"
+    input_stats: dict = None
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        num_classes: int = 1,
+        loss: str = "ce",
+        lr: float = 1e-4,
+        weight_decay: float = 1e-4,
+        ignore_index: int = 0,
+        labels: dict = None,
+        colormap: dict = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.labels = labels or {}
+        self.colormap = colormap or {}
+        self.validation_step_outputs = []
+
+    def configure_models(self):
+        """Initialize the UNet model for classification."""
+        self.model = UNet(
+            in_channels=self.hparams["in_channels"],
+            out_channels=self.hparams["num_classes"],
+            dropout=0.0,
+        )
+
+    def configure_losses(self) -> None:
+        """Initialize the loss criterion.
+
+        Raises:
+            ValueError: If *loss* is invalid.
+        """
+        loss: str = self.hparams["loss"]
+        if loss == "ce":
+            self.criterion: nn.Module = nn.CrossEntropyLoss(
+                reduction="none", ignore_index=self.hparams["ignore_index"]
+            )
+        elif loss == "focal":
+            self.criterion: nn.Module = FocalLoss(
+                mode="multiclass",
+                gamma=2,
+                reduction="none",
+                ignore_index=self.hparams["ignore_index"],
+            )
+        else:
+            raise ValueError(
+                f"Loss type '{loss}' is not valid. "
+                "Currently, supports 'ce' or 'focal' loss."
+            )
+
+    def configure_metrics(self) -> None:
+        """Initialize the performance metrics for classification."""
+        metrics = MetricCollection(
+            {
+                "accuracy": Accuracy(
+                    task="multiclass",
+                    num_classes=self.hparams["num_classes"],  # Keep +1 for ignore_index
+                    ignore_index=self.hparams["ignore_index"],
+                ),
+                "kappa": CohenKappa(
+                    task="multiclass",
+                    num_classes=self.hparams["num_classes"],
+                    weights="quadratic",
+                    ignore_index=self.hparams["ignore_index"],
+                ),
+                "jaccard": JaccardIndex(
+                    task="multiclass",
+                    num_classes=self.hparams["num_classes"],
+                    ignore_index=self.hparams["ignore_index"],
+                ),
+            }
+        )
+        self.train_metrics = metrics.clone(prefix="train_")
+        self.val_metrics = metrics.clone(prefix="val_")
+        self.test_metrics = metrics.clone(prefix="test_")
+
+        # Confusion matrix for validation epoch end
+        self.confusion_matrix = ConfusionMatrix(
+            task="multiclass",
+            num_classes=self.hparams["num_classes"],  # Keep +1 for ignore_index
+            ignore_index=self.hparams["ignore_index"],
+        )
+
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler."""
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"],
+        )
+        return optimizer
+
+    def training_step(self, batch, batch_idx):
+        """Training step for classification."""
+        x, y = batch["image"], batch["mask"].long()
+        y_logits = self(x)  # Model outputs logits
+
+        # Compute loss using logits (FocalLoss expects logits and applies softmax internally)
+        loss = self.criterion(y_logits, y.squeeze(1))
+        loss = loss.mean()
+        self.log("train_loss", loss, on_epoch=True, sync_dist=True)
+
+        # Compute predictions for metrics (apply softmax + argmax)
+        y_probs = y_logits.softmax(dim=1)
+        y_pred = torch.argmax(y_probs, dim=1)
+
+        metrics = self.train_metrics(y_pred, y.squeeze(1))
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        """Validation step for classification."""
+        x, y = batch["image"], batch["mask"].long()
+        y_logits = self(x)  # Model outputs logits
+
+        loss = self.criterion(y_logits, y.squeeze(1))
+        loss = loss.mean()
+        self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
+
+        y_probs = y_logits.softmax(dim=1)
+        y_pred = torch.argmax(y_probs, dim=1)
+        metrics = self.val_metrics(y_pred, y.squeeze(1))
+        self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+        self.confusion_matrix.update(y_pred, y.squeeze(1))
+
+        # Store batch for visualization (use 2D predictions for plotting)
+        batch["prediction"] = y_pred
+        self.validation_step_outputs.append(batch)
+
+    def test_step(self, batch, batch_idx):
+        """Test step for classification."""
+        x, y = batch["image"], batch["mask"].long()
+        y_logits = self(x)  # Model outputs logits
+
+        loss = self.criterion(y_logits, y.squeeze(1))
+        loss = loss.mean()
+        self.log("test_loss", loss, on_epoch=True, sync_dist=True)
+
+        y_probs = y_logits.softmax(dim=1)
+        y_pred = torch.argmax(y_probs, dim=1)
+        metrics = self.test_metrics(y_pred, y.squeeze(1))
+        self.log_dict(metrics, sync_dist=True)
+
+    def on_validation_epoch_end(self):
+        """Called at the end of validation epoch."""
+        # Compute confusion matrix
+        confmat = self.confusion_matrix.compute()
+        self.confusion_matrix.reset()
+
+        # Create and log confusion matrix plot
+        confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
+        if self.logger is not None:
+            self.logger.experiment.add_figure(
+                "confusion_matrix", confmat_fig, self.current_epoch
+            )
+
+        # Create and log sample batch plot
+        if self.validation_step_outputs:
+            batch_fig = self.plot_batch(self.validation_step_outputs[0])
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    "val_images", batch_fig, self.current_epoch
+                )
+
+        self.validation_step_outputs.clear()
+
+    def plot_batch(self, batch, n=5, rgb_bands=[6, 2, 1]):
+        """Plot a sample of n images from batch for classification."""
+        plt.rcParams["savefig.bbox"] = "tight"
+        plt.close("all")  # clear previous plots if any
+
+        try:
+            input_stats = self.trainer.datamodule.input_stats
+        except AttributeError:
+            input_stats = self.input_stats
+
+        def revert(tensor, stats):
+            if stats is not None:
+                return Denormalize(mean=stats["mean"], std=stats["std"])(tensor)
+            return tensor
+
+        x, y = batch["image"], batch["mask"]
+        predictions = batch.get("prediction", None)
+        x = revert(x, input_stats)
+
+        # Determine actual number of samples to plot (min of n and available samples)
+        actual_n = min(n, len(x))
+
+        sample_dict = {
+            "input": x[:actual_n],
+            "ground_truth": y[:actual_n],
+        }
+        if predictions is not None:
+            sample_dict["prediction"] = predictions[:actual_n]
+
+        num_rows = len(sample_dict)
+        num_cols = actual_n
+        fig, axs = plt.subplots(
+            figsize=(4 * num_cols, 3 * num_rows),
+            nrows=num_rows,
+            ncols=num_cols,
+            squeeze=False,
+        )
+
+        for row_idx, (title, item) in enumerate(sample_dict.items()):
+            for col_idx in range(num_cols):
+                if title == "input":
+                    # Handle different channel counts
+                    img_tensor = item[col_idx]
+                    num_channels = img_tensor.shape[0]
+
+                    if num_channels >= 3:
+                        # Use first 3 channels for RGB
+                        img = img_tensor[:3]
+                    elif num_channels == 2:
+                        # For 2 channels, duplicate the first channel to create RGB
+                        img = torch.stack([img_tensor[0], img_tensor[0], img_tensor[0]])
+                    else:
+                        # For 1 channel, create grayscale RGB
+                        img = torch.stack([img_tensor[0], img_tensor[0], img_tensor[0]])
+
+                    img = minmax_scaling(img, self.hparams["ignore_index"])
+                    img = tvF.to_pil_image(img)
+                    axs[row_idx, col_idx].imshow(np.asarray(img))
+                    axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
+                else:
+                    # Show categorical mask
+                    mask = item[col_idx].squeeze().clone().detach().cpu().numpy()
+
+                    # Create colored mask using colormap
+                    colored_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
+                    for class_id, color in self.colormap.items():
+                        if isinstance(color, str):
+                            # Convert hex to RGB
+                            color = tuple(
+                                int(color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)
+                            )
+                        mask_pixels = mask == class_id
+                        colored_mask[mask_pixels] = color
+
+                    axs[row_idx, col_idx].imshow(colored_mask)
+                    axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
+
+                axs[row_idx, col_idx].get_xaxis().set_ticks([])
+                axs[row_idx, col_idx].get_yaxis().set_ticks([])
+
+        plt.tight_layout()
+        return fig
+
+    def plot_confusion_matrix(self, confmat, normalize=True):
+        """Plot confusion matrix using matplotlib."""
+        plt.rcParams["savefig.bbox"] = "tight"
+        plt.close("all")  # clear previous plots if any
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Normalize by rows (percentage per true class)
+        if normalize:
+            # Calculate raw sums, avoiding division by zero
+            row_sums = confmat.sum(axis=1, keepdims=True)
+            # Replace zeros with 1 to avoid division by zero
+            row_sums[row_sums == 0] = 1
+            confmat_normalized = confmat / row_sums * 100  # Convert to percentage
+            display_matrix = confmat_normalized
+        else:
+            display_matrix = confmat
+
+        # Create heatmap using matplotlib imshow
+        im = ax.imshow(display_matrix, cmap="Blues", aspect="auto")
+
+        # Add colorbar
+        cbar = ax.figure.colorbar(im, ax=ax)
+        cbar.set_label(
+            "Percentage (%)" if normalize else "Count", rotation=270, labelpad=20
+        )
+
+        # Set labels
+        label_names = [
+            self.labels.get(i, f"Class {i}") for i in range(confmat.shape[0])
+        ]
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_xticks(np.arange(len(label_names)))
+        ax.set_yticks(np.arange(len(label_names)))
+        ax.set_xticklabels(label_names, rotation=45, ha="right")
+        ax.set_yticklabels(label_names, rotation=0)
+
+        # Add text annotations
+        for i in range(confmat.shape[0]):
+            for j in range(confmat.shape[1]):
+                if normalize:
+                    # Display percentage with 1 decimal place
+                    text_value = f"{display_matrix[i, j]:.1f}"
+                else:
+                    # Display raw count
+                    text_value = f"{display_matrix[i, j]:d}"
+
+                text = ax.text(
+                    j,
+                    i,
+                    text_value,
+                    ha="center",
+                    va="center",
+                    color=(
+                        "black"
+                        if display_matrix[i, j] < display_matrix.max() * 0.7
+                        else "white"
+                    ),
+                )
+
+        ax.set_title("Confusion Matrix")
         plt.tight_layout()
         return fig
 
