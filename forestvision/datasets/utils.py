@@ -92,15 +92,24 @@ class DatasetStats:
                 image = batch[self.data_key].float()
                 ndmask = image == self.nodata
                 image[ndmask] = float("nan")
-                self._sum += torch.nansum(image, dim=self.dim)
-                self._sum_sq += torch.nansum(image**2, dim=self.dim)
-                self._count += torch.sum(~torch.isnan(image), dim=self.dim)
+                
+                # Dynamically adjust dimensions based on tensor shape
+                if image.dim() == 3:  # channels, height, width
+                    on_dims = (1, 2)  # sum over height and width
+                elif image.dim() == 4:  # batch, channels, height, width
+                    on_dims = (0, 2, 3)  # sum over batch, height and width
+                else:
+                    raise ValueError(f"Unsupported tensor dimension: {image.dim()}")
+                
+                self._sum += torch.nansum(image, dim=on_dims)
+                self._sum_sq += torch.nansum(image**2, dim=on_dims)
+                self._count += torch.sum(~torch.isnan(image), dim=on_dims)
                 image[ndmask] = float("inf")
-                self._min = torch.stack([self._min, image.amin(dim=self.dim)]).amin(
+                self._min = torch.stack([self._min, image.amin(dim=on_dims)]).amin(
                     dim=0
                 )
                 image[ndmask] = float("-inf")
-                self._max = torch.stack([self._max, image.amax(dim=self.dim)]).amax(
+                self._max = torch.stack([self._max, image.amax(dim=on_dims)]).amax(
                     dim=0
                 )
                 if self.nodata is not None:
