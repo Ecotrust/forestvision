@@ -16,6 +16,8 @@ from matplotlib import colors
 from matplotlib.figure import Figure
 from matplotlib import pyplot as plt
 from matplotlib.colors import ListedColormap
+import logging
+
 
 import ee
 import torch
@@ -29,6 +31,11 @@ import torchvision.transforms.functional as tvF
 
 from .cloudgeo import CloudRasterDataset
 from .utils import minmax_scaling
+
+
+# Hack to suppress rasterio GDAL warnings
+rasterio_logger = logging.getLogger("rasterio._env")
+rasterio_logger.setLevel(logging.ERROR)
 
 
 class GEEMSImage:
