@@ -69,8 +69,8 @@ class Normalize:
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         data = sample[self.on_key].float()
-        nodata_mask = data == self.nodata
-        
+        nodata_mask = data == self.nodata if self.nodata is not None else None
+
         # Handle different tensor shapes for masks vs images
         if self.on_key == "mask":
             # For masks, we need to preserve the batch dimension
@@ -78,29 +78,40 @@ class Normalize:
             if data.ndim == 2:
                 # Add batch and channel dimensions: (H, W) -> (1, 1, H, W)
                 data = data.unsqueeze(0).unsqueeze(0)
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.unsqueeze(0).unsqueeze(0)
             elif data.ndim == 3:
                 # Add channel dimension: (B, H, W) -> (B, 1, H, W)
                 data = data.unsqueeze(1)
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.unsqueeze(1)
         else:
             # For images, add batch dimension if needed
             if data.ndim == 3:
                 # Add batch dimension: (C, H, W) -> (1, C, H, W)
                 data = data.unsqueeze(0)
-        
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.unsqueeze(0)
+
         data = tvF.normalize(data, self.mean, self.std)
-        
+
         # Remove extra dimensions we added
         if self.on_key == "mask":
             # Remove channel dimension: (B, 1, H, W) -> (B, H, W)
             data = data.squeeze(1)
+            if nodata_mask is not None:
+                nodata_mask = nodata_mask.squeeze(1)
         else:
             # Remove batch dimension if we added it: (1, C, H, W) -> (C, H, W)
             if sample[self.on_key].ndim == 3:
                 data = data.squeeze(0)
-            
-        if self.nodata is not None:
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.squeeze(0)
+
+        # Apply nodata mask after all shape transformations
+        if self.nodata is not None and nodata_mask is not None:
             data[nodata_mask] = self.nodata
-            
+
         sample[self.on_key] = data
         return sample
 
