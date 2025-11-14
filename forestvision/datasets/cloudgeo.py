@@ -142,15 +142,19 @@ class CloudRasterDataset(GeoDataset):
         return self._res
 
     @res.setter
-    def res(self, value: float):
+    def res(self, value: float | tuple):
         """Set the resolution of the dataset.
 
         Args:
-            value (float): Resolution in meters per pixel.
+            value (float | tuple): Resolution in meters per pixel. If a tuple is provided,
+                the first element (x-resolution) will be used.
 
         Raises:
             AssertionError: If value is not greater than 0.
         """
+        # Handle tuple resolution (x_res, y_res) by using the x-resolution
+        if isinstance(value, tuple):
+            value = value[0]
         assert value > 0, "Resolution must be greater than 0"
         self._res = value
 
