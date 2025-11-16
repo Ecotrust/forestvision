@@ -58,7 +58,7 @@ class DatasetStats:
         )
 
         self.data_key = "image" if dataset.is_image else "mask"
-        if path and isinstance(dataset.paths, (str, Path)):
+        if path and isinstance(path, (str, Path)):
             self.path = path
         elif dataset.paths and isinstance(dataset.paths, str):
             self.path = os.path.join(dataset.paths, "stats.pt")
@@ -70,6 +70,7 @@ class DatasetStats:
         elif channels is None:
             raise ValueError("No channel information available.")
 
+        self.channels = channels
         self.datset_name = dataset.__class__.__name__
         self.samples = len(self.dataloader) * batch_size
         self.dim = on_dims
@@ -92,24 +93,20 @@ class DatasetStats:
                 image = batch[self.data_key].float()
                 ndmask = image == self.nodata
                 image[ndmask] = float("nan")
-                
-                # Dynamically adjust dimensions based on tensor shape
-                if image.dim() == 3:  # channels, height, width
-                    on_dims = (1, 2)  # sum over height and width
-                elif image.dim() == 4:  # batch, channels, height, width
-                    on_dims = (0, 2, 3)  # sum over batch, height and width
-                else:
-                    raise ValueError(f"Unsupported tensor dimension: {image.dim()}")
-                
-                self._sum += torch.nansum(image, dim=on_dims)
-                self._sum_sq += torch.nansum(image**2, dim=on_dims)
-                self._count += torch.sum(~torch.isnan(image), dim=on_dims)
+
+                if self.channels == 1 and self.channels != image.shape[1]:
+                    image = image.unsqueeze(1)
+                    ndmask = ndmask.unsqueeze(1)
+
+                self._sum += torch.nansum(image, dim=self.dim)
+                self._sum_sq += torch.nansum(image**2, dim=self.dim)
+                self._count += torch.sum(~torch.isnan(image), dim=self.dim)
                 image[ndmask] = float("inf")
-                self._min = torch.stack([self._min, image.amin(dim=on_dims)]).amin(
+                self._min = torch.stack([self._min, image.amin(dim=self.dim)]).amin(
                     dim=0
                 )
                 image[ndmask] = float("-inf")
-                self._max = torch.stack([self._max, image.amax(dim=on_dims)]).amax(
+                self._max = torch.stack([self._max, image.amax(dim=self.dim)]).amax(
                     dim=0
                 )
                 if self.nodata is not None:
@@ -164,11 +161,10 @@ def minmax_scaling(data: torch.Tensor, nodata: float) -> torch.Tensor:
     max_val = data.amax(dim=dim)
     data[mask] = nodata
 
-    scaled = (data - min_val.reshape(-1, 1, 1)) / (max_val - min_val).reshape(
-        -1, 1, 1
-    )
+    scaled = (data - min_val.reshape(-1, 1, 1)) / (max_val - min_val).reshape(-1, 1, 1)
     scaled[mask] = nodata
     return scaled
+
 
 def save_cog(
     data: numpy.ndarray,
