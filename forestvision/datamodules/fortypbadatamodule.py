@@ -3,26 +3,22 @@ import logging
 from typing import Any, Dict, Optional
 
 import ee
-from tqdm import tqdm
 from dotenv import load_dotenv
-from geopandas import GeoDataFrame
 
 import torch
 from kornia.enhance import Denormalize
 from torch.utils.data import DataLoader
-from torchgeo.datasets import stack_samples, GeoDataset
+from torchgeo.datasets import stack_samples
 from torchvision.transforms import v2
 
 from forestvision.datasets import (
     GNNForestAttr,
     GEESentinel2,
-    DatasetStats,
     GPDFeatureCollection,
 )
 from forestvision.datamodules import CloudDataModule
 from forestvision.transforms import (
     Normalize,
-    ReplaceNodataVal,
     RemapFortypba,
     MinMaxScaler,
     InverseMinMaxScaler,
@@ -37,47 +33,6 @@ torch.set_float32_matmul_precision("medium")
 load_dotenv()
 GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
 TARGET_PATH = os.getenv("TARGET_PATH")
-
-
-def get_stats(
-    dataset: GeoDataset,
-    tiles: GeoDataFrame,
-    nodata: int | None = None,
-    path: str | None = None,
-    overwrite: bool = False,
-) -> dict:
-    """Compute dataset statistics including mean and standard deviation.
-
-    Args:
-        dataset (GeoDataset): The dataset to compute stats for
-        tiles (GeoDataFrame): GeoDataFrame containing tile geometries for sampling
-        nodata (int | None): No data value to exclude from statistics
-        overwrite (bool): Whether to overwrite existing stats
-
-    Returns:
-        dict: Dictionary containing computed statistics (mean, std, etc.)
-    """
-
-    sampler = TileGeoSampler(dataset, tiles=tiles)
-
-    channels = 1
-    if hasattr(dataset, "_bands"):
-        channels = len(dataset._bands)
-
-    if nodata is None:
-        nodata = dataset.nodata
-
-    stats = DatasetStats(
-        dataset,
-        sampler,
-        path=path,
-        batch_size=5,
-        num_workers=20,
-        channels=channels,
-        nodata=nodata,
-        overwrite=overwrite,
-    )
-    return stats.compute()
 
 
 class ForTypesDataModule(CloudDataModule):
@@ -134,6 +89,7 @@ class ForTypesDataModule(CloudDataModule):
         self,
         root: str,
         year: int,
+        stats_path: str,
         batch_size: int | None = None,
         patch_size: int | tuple[int, int] = None,
         epoch_length: int | None = None,
@@ -193,6 +149,7 @@ class ForTypesDataModule(CloudDataModule):
         self.root = root
         self.target_path = target_path or TARGET_PATH
         self.hparams_dict = hparams or {}
+        self.stats_path = stats_path
         self.train_tiles_path = train_tiles_path
         self.val_tiles_path = val_tiles_path
         self.test_tiles_path = test_tiles_path
@@ -220,6 +177,9 @@ class ForTypesDataModule(CloudDataModule):
 
         # Track if stats were loaded from hparams
         self.stats_from_hparams = False
+
+        # Track if transforms have been applied (for lazy application)
+        self._transforms_applied = False
 
         self.inputs_class = GEESentinel2
         self.init_transforms = None  # ReplaceNodataVal(-32768, 0, on_key="image")
@@ -289,6 +249,42 @@ class ForTypesDataModule(CloudDataModule):
                 deserialized[key] = value
         return deserialized
 
+    def _load_stats_from_file(self) -> bool:
+        """Load statistics from the specified stats_path file.
+
+        Returns:
+            bool: True if stats were successfully loaded, False otherwise
+        """
+        if not self.stats_path:
+            logging.info("No stats_path provided, skipping file loading")
+            return False
+
+        if not os.path.exists(self.stats_path):
+            logging.warning(f"Stats file not found at {self.stats_path}")
+            return False
+
+        try:
+            logging.info(f"Loading statistics from {self.stats_path}")
+            stats_dict = torch.load(self.stats_path)
+
+            # Check if stats_dict contains both input and target stats
+            if "input_stats" in stats_dict and "target_stats" in stats_dict:
+                self.input_stats = self._deserialize_stats(stats_dict["input_stats"])
+                self.target_stats = self._deserialize_stats(stats_dict["target_stats"])
+                logging.info(
+                    "Successfully loaded input and target statistics from file"
+                )
+                return True
+            else:
+                logging.warning(
+                    f"Stats file missing required keys: {stats_dict.keys()}"
+                )
+                return False
+
+        except Exception as e:
+            logging.error(f"Failed to load statistics from {self.stats_path}: {e}")
+            return False
+
     def _collate_fn(self, batch):
         """Custom collate function that removes frozen dataclasses before GPU transfer.
 
@@ -335,10 +331,18 @@ class ForTypesDataModule(CloudDataModule):
         based on precomputed statistics. First checks if stats are available in hparams,
         otherwise falls back to computed stats.
 
+        Transform Strategy:
+        - Target transforms (RemapFortypba) are applied to COMBINED datasets to ensure
+          mask remapping happens regardless of dataset composition
+        - Input transforms (MinMaxScaler) are applied to INDIVIDUAL input datasets
+          since they need to be normalized before being combined
+
         Workflow:
         1. Check if hparams contains precomputed stats
         2. If yes, deserialize and use them (skip computation)
         3. If no, use existing computed stats or compute new ones
+        4. Apply target transforms to combined datasets
+        5. Apply input transforms to individual input datasets
         """
         # Check if stats are available in hparams (highest priority)
         if (
@@ -367,7 +371,7 @@ class ForTypesDataModule(CloudDataModule):
                     logging.info("Falling back to stat computation")
                     return  # Let prepare_data() handle computation
 
-        # Apply transforms to combined datasets to ensure remapping happens
+        # Apply target transforms to combined datasets to ensure remapping happens
         # regardless of dataset composition
         target_transforms = v2.Compose(
             [
@@ -375,111 +379,67 @@ class ForTypesDataModule(CloudDataModule):
             ]
         )
 
-        # Apply transforms to all combined datasets
-        if hasattr(self, "train_dataset") and self.train_dataset is not None:
-            self.train_dataset.transforms = target_transforms
-        if hasattr(self, "val_dataset") and self.val_dataset is not None:
-            self.val_dataset.transforms = target_transforms
-        if hasattr(self, "test_dataset") and self.test_dataset is not None:
-            self.test_dataset.transforms = target_transforms
-        if hasattr(self, "predict_dataset") and self.predict_dataset is not None:
-            self.predict_dataset.transforms = target_transforms
+        # Apply target transforms to all combined datasets that exist
+        combined_datasets = [
+            ("train_dataset", self.train_dataset),
+            ("val_dataset", self.val_dataset),
+            ("test_dataset", self.test_dataset),
+            ("predict_dataset", self.predict_dataset),
+        ]
+
+        for name, dataset in combined_datasets:
+            if dataset is not None:
+                dataset.transforms = target_transforms
+                logging.info(f"Applied target transforms to {name}")
 
         if self.input_stats is not None:
-            transforms = v2.Compose(
+            input_transforms = v2.Compose(
                 [
-                    # ReplaceNodataVal(-32768, 0, on_key="image"),
-                    MinMaxScaler(
-                        min=self.input_stats["min"], max=self.input_stats["max"]
+                    Normalize(
+                        min=self.input_stats["mean"],
+                        max=self.input_stats["std"],
+                        on_key="image",
                     ),
                 ]
             )
 
-            # Only set transforms for datasets that exist
-            if hasattr(self, "input_dataset") and self.input_dataset is not None:
-                self.input_dataset.transforms = transforms
-            if (
-                hasattr(self, "val_input_dataset")
-                and self.val_input_dataset is not None
-            ):
-                self.val_input_dataset.transforms = transforms
-            if (
-                hasattr(self, "test_input_dataset")
-                and self.test_input_dataset is not None
-            ):
-                self.test_input_dataset.transforms = transforms
-            if (
-                hasattr(self, "predict_inputs_dataset")
-                and self.predict_inputs_dataset is not None
-            ):
-                self.predict_inputs_dataset.transforms = transforms
+            # Apply input transforms to individual input datasets that exist
+            input_datasets = [
+                ("input_dataset", self.input_dataset),
+                ("val_input_dataset", self.val_input_dataset),
+                ("test_input_dataset", self.test_input_dataset),
+                ("predict_inputs_dataset", self.predict_inputs_dataset),
+            ]
 
-            self.revert_inputs = InverseMinMaxScaler(
-                min=self.input_stats["min"], max=self.input_stats["max"]
+            for name, dataset in input_datasets:
+                if dataset is not None:
+                    dataset.transforms = input_transforms
+                    logging.info(f"Applied input transforms to {name}")
+
+            self.revert_inputs = Denormalize(
+                min=self.input_stats["mean"], max=self.input_stats["std"]
             )
-            self.revert_target = InverseMinMaxScaler(
-                min=self.target_stats["min"], max=self.target_stats["max"]
+            self.revert_target = Denormalize(
+                min=self.target_stats["mean"], max=self.target_stats["std"]
             )
 
     def prepare_data(self, overwrite: bool = False) -> None:
-        """Prepare data by downloading and computing statistics if needed.
+        """Prepare data by downloading datasets.
+
+        Note: Statistics computation has been moved to a separate script.
+        Use scripts/compute_stats.py to compute statistics and then pass
+        the stats file path via the stats_path parameter.
 
         Args:
-            overwrite: Whether to overwrite existing data and statistics
+            overwrite: Whether to overwrite existing data
         """
         self.setup("fit")
-
         logging.info("Preparing training dataset...")
 
-        # Skip stat computation if stats were already loaded from hparams
-        if self.stats_from_hparams:
-            logging.info("Skipping stat computation - using stats from hparams")
-            return
-
-        if self.input_stats is None or overwrite:
-            try:
-                self.input_stats = get_stats(
-                    self.input_dataset,
-                    self.train_tiles.data,
-                    nodata=self.input_dataset.nodata,
-                    path=self.input_stats,
-                    overwrite=overwrite,
-                )
-
-                # For target dataset (classification labels), we don't need stats
-                # Just create a placeholder stats dict for compatibility
-                self.target_stats = {
-                    "mean": torch.tensor([0.0]),
-                    "std": torch.tensor([1.0]),
-                    "min": torch.tensor([0.0]),
-                    "max": torch.tensor([1.0]),
-                    "nodata": 0,
-                    "nodata_pixels": "0 (0.00%)",
-                    "sample_size": 0,  # Placeholder value
-                }
-
-                # Serialize stats to log into hparams
-                self.serialized_input_stats = self._serialize_stats(self.input_stats)
-                self.serialized_target_stats = self._serialize_stats(self.target_stats)
-
-                # Log stats to trainer if available
-                if hasattr(self, "trainer") and self.trainer is not None:
-                    hparams_to_log = {
-                        "datamodule": {
-                            "input_stats": self.serialized_input_stats,
-                            "target_stats": self.serialized_target_stats,
-                        }
-                    }
-                    if (
-                        hasattr(self.trainer, "logger")
-                        and self.trainer.logger is not None
-                    ):
-                        self.trainer.logger.log_hyperparams(hparams_to_log)
-                        logging.info("Statistics logged to trainer hyperparameters")
-
-            except Exception as e:
-                logging.error(f"Failed to compute statistics: {e}")
-                raise
+        # Statistics are now loaded from file in setup() method
+        # or computed separately using scripts/compute_stats.py
+        logging.info("Statistics should be precomputed using scripts/compute_stats.py")
+        logging.info("and loaded via stats_path parameter")
 
     def train_dataloader(self) -> DataLoader:
         """Return the training dataloader using TileGeoSampler.
@@ -487,6 +447,12 @@ class ForTypesDataModule(CloudDataModule):
         Returns:
             DataLoader: Training data loader
         """
+        # Lazy transform application: apply transforms if stats are available but not applied yet
+        if self.input_stats is not None and not self._transforms_applied:
+            logging.info("Lazy applying transforms in train_dataloader...")
+            self.setup_transforms()
+            self._transforms_applied = True
+
         if self.train_sampler is None:
             self.train_sampler = TileGeoSampler(
                 self.train_dataset, self.train_tiles.data, shuffle=True
@@ -506,6 +472,12 @@ class ForTypesDataModule(CloudDataModule):
         Returns:
             DataLoader: Validation data loader
         """
+        # Lazy transform application: apply transforms if stats are available but not applied yet
+        if self.input_stats is not None and not self._transforms_applied:
+            logging.info("Lazy applying transforms in val_dataloader...")
+            self.setup_transforms()
+            self._transforms_applied = True
+
         if self.val_sampler is None:
             self.val_sampler = TileGeoSampler(
                 self.val_dataset, self.val_tiles.data, shuffle=True
@@ -525,6 +497,12 @@ class ForTypesDataModule(CloudDataModule):
         Returns:
             DataLoader: Test data loader
         """
+        # Lazy transform application: apply transforms if stats are available but not applied yet
+        if self.input_stats is not None and not self._transforms_applied:
+            logging.info("Lazy applying transforms in test_dataloader...")
+            self.setup_transforms()
+            self._transforms_applied = True
+
         if not hasattr(self, "test_dataset") or self.test_dataset is None:
             self.setup("test")
 
@@ -590,6 +568,10 @@ class ForTypesDataModule(CloudDataModule):
             if year is None:
                 raise ValueError("year parameter required for predict stage")
             self._setup_predict_stage(year)
+
+        # Load statistics from file if available and not already loaded
+        if self.input_stats is None and self.stats_path:
+            self._load_stats_from_file()
 
         self.setup_transforms()
 
