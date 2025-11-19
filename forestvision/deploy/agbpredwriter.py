@@ -11,7 +11,6 @@ from rasterio.crs import CRS
 import rasterio
 
 from forestvision.datasets.utils import save_cog
-from forestvision.transforms import Denormalize
 
 
 class AGBPredictionSaver(BasePredictionWriter):
