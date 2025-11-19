@@ -105,6 +105,7 @@ class AnyRasterDataset(RasterDataset):
         nodata: int = None,
         crs: CRS = None,
         res: float = None,
+        bands: list[int] | None = None,
         is_image: bool = False,
         transforms: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         cache: bool = False,
@@ -133,8 +134,10 @@ class AnyRasterDataset(RasterDataset):
         self.is_image = is_image
         if res:
             self._res = res
-        super().__init__(paths, crs, res, transforms=transforms, cache=cache)
-    
+        super().__init__(
+            paths, crs, res, bands=bands, transforms=transforms, cache=cache
+        )
+
     @property
     def res(self) -> float:
         """Get the resolution of the dataset.
@@ -143,7 +146,7 @@ class AnyRasterDataset(RasterDataset):
             float: Resolution in meters per pixel.
         """
         # Handle both single float and tuple cases
-        if hasattr(self, '_res') and self._res is not None:
+        if hasattr(self, "_res") and self._res is not None:
             if isinstance(self._res, tuple):
                 # Return the x resolution (first element of tuple)
                 return float(self._res[0])
@@ -203,21 +206,3 @@ class AnyRasterDataset(RasterDataset):
             plt.suptitle(suptitle)
 
         return fig
-
-
-if __name__ == "__main__":
-    from torchgeo.datasets import BoundingBox
-
-    agbp = AGBPredictions()
-    # coords(minx, maxx, miny, maxy, mint, maxt)
-    coords = (
-        -2294721.6813173853,
-        -2287041.6813173853,
-        2451475.162286404,
-        2459155.162286404,
-        0,
-        9223372036854775807,
-    )
-    bbox = BoundingBox(*coords)
-    sample = agbp.__getitem__(bbox)
-    print(sample.keys())
