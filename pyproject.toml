@@ -2,6 +2,10 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forestvision*"]
+
 [project]
 name = "forestvision"
 version = "0.1.0"
@@ -10,6 +14,7 @@ authors = [
 ]
 description = "Machine learning package for forest analysis from remote sensing data"
 readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "earthengine-api",
@@ -18,7 +23,7 @@ dependencies = [
     "torch>=2.5.1",
     "torchvision>=0.20.1",
     "lightning[all]",
-    "torchgeo[all]",
+    "torchgeo",
     "rasterio",
     "scikit-learn",
     "numpy",
@@ -35,11 +40,14 @@ dependencies = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: GIS",
 ]
+
+[tool.setuptools.package-data]
+"forestvision" = ["py.typed"]
+"*" = ["*.yaml", "*.yml", "*.json", "*.geojson"]
 
 [project.urls]
 Homepage = "https://github.com/ygalvan/forestvision"
