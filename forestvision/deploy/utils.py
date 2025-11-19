@@ -134,9 +134,8 @@ class AnyRasterDataset(RasterDataset):
         self.is_image = is_image
         if res:
             self._res = res
-        super().__init__(
-            paths, crs, res, bands=bands, transforms=transforms, cache=cache
-        )
+        super().__init__(paths, crs, res, transforms=transforms, cache=cache)
+        self.bands = bands
 
     @property
     def res(self) -> float:
