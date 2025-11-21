@@ -154,15 +154,18 @@ def minmax_scaling(data: torch.Tensor, nodata: float) -> torch.Tensor:
         data = data.unsqueeze(0)
     if len(data.shape) > 3:
         raise ValueError("Input tensor must have shape CxHxW")
-    mask = data == nodata
-    data[data == nodata] = float("inf")
+    if nodata is not None:
+        data[mask] = nodata
+        mask = data == nodata
+        data[data == nodata] = float("inf")
+
     min_val = data.amin(dim=dim)
     data[data == float("inf")] = float("-inf")
     max_val = data.amax(dim=dim)
-    data[mask] = nodata
 
     scaled = (data - min_val.reshape(-1, 1, 1)) / (max_val - min_val).reshape(-1, 1, 1)
-    scaled[mask] = nodata
+    if nodata is not None:
+        scaled[mask] = nodata
     return scaled
 
 
