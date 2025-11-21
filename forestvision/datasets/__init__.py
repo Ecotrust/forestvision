@@ -3,6 +3,7 @@ from .geesentinel import GEESentinel2
 from .geelandsat import GEELandsat8, GEELandsatTimeSeries, GEELandTrendr, GEELandsatFTV
 from .geealphaearth import GEEAlphaEarth
 from .geedw import GEEDynamicWorld
+from .gee3dep import GEE3Dep
 from .emapragb import eMapRAGB
 from .geegfc import GEEGlobalForestChange
 from .osugnn import GNNForestAttr
@@ -22,6 +23,7 @@ __all__ = [
     "GEELandTrendr",
     "GEEDynamicWorld",
     "GEEAlphaEarth",
+    "GEE3Dep",
     "eMapRAGB",
     "GEEGlobalForestChange",
     "GNNForestAttr",
