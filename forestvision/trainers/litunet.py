@@ -279,7 +279,7 @@ class SegmentationUNet(BaseTask):
         loss: str = "ce",
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
-        ignore_index: int = 0,
+        ignore_index: int = None,
         labels: dict = None,
         colormap: dict = None,
     ):
