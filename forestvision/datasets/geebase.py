@@ -67,7 +67,7 @@ class GEEMSImage:
         image: ee.Image,
         scale: int,
         bounds: Tuple[float, float, float, float] = None,
-        epsg: Union[str, int] = 4326,
+        epsg: Union[str, int] = None,
         bands: List[str] = None,
         dimensions: Tuple[int, int] = None,
         nodata: int = 0,
