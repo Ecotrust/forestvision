@@ -1,14 +1,11 @@
 from abc import abstractmethod, ABC
-import hashlib
 import numpy
 import rasterio
-import pandas
 import rasterio.transform
 from torchgeo.datasets import RasterDataset, BoundingBox
 
 from forestvision.datasets import (
     CloudRasterDataset,
-    ForestOwnership,
     GPDFeatureCollection,
 )
 
@@ -116,9 +113,7 @@ class ZonalStatsBase(ABC):
 
         if self.zones_raster:
             try:
-                zones = (
-                    self.zones_raster.__getitem__(bbox)[self.data_key].squeeze().numpy()
-                )
+                zones = self.zones_raster.__getitem__(bbox)["mask"].squeeze().numpy()
             except IndexError as e:
                 print(f"Error: {e}")
                 return None
