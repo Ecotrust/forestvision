@@ -23,7 +23,7 @@ dependencies = [
     "torch>=2.5.1",
     "torchvision>=0.20.1",
     "lightning[all]",
-    "torchgeo",
+    "torchgeo>=0.7",
     "rasterio",
     "scikit-learn",
     "numpy",
