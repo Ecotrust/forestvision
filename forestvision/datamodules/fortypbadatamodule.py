@@ -8,12 +8,13 @@ from dotenv import load_dotenv
 import torch
 from kornia.enhance import Denormalize
 from torch.utils.data import DataLoader
-from torchgeo.datasets import stack_samples
+from torchgeo.datasets import stack_samples, IntersectionDataset
 from torchvision.transforms import v2
 
 from forestvision.datasets import (
     GNNForestAttr,
     GEESentinel2,
+    GEE3Dep,
     GPDFeatureCollection,
 )
 from forestvision.datamodules import CloudDataModule
@@ -33,6 +34,14 @@ torch.set_float32_matmul_precision("medium")
 load_dotenv()
 GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
 TARGET_PATH = os.getenv("TARGET_PATH")
+
+
+class ClimateNA(AnyRasterDataset):
+    all_bands = ["AHM", "MAP", "TD"]
+    _cmap = None
+    rgb_bands = ["AHM", "MAP", "TD"]
+    instrument = "ClimateNA"
+    nodata = -9999
 
 
 class ForTypesDataModule(CloudDataModule):
@@ -181,11 +190,13 @@ class ForTypesDataModule(CloudDataModule):
         # Track if transforms have been applied (for lazy application)
         self._transforms_applied = False
 
-        self.inputs_class = GEESentinel2
+        self.satimagery_class = GEESentinel2
+        self.dem_class = GEE3Dep
+        self.climate_class = ClimateNA
         self.init_transforms = None  # ReplaceNodataVal(-32768, 0, on_key="image")
 
         super().__init__(
-            dataset_class=self.inputs_class,
+            dataset_class=self.satimagery_class,
             batch_size=batch_size,
             patch_size=patch_size,
             length=epoch_length,
@@ -247,6 +258,7 @@ class ForTypesDataModule(CloudDataModule):
                 deserialized[key] = ForTypesDataModule._deserialize_stats(value)
             else:
                 deserialized[key] = value
+
         return deserialized
 
     def _load_stats_from_file(self) -> bool:
@@ -263,12 +275,35 @@ class ForTypesDataModule(CloudDataModule):
             logging.warning(f"Stats file not found at {self.stats_path}")
             return False
 
+        def extract_datasets(dataset):
+            if isinstance(dataset, IntersectionDataset):
+                result = []
+                for ds in dataset.datasets:
+                    result.extend(extract_datasets(ds))
+                return result
+            else:
+                return [dataset]
+
         try:
             logging.info(f"Loading statistics from {self.stats_path}")
             stats_dict = torch.load(self.stats_path)
 
             # Check if stats_dict contains both input and target stats
             if "input_stats" in stats_dict and "target_stats" in stats_dict:
+                # If input_datasets is an IntersectionDataset, merge stats from all datasets
+                if isinstance(self.input_dataset, IntersectionDataset):
+                    all_input_stats = {"mean": [], "std": [], "min": [], "max": []}
+                    input_stats = stats_dict["input_stats"]
+                    for key in all_input_stats.keys():
+                        all_input_stats[key] = [
+                            i
+                            for sbl in [
+                                input_stats.get(ds.__class__.__name__).get(key)
+                                for ds in extract_datasets(self.input_dataset)
+                            ]
+                            for i in sbl
+                        ]
+                    stats_dict["input_stats"] = all_input_stats
                 self.input_stats = self._deserialize_stats(stats_dict["input_stats"])
                 self.target_stats = self._deserialize_stats(stats_dict["target_stats"])
                 logging.info(
@@ -306,15 +341,15 @@ class ForTypesDataModule(CloudDataModule):
         logging.info(f"Mask unique values in collate: {mask_unique}")
 
         # Verify that mask values are in the expected range [0-13, -1]
-        expected_values = set(range(0, 14)) | {-1}
-        actual_values = set(mask_unique.tolist())
+        # expected_values = set(range(0, 14)) | {-1}
+        # actual_values = set(mask_unique.tolist())
 
-        unexpected_values = actual_values - expected_values
-        if unexpected_values:
-            logging.warning(f"Unexpected mask values detected: {unexpected_values}")
-            logging.warning(f"Expected range: {expected_values}, Got: {actual_values}")
-        else:
-            logging.info("Mask values are properly remapped to [0-13, -1]")
+        # unexpected_values = actual_values - expected_values
+        # if unexpected_values:
+        #     logging.warning(f"Unexpected mask values detected: {unexpected_values}")
+        #     logging.warning(f"Expected range: {expected_values}, Got: {actual_values}")
+        # else:
+        #     logging.info("Mask values are properly remapped to [0-13, -1]")
 
         # prep mask
         return {
@@ -396,8 +431,8 @@ class ForTypesDataModule(CloudDataModule):
             input_transforms = v2.Compose(
                 [
                     Normalize(
-                        min=self.input_stats["mean"],
-                        max=self.input_stats["std"],
+                        mean=self.input_stats["mean"],
+                        std=self.input_stats["std"],
                         on_key="image",
                     ),
                 ]
@@ -417,10 +452,10 @@ class ForTypesDataModule(CloudDataModule):
                     logging.info(f"Applied input transforms to {name}")
 
             self.revert_inputs = Denormalize(
-                min=self.input_stats["mean"], max=self.input_stats["std"]
+                mean=self.input_stats["mean"], std=self.input_stats["std"]
             )
             self.revert_target = Denormalize(
-                min=self.target_stats["mean"], max=self.target_stats["std"]
+                mean=self.target_stats["mean"], std=self.target_stats["std"]
             )
 
     def prepare_data(self, overwrite: bool = False) -> None:
@@ -584,30 +619,80 @@ class ForTypesDataModule(CloudDataModule):
             os.path.join(self.root, self.val_tiles_path)
         )
 
-        dataset_class_name = self.inputs_class.__name__.lower()
-        training_inputs_path = os.path.join(
-            self.root, f"training/{dataset_class_name}/{self.year}"
+        self.training_satimagery_path = os.path.join(
+            self.root,
+            "training",
+            self.satimagery_class.__name__.lower(),
+            str(self.year),
         )
-        validation_inputs_path = os.path.join(
-            self.root, f"validation/{dataset_class_name}/{self.year}"
+        self.training_dem_path = os.path.join(
+            self.root, "training", self.dem_class.__name__.lower(), str(self.year)
         )
+        self.training_cimate_path = os.path.join(self.root, "training", "climatena")
 
-        self.input_dataset = self.inputs_class(
+        validation_satimagery_path = self.training_satimagery_path.replace(
+            "training", "validation"
+        )
+        validation_dem_path = self.training_dem_path.replace("training", "validation")
+        # We will use the same path for training and validation climate data
+        validation_climate_path = self.training_cimate_path
+
+        training_satimagery_dataset = self.satimagery_class(
             year=self.year,
             roi=self.train_tiles.bounds,
-            path=training_inputs_path,
+            path=self.training_satimagery_path,
             transforms=self.init_transforms,
             download=True,
         )
-        self.val_input_dataset = self.inputs_class(
-            year=self.year,
-            roi=self.val_tiles.bounds,
-            path=validation_inputs_path,
+        training_dem_dataset = self.dem_class(
+            roi=self.train_tiles.bounds,
+            res=10,
+            path=self.training_dem_path,
+            transforms=self.init_transforms,
             download=True,
         )
+        training_climate_dataset = self.climate_class(
+            paths=self.training_cimate_path,
+            glob="*.tif",
+            crs=self.target_dataset.crs,
+            res=10,
+            is_image=True,
+            nodata=-9999,
+        )
 
-        # Combine mask & inputs
+        val_satimagery_dataset = self.satimagery_class(
+            year=self.year,
+            roi=self.val_tiles.bounds,
+            path=validation_satimagery_path,
+            transforms=self.init_transforms,
+            download=True,
+        )
+        val_dem_dataset = self.dem_class(
+            roi=self.val_tiles.bounds,
+            res=10,
+            path=validation_dem_path,
+            transforms=self.init_transforms,
+            download=True,
+        )
+        # val_climate_dataset = self.climate_class(
+        #     paths=validation_climate_path,
+        #     glob="*.vrt",
+        #     crs=self.target_dataset.crs,
+        #     res=10,
+        #     is_image=True,
+        # )
+
+        # Combine datasets
+        self.input_dataset = (
+            training_satimagery_dataset
+            & training_dem_dataset
+            & training_climate_dataset
+        )
         self.train_dataset = self.target_dataset & self.input_dataset
+
+        self.val_input_dataset = (
+            val_satimagery_dataset & val_dem_dataset & training_climate_dataset
+        )
         self.val_dataset = self.target_dataset & self.val_input_dataset
 
     def _setup_test_stage(self) -> None:
@@ -616,12 +701,12 @@ class ForTypesDataModule(CloudDataModule):
             os.path.join(self.root, self.test_tiles_path)
         )
 
-        dataset_class_name = self.inputs_class.__name__.lower()
+        dataset_class_name = self.satimagery_class.__name__.lower()
         test_inputs_path = os.path.join(
-            self.root, f"test/{dataset_class_name}/{self.year}"
+            self.root, "test", dataset_class_name, str(self.year)
         )
 
-        self.test_input_dataset = self.inputs_class(
+        self.test_input_dataset = self.satimagery_class(
             year=self.year,
             roi=self.test_tiles.bounds,
             path=test_inputs_path,
@@ -641,7 +726,7 @@ class ForTypesDataModule(CloudDataModule):
             os.path.join(self.root, self.predict_tiles_path)
         )
 
-        dataset_class_name = self.inputs_class.__name__.lower()
+        dataset_class_name = self.satimagery_class.__name__.lower()
         predict_inputs_path = os.path.join(self.root, f"predict/{dataset_class_name}")
 
         self.predict_inputs_dataset = AnyRasterDataset(
