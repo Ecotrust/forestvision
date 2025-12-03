@@ -61,8 +61,6 @@ class GEE3Dep(GEERasterDataset):
 
     def __init__(
         self,
-        date_start: str,
-        date_end: str,
         roi: Optional[BoundingBox] = None,
         res: float = 10.2,
         bands: Optional[list] = None,
@@ -111,17 +109,11 @@ class GEE3Dep(GEERasterDataset):
             overwrite=overwrite,
             cache=cache,
         )
-        self.date_start = date_start
-        self.date_end = date_end
         self.bands = bands or ["elevation"]
 
     @property
     def collection(self):
-        return (
-            ee.ImageCollection(self.gee_asset_id)
-            # .filterDate(self.date_start, self.date_end)
-            .select(self.bands)
-        )
+        return ee.ImageCollection(self.gee_asset_id).select(self.bands)
 
     def _reducer(self, collection: ee.ImageCollection) -> ee.Image:
         """Reduce collection to a single image."""
