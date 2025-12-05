@@ -60,10 +60,10 @@ class DatasetStats:
         self.data_key = "image" if dataset.is_image else "mask"
         if path and isinstance(path, (str, Path)):
             self.path = path
-        elif dataset.paths and isinstance(dataset.paths, str):
-            self.path = os.path.join(dataset.paths, "stats.pt")
-        else:
-            self.path = None
+        # elif dataset.paths and isinstance(dataset.paths, str):
+        #     self.path = os.path.join(dataset.paths, "stats.pt")
+        # else:
+        #     self.path = None
 
         if channels is None and hasattr(dataset, "bands"):
             channels = len(dataset.bands)
@@ -109,8 +109,7 @@ class DatasetStats:
                 self._max = torch.stack([self._max, image.amax(dim=self.dim)]).amax(
                     dim=0
                 )
-                if self.nodata is not None:
-                    ndpixels += ndmask.sum().item()
+                ndpixels += ndmask.sum().item()
 
             mean = self._sum / self._count
             meansq = self._sum_sq / self._count
@@ -122,7 +121,7 @@ class DatasetStats:
                 "min": self._min,
                 "max": self._max,
                 "nodata": self.nodata,
-                "nodata_pixels": f"{ndpixels} ({(100*ndpixels/self._count.sum()).item():.2f}%)",
+                "nodata_pixels": f"{ndpixels} ({100*(ndpixels/(self._count.sum() + ndpixels)).item():.2f}%)",
                 "sample_size": self.samples,
             }
 
