@@ -199,6 +199,7 @@ class GEEMSImage:
                 "crs": self.crs,
                 "region": self.region,
                 "filePerBand": False,
+                # "format": "GeoTIFF",
                 "formatOptions": {"cloudOptimized": True, "noData": self.nodata},
             }
             # GEE will throw an error if both dimensions and scale are provided
@@ -276,6 +277,8 @@ class GEEMSImage:
         preview: bool = False,
     ) -> str:
         """Get URL to download Earth Engine image.
+
+        Maximum request size is 32 MB, maximum grid dimension is 10000.
 
         Args:
             params (Dict[str, Any], optional): Additional parameters to pass to
