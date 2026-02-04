@@ -286,13 +286,13 @@ class GEEQueueManager:
     should not stay in the queue for too long.
     """
     
-    def __init__(self, max_concurrent: int = 5, rate_limit_delay: float = 0.1, max_queue_age: float = 300.0):
+    def __init__(self, max_concurrent: int = 10, rate_limit_delay: float = 0.05, max_queue_age: float = 600.0):
         """Initialize a new GEEQueueManager.
         
         Args:
             max_concurrent: Maximum number of concurrent GEE requests
             rate_limit_delay: Delay between requests to avoid rate limiting
-            max_queue_age: Maximum age in seconds for requests in queue (default 5 minutes)
+            max_queue_age: Maximum age in seconds for requests in queue (default 10 minutes)
         """
         self._queue = queue.Queue()
         self._lock = threading.Lock()
@@ -460,11 +460,13 @@ def _get_queue_manager() -> GEEQueueManager:
     if _queue_manager is None:
         with _queue_manager_lock:
             if _queue_manager is None:  # Double-check locking
-                _queue_manager = GEEQueueManager()
+                # Increase concurrency for multi-worker DataLoaders
+                # 10 concurrent requests is a safe default for most GEE accounts
+                _queue_manager = GEEQueueManager(max_concurrent=10, rate_limit_delay=0.05)
                 _queue_manager.start()  # Auto-start the worker thread
     return _queue_manager
 
-def start_gee_queue(max_concurrent: int = 5, rate_limit_delay: float = 0.1):
+def start_gee_queue(max_concurrent: int = 10, rate_limit_delay: float = 0.05):
     """Start the GEE request queue processor.
     
     Args:
@@ -472,6 +474,10 @@ def start_gee_queue(max_concurrent: int = 5, rate_limit_delay: float = 0.1):
         rate_limit_delay: Delay between requests to avoid rate limiting
     """
     manager = _get_queue_manager()
+    # If manager was already started with different params, we might want to update them
+    with manager._lock:
+        manager._max_concurrent = max_concurrent
+        manager._rate_limit_delay = rate_limit_delay
     manager.start()
     logging.info(f"GEE queue started with {max_concurrent} max concurrent requests")
 
@@ -518,6 +524,7 @@ def reset_gee_queue_stats():
         'expired': 0
     }
 
+# TODO: Add option to overwrite existing files
 
 class GEEMSImage:
     """Wrapper class to fetch Google Earth Engine (GEE) images.
@@ -573,7 +580,7 @@ class GEEMSImage:
                 (width, height). If None, fetches the full image.
             nodata (int, optional): NoData value for the image. Defaults to 0.
             timeout (float, optional): Timeout in seconds for fetch operations.
-                Defaults to 120 seconds.
+                Defaults to 300 seconds.
 
         Raises:
             ValueError: If input image is not an ee.Image object or has no bands.
@@ -592,7 +599,7 @@ class GEEMSImage:
         self.bounds = bounds
         self._bands: List[str] = bands
         self.nodata = nodata
-        self.timeout = timeout or 120.0  # Default timeout: 120 seconds
+        self.timeout = timeout or 300.0  # Default timeout: 300 seconds
     
     def __del__(self):
         """Cleanup resources when object is deleted."""
@@ -941,7 +948,19 @@ class GEEMSImage:
             
             # Wait for completion with instance timeout
             if not request.wait(timeout=self.timeout):
-                raise TimeoutError(f"Queue request timed out after {self.timeout} seconds")
+                stats = get_gee_queue_stats()
+                msg = (
+                    f"Queue request timed out after {self.timeout} seconds. "
+                    f"Queue Stats: {stats}. "
+                    f"Request Age: {request.age:.1f}s. "
+                    f"Status: {request.status.name}. "
+                )
+                if request.status == RequestStatus.PENDING:
+                    msg += "Request is still pending in queue. Consider increasing max_concurrent."
+                elif request.status == RequestStatus.RUNNING:
+                    msg += "Request is currently running but taking too long."
+                
+                raise TimeoutError(msg)
             
             # Get result and error in thread-safe manner
             result, error = request.get_result()
