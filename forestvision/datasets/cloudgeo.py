@@ -102,7 +102,7 @@ class CloudRasterDataset(GeoDataset):
             minx, maxx, miny, maxy, mint, maxt = roi
         except Exception as e:
             raise ValueError(f"Provide a valid ROI: {e}")
-
+        # TODO: Improve hashing to include image collection info: bands, year, season, etc.
         roi_id = hashlib.md5((minx, maxx, miny, maxy).__str__().encode()).hexdigest()
         self.index.insert(0, (minx, maxx, miny, maxy, mint, maxt), roi_id)
         self._crs = cast(CRS, crs)
