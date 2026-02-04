@@ -91,7 +91,14 @@ class DatasetStats:
         if any([none_or_notexists == False, self.overwrite]):
             for batch in tqdm(self.dataloader):
                 image = batch[self.data_key].float()
-                ndmask = image == self.nodata
+                
+                # Create nodata mask - handle None case safely
+                if self.nodata is not None:
+                    ndmask = image == self.nodata
+                else:
+                    # If no nodata value specified, create all-False mask
+                    ndmask = torch.zeros_like(image, dtype=torch.bool)
+                
                 image[ndmask] = float("nan")
 
                 if self.channels == 1 and self.channels != image.shape[1]:
@@ -109,7 +116,9 @@ class DatasetStats:
                 self._max = torch.stack([self._max, image.amax(dim=self.dim)]).amax(
                     dim=0
                 )
-                ndpixels += ndmask.sum().item()
+                # Ensure ndmask is a tensor before calling sum()
+                if isinstance(ndmask, torch.Tensor):
+                    ndpixels += ndmask.sum().item()
 
             mean = self._sum / self._count
             meansq = self._sum_sq / self._count
