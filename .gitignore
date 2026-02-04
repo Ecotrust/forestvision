@@ -12,10 +12,13 @@
 *.rar
 *log_*
 *.log
+
+# Ignore specific directories
 data/*/
 data/dev
 logs/*
 lightning_logs/*
+experiments/*
 
 # Ignore Python compiled files
 *.pyc
