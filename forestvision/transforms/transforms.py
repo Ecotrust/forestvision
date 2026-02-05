@@ -69,44 +69,32 @@ class Normalize:
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         data = sample[self.on_key].float()
+
+        # Store original shape for restoration
+        original_shape = data.shape
+
+        # Create nodata mask before any shape modifications
         nodata_mask = data == self.nodata if self.nodata is not None else None
 
-        # Handle different tensor shapes for masks vs images
-        if self.on_key == "mask":
-            # For masks, we need to preserve the batch dimension
-            # Masks typically come as (B, H, W) or (H, W)
-            if data.ndim == 2:
-                # Add batch and channel dimensions: (H, W) -> (1, 1, H, W)
-                data = data.unsqueeze(0).unsqueeze(0)
-                if nodata_mask is not None:
-                    nodata_mask = nodata_mask.unsqueeze(0).unsqueeze(0)
-            elif data.ndim == 3:
-                # Add channel dimension: (B, H, W) -> (B, 1, H, W)
+        # Ensure data is 4D (B, C, H, W) for tvF.normalize
+        if data.ndim == 2:
+            # (H, W) -> (1, 1, H, W)
+            data = data.unsqueeze(0).unsqueeze(0)
+        elif data.ndim == 3:
+            # Distinguish between (B, H, W) for masks and (C, H, W) for images
+            if self.on_key == "mask" and len(self.mean) == 1:
+                # (B, H, W) -> (B, 1, H, W)
                 data = data.unsqueeze(1)
-                if nodata_mask is not None:
-                    nodata_mask = nodata_mask.unsqueeze(1)
-        else:
-            # For images, add batch dimension if needed
-            if data.ndim == 3:
-                # Add batch dimension: (C, H, W) -> (1, C, H, W)
+            else:
+                # (C, H, W) -> (1, C, H, W)
                 data = data.unsqueeze(0)
-                if nodata_mask is not None:
-                    nodata_mask = nodata_mask.unsqueeze(0)
+        # else: data.ndim == 4, already in correct format
 
+        # Apply normalization
         data = tvF.normalize(data, self.mean, self.std)
 
-        # Remove extra dimensions we added
-        if self.on_key == "mask":
-            # Remove channel dimension: (B, 1, H, W) -> (B, H, W)
-            data = data.squeeze(1)
-            if nodata_mask is not None:
-                nodata_mask = nodata_mask.squeeze(1)
-        else:
-            # Remove batch dimension if we added it: (1, C, H, W) -> (C, H, W)
-            if sample[self.on_key].ndim == 3:
-                data = data.squeeze(0)
-                if nodata_mask is not None:
-                    nodata_mask = nodata_mask.squeeze(0)
+        # Restore original shape
+        data = data.view(original_shape)
 
         # Apply nodata mask after all shape transformations
         if self.nodata is not None and nodata_mask is not None:
@@ -180,7 +168,10 @@ class MaskFromRaster:
     """
 
     # we want to avoid importing cv2 unless necessary
-    cv = __import__("cv2")
+    try:
+        import cv2 as cv
+    except ImportError:
+        cv = None
 
     def __init__(
         self,
@@ -203,6 +194,11 @@ class MaskFromRaster:
         self.invert = invert
 
     def _filter(self, mask: torch.Tensor) -> torch.Tensor:
+        if self.cv is None:
+            raise ImportError(
+                "OpenCV (cv2) is required for morphological filtering. "
+                "Please install it with 'pip install opencv-python'."
+            )
         filtered = self.cv.morphologyEx(
             numpy.asarray(tvF.to_pil_image(mask.float())),
             self.cv.MORPH_OPEN,
@@ -308,3 +304,539 @@ class ResizeRaster:
             )
 
         return sample
+
+
+class RemapFortypba:
+    """Remap forest type codes using the GNN to ODF mapping.
+
+    This transform applies the same remapping logic as GNNForestAttr.__getitem__()
+    but ensures it happens consistently in the transform pipeline regardless of
+    dataset composition.
+
+    Args:
+        remap_dict (dict): Dictionary mapping GNN codes to ODF codes
+        on_key (str): The key of the data to remap (should be "mask")
+    """
+
+    def __init__(self, remap_dict: dict, on_key: str = "mask"):
+        assert on_key in ["image", "mask"], "on_key must be either 'image' or 'mask'"
+        self.remap_dict = remap_dict
+        self.on_key = on_key
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample[self.on_key]
+
+        # Apply remapping to each unique value in the tensor
+        unique_vals = torch.unique(data)
+        for val in unique_vals:
+            val_int = int(val.item())
+            if val_int in self.remap_dict:
+                data[data == val] = self.remap_dict[val_int]
+
+        sample[self.on_key] = data
+        return sample
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(remap_dict={self.remap_dict})"
+
+
+class AppendNDVI:
+    """Append NDVI band to an image.
+
+    This class wraps torchgeo.transforms.AppendNDVI to handle dictionary samples.
+
+    Args:
+        index_nir (int): Index of the NIR band.
+        index_red (int): Index of the red band.
+    """
+
+    def __init__(self, index_nir: int, index_red: int):
+        from torchgeo.transforms import AppendNDVI as TGAppendNDVI
+
+        self.index_nir = index_nir
+        self.index_red = index_red
+        self.transform = TGAppendNDVI(index_nir=index_nir, index_red=index_red)
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        # Ensure data is 4D (B, C, H, W) for Kornia-based transforms
+        if data.ndim == 3:
+            # (C, H, W) -> (1, C, H, W)
+            data = data.unsqueeze(0)
+
+        # Apply NDVI append
+        data = self.transform(data)
+
+        # Restore original dimensionality if we added a batch dimension
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(index_nir={self.index_nir}, index_red={self.index_red})"
+
+
+class AppendNBR:
+    """Append NBR band to an image.
+
+    This class wraps torchgeo.transforms.AppendNBR to handle dictionary samples.
+
+    Args:
+        index_nir (int): Index of the NIR band.
+        index_swir (int): Index of the SWIR band (typically SWIR2).
+    """
+
+    def __init__(self, index_nir: int, index_swir: int):
+        from torchgeo.transforms import AppendNBR as TGAppendNBR
+
+        self.index_nir = index_nir
+        self.index_swir = index_swir
+        self.transform = TGAppendNBR(index_nir=index_nir, index_swir=index_swir)
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        # Ensure data is 4D (B, C, H, W) for Kornia-based transforms
+        if data.ndim == 3:
+            # (C, H, W) -> (1, C, H, W)
+            data = data.unsqueeze(0)
+
+        # Apply NBR append
+        data = self.transform(data)
+
+        # Restore original dimensionality if we added a batch dimension
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"index_nir={self.index_nir}, index_swir={self.index_swir})"
+        )
+
+
+class AppendEVI:
+    """Append EVI band to an image.
+
+    The EVI (Enhanced Vegetation Index) is an atmospherically-corrected index that
+    reduces soil and atmospheric noise. It performs better than NDVI in dense forests.
+
+    EVI = 2.5 * (NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1)
+
+    Args:
+        index_nir (int): Index of the NIR band.
+        index_red (int): Index of the red band.
+        index_blue (int): Index of the blue band.
+    """
+
+    def __init__(self, index_nir: int, index_red: int, index_blue: int):
+        self.index_nir = index_nir
+        self.index_red = index_red
+        self.index_blue = index_blue
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        # Ensure data is 4D (B, C, H, W)
+        if data.ndim == 3:
+            # (C, H, W) -> (1, C, H, W)
+            data = data.unsqueeze(0)
+
+        nir = data[:, self.index_nir, :, :].float()
+        red = data[:, self.index_red, :, :].float()
+        blue = data[:, self.index_blue, :, :].float()
+
+        # EVI = 2.5 * (NIR - Red) / (NIR + 6 * Red - 7.5 * Blue + 1)
+        numerator = 2.5 * (nir - red)
+        denominator = nir + 6.0 * red - 7.5 * blue + 1.0
+        evi = numerator / (denominator + 1e-8)
+
+        # Clean up any potential NaNs or Inf
+        evi = torch.nan_to_num(evi, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(1)
+
+        # Append EVI band
+        data = torch.cat([data, evi], dim=1)
+
+        # Restore original dimensionality if we added a batch dimension
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"index_nir={self.index_nir}, index_red={self.index_red}, "
+            f"index_blue={self.index_blue})"
+        )
+
+
+class AppendSAVI:
+    """Append SAVI band to an image.
+
+    The SAVI (Soil-Adjusted Vegetation Index) accounts for soil brightness under
+    sparse vegetation.
+
+    SAVI = (NIR - Red) * (1 + L) / (NIR + Red + L)
+
+    Args:
+        index_nir (int): Index of the NIR band.
+        index_red (int): Index of the red band.
+        L (float): Soil brightness correction factor (default: 0.5).
+    """
+
+    def __init__(self, index_nir: int, index_red: int, L: float = 0.5):
+        self.index_nir = index_nir
+        self.index_red = index_red
+        self.L = L
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        if data.ndim == 3:
+            data = data.unsqueeze(0)
+
+        nir = data[:, self.index_nir, :, :].float()
+        red = data[:, self.index_red, :, :].float()
+
+        # SAVI = (NIR - Red) * (1 + L) / (NIR + Red + L)
+        numerator = (nir - red) * (1.0 + self.L)
+        denominator = nir + red + self.L
+        savi = numerator / (denominator + 1e-8)
+
+        # Clean up any potential NaNs or Inf
+        savi = torch.nan_to_num(savi, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(1)
+
+        data = torch.cat([data, savi], dim=1)
+
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"index_nir={self.index_nir}, index_red={self.index_red}, L={self.L})"
+        )
+
+
+class AppendMSAVI:
+    """Append MSAVI band to an image.
+
+    The MSAVI (Modified Soil-Adjusted Vegetation Index) reduces soil background
+    effects and is effective for areas with visible bare soil.
+
+    MSAVI = (2 * NIR + 1 - sqrt((2 * NIR + 1)^2 - 8 * (NIR - Red))) / 2
+
+    Args:
+        index_nir (int): Index of the NIR band.
+        index_red (int): Index of the red band.
+    """
+
+    def __init__(self, index_nir: int, index_red: int):
+        self.index_nir = index_nir
+        self.index_red = index_red
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        if data.ndim == 3:
+            data = data.unsqueeze(0)
+
+        nir = data[:, self.index_nir, :, :].float()
+        red = data[:, self.index_red, :, :].float()
+
+        # MSAVI = (2 * NIR + 1 - sqrt((2 * NIR + 1)^2 - 8 * (NIR - Red))) / 2
+        term1 = 2.0 * nir + 1.0
+        term2 = 8.0 * (nir - red)
+        # Ensure the value under sqrt is non-negative
+        msavi = (term1 - torch.sqrt(torch.clamp(term1**2 - term2, min=0))) / 2.0
+
+        # Clean up any potential NaNs or Inf
+        msavi = torch.nan_to_num(msavi, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(1)
+
+        data = torch.cat([data, msavi], dim=1)
+
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"index_nir={self.index_nir}, index_red={self.index_red})"
+        )
+
+
+class AppendNIRv:
+    """Append NIRv band to an image.
+
+    The NIRv (Near-Infrared Reflectance of Vegetation) is calculated by multiplying
+    the total scene near-infrared reflectance by the NDVI. It isolates the vegetated
+    signal and reduces noise.
+
+    NIRv = NIR * (NIR - Red) / (NIR + Red)
+
+    Args:
+        index_nir (int): Index of the NIR band.
+        index_red (int): Index of the red band.
+    """
+
+    def __init__(self, index_nir: int, index_red: int):
+        self.index_nir = index_nir
+        self.index_red = index_red
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        if data.ndim == 3:
+            data = data.unsqueeze(0)
+
+        nir = data[:, self.index_nir, :, :].float()
+        red = data[:, self.index_red, :, :].float()
+
+        # NIRv = NIR * (NIR - Red) / (NIR + Red)
+        numerator = nir - red
+        denominator = nir + red
+        # Add epsilon to avoid division by zero
+        ndvi = numerator / (denominator + 1e-8)
+        nirv = nir * ndvi
+
+        # Clean up any potential NaNs or Inf
+        nirv = torch.nan_to_num(nirv, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(1)
+
+        data = torch.cat([data, nirv], dim=1)
+
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"index_nir={self.index_nir}, index_red={self.index_red})"
+        )
+
+
+class SelectBands:
+    """Select and/or reorder bands in an image.
+
+    Args:
+        indices (list[int]): List of band indices to select and/or reorder.
+    """
+
+    def __init__(self, indices: list[int]):
+        self.indices = indices
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample["image"]
+        original_ndim = data.ndim
+
+        if data.ndim == 3:
+            # (C, H, W) -> (1, C, H, W)
+            data = data.unsqueeze(0)
+
+        num_bands = data.shape[1]
+        for idx in self.indices:
+            if idx < 0 or idx >= num_bands:
+                raise IndexError(
+                    f"Band index {idx} out of range (num_bands={num_bands})"
+                )
+
+        # Select and reorder bands
+        data = data[:, self.indices, :, :]
+
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(indices={self.indices})"
+
+
+class MinMaxScaler:
+    """Scale mask or image data to [0, 1] range using min-max scaling.
+
+    Args:
+        min: The minimum value for scaling.
+        max: The maximum value for scaling.
+        on_key: The key of the data to scale.
+        nodata: If provided, nodata values won't be scaled.
+    """
+
+    def __init__(
+        self,
+        min: Union[torch.Tensor, Tuple[float], List[float], float],
+        max: Union[torch.Tensor, Tuple[float], List[float], float],
+        on_key: str = "image",
+        nodata: int = None,
+    ):
+        assert on_key in ["image", "mask"], "on_key must be either 'image' or 'mask'"
+
+        if isinstance(min, float):
+            min = torch.tensor([min])
+
+        if isinstance(max, float):
+            max = torch.tensor([max])
+
+        if isinstance(min, (tuple, list)):
+            min = torch.tensor(min)
+
+        if isinstance(max, (tuple, list)):
+            max = torch.tensor(max)
+
+        self.min = min
+        self.max = max
+        self.on_key = on_key
+        self.nodata = nodata
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        data = sample[self.on_key].float()
+        nodata_mask = data == self.nodata if self.nodata is not None else None
+
+        # Store original shape for later restoration
+        original_shape = data.shape
+        original_ndim = data.ndim
+
+        # Handle different tensor shapes for masks vs images
+        if self.on_key == "mask":
+            # For masks, we need to preserve the batch dimension
+            # Masks typically come as (B, H, W) or (H, W)
+            if data.ndim == 2:
+                # Add batch and channel dimensions: (H, W) -> (1, 1, H, W)
+                data = data.unsqueeze(0).unsqueeze(0)
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.unsqueeze(0).unsqueeze(0)
+            elif data.ndim == 3:
+                # Add channel dimension: (B, H, W) -> (B, 1, H, W)
+                data = data.unsqueeze(1)
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.unsqueeze(1)
+        else:
+            # For images, add batch dimension if needed
+            if data.ndim == 3:
+                # Add batch dimension: (C, H, W) -> (1, C, H, W)
+                data = data.unsqueeze(0)
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.unsqueeze(0)
+
+        # Apply min-max scaling
+        # Reshape min and max to match data dimensions
+        if self.min.ndim == 1:
+            min_val = self.min.view(-1, 1, 1)
+        else:
+            min_val = self.min
+
+        if self.max.ndim == 1:
+            max_val = self.max.view(-1, 1, 1)
+        else:
+            max_val = self.max
+
+        # Avoid division by zero
+        range_val = max_val - min_val
+        range_val[range_val == 0] = 1.0  # Prevent division by zero
+
+        data = (data - min_val) / range_val
+
+        # Remove extra dimensions we added
+        if self.on_key == "mask":
+            # Remove channel dimension: (B, 1, H, W) -> (B, H, W)
+            data = data.squeeze(1)
+            if nodata_mask is not None:
+                nodata_mask = nodata_mask.squeeze(1)
+        else:
+            # Remove batch dimension if we added it: (1, C, H, W) -> (C, H, W)
+            if original_ndim == 3:
+                data = data.squeeze(0)
+                if nodata_mask is not None:
+                    nodata_mask = nodata_mask.squeeze(0)
+
+        # Apply nodata mask after all shape transformations
+        if self.nodata is not None and nodata_mask is not None:
+            data[nodata_mask] = self.nodata
+
+        sample[self.on_key] = data
+        return sample
+
+    def __repr__(self):
+        repr = f"(min={self.min}, max={self.max})"
+        return self.__class__.__name__ + repr
+
+
+class InverseMinMaxScaler:
+    """Inverse min-max scaling to revert values back to original range."""
+
+    def __init__(
+        self,
+        min: Union[torch.Tensor, Tuple[float], List[float], float],
+        max: Union[torch.Tensor, Tuple[float], List[float], float],
+        nodata: int = None,
+    ):
+        """Initialize a new InverseMinMaxScaler instance.
+
+        Args:
+            min: The minimum value used in scaling.
+            max: The maximum value used in scaling.
+            nodata: If provided, nodata values won't be inverse scaled.
+        """
+        if isinstance(min, float):
+            min = torch.tensor([min])
+
+        if isinstance(max, float):
+            max = torch.tensor([max])
+
+        if isinstance(min, (tuple, list)):
+            min = torch.tensor(min)
+
+        if isinstance(max, (tuple, list)):
+            max = torch.tensor(max)
+
+        self.min = min
+        self.max = max
+        self.nodata = nodata
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            tensor (Tensor): Tensor image of size (C, H, W) to be inverse scaled.
+        Returns:
+            Tensor: Inverse scaled image.
+        """
+        if self.min.ndim == 1:
+            min_val = self.min.view(-1, 1, 1)
+        else:
+            min_val = self.min
+
+        if self.max.ndim == 1:
+            max_val = self.max.view(-1, 1, 1)
+        else:
+            max_val = self.max
+
+        nodata_mask = tensor == self.nodata
+        range_val = max_val - min_val
+        tensor = tensor * range_val + min_val
+        if self.nodata is not None:
+            tensor[nodata_mask] = self.nodata
+
+        return tensor
