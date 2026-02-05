@@ -1,7 +1,7 @@
 """OSU GNN Forest Attributes dataset module.
 
 This module provides the GNNForestAttr class for accessing Oregon State University's
-Gradient Nearest Neighbor (GNN) forest attributes data from 2017, which includes
+Gradient Nearest Neighbor (GNN) forest attributes data from 2023, which includes
 various forest structure and composition metrics.
 """
 
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 import numpy
+import numpy.ma as ma
 from rasterio.crs import CRS
 from torchgeo.datasets import RasterDataset
 from matplotlib.figure import Figure
@@ -16,10 +17,10 @@ import matplotlib.pyplot as plt
 
 
 class GNNForestAttr(RasterDataset):
-    """OSU GNN Forest Attributes 2017.
+    """OSU GNN Forest Attributes 2023.
 
     This dataset provides access to Oregon State University's Gradient Nearest Neighbor
-    (GNN) forest attributes data from 2017, including forest structure, composition,
+    (GNN) forest attributes data released in 2023 (with data from 2021), including forest structure, composition,
     and biomass metrics.
 
     Attributes:
@@ -35,8 +36,9 @@ class GNNForestAttr(RasterDataset):
     Bands (stored as separate rasters):
         - fortypba: forest type
         - cancov: canopy cover from 0 to 10,000
-        - stndhgt: height of dominant and co-dominant trees in cm
-        - mndbhba: basal-area-weighted average dbh of live trees, in mm
+        - stndhgt: height of dominant and co-dominant trees
+        - mndbhba: basal-area-weighted average dbh of live trees
+        - qmd_dom: quadratic mean diameter of dominant and co-dominant trees
         - ba_ge_3: basal area of live trees >2.5cm dbh, m2/ha
         - tph_ge_3: live trees per hectare >2.5cm dbh
         - bph_ge_3_crm: biomass of live trees >2.5cm dbh, kg/ha
@@ -57,7 +59,7 @@ class GNNForestAttr(RasterDataset):
     _res = 30
     is_image = False
     filename_glob = "*.tif"
-    filename_regex = r"^(?P<band>\w+)_2017.tif$"
+    filename_regex = r"^(?P<band>\w+)_2021.tif$"
     separate_files = True
     nodata = -2147483648
     all_bands = [
@@ -65,6 +67,7 @@ class GNNForestAttr(RasterDataset):
         "cancov",
         "stndhgt",
         "mndbhba",
+        "qmd_dom",
         "ba_ge_3",
         "tph_ge_3",
         "bph_ge_3_crm",
@@ -74,7 +77,7 @@ class GNNForestAttr(RasterDataset):
     # fmt: off
     # GNN --> ODF code mapping
     remap_dict = {
-         -1: -1,   1:  0,   2:  6,   3:  7,   4:  7,   5:  7,   6:  9,   7:  2,   8:  2,   9: 12,  10: 12,  11: 12,  12: 13,  13: 12,  14: 12,
+         -1:  0,   1:  0,   2:  6,   3:  7,   4:  7,   5:  7,   6:  9,   7:  2,   8:  2,   9: 12,  10: 12,  11: 12,  12: 13,  13: 12,  14: 12,
          15: 12,  16: 12,  17: 12,  18: 12,  19: 12,  20: 12,  21: 12,  22: 12,  23: 12,  24: 12,  25: 12,  26: 12,  27:  5,  28:  5,  29: 12,
          30: 13,  31: 12,  32:  5,  33:  9,  34:  9,  35: 11,  36:  9,  37:  9,  38:  9,  39:  5,  40:  5,  41:  5,  42: 10,  43: 11,  44:  5,
          45:  5,  46:  5,  47: 13,  48:  5,  49:  5,  50:  5,  51:  5,  52: 13,  53: 13,  54:  5,  55:  5,  56:  5,  57:  5,  58:  9,  59:  5,
@@ -135,12 +138,14 @@ class GNNForestAttr(RasterDataset):
         870:  7, 871:  7, 872:  7, 873:  7, 874:  1, 875:  2, 876:  2, 877:  2, 878:  2, 879:  2, 880:  7, 881:  5, 882:  5, 883:  5, 884:  5,
         885:  5, 886: 10, 887: 10, 888: 10, 889: 10, 890: 10, 891: 10, 892: 10, 893: 10, 894: 10, 895: 10, 896: 10, 897: 10, 898: 10, 899: 10,
         900: 10, 901: 11, 902: 11, 903: 12, 904: 11, 905: 13, 906: 11, 907:  9, 908: 11, 909: 11, 910: 11, 911: 11, 912:  5, 913:  5, 914: 13,
-        915: 11, 916: 10, 917:  9, 918: 11, 919: 11, 920:  7, 921: 11, 922: 13, 923:  5, 924: 11, 925: 12, 926: 11, 927: 13, 928: 12, 929:  9,
-        930: 11, 931: 11, 932: 11, 933:  5, 934:  5, 935: 10, 936: 13, 937:  5, 938:  5, 939: 13, 940:  5, 941:  5, 942: 10, 943: 11, 944: 11,
+        915: 11, 916: 10, 917:  9, 918: 11, 919: 11, 920:  7, 921: 11, 922: 13, 923:  5, 924: 10, 925: 12, 926: 11, 927: 13, 928: 12, 929:  9,
+        930: 11, 931: 11, 932: 11, 933:  5, 934:  5, 935: 10, 936: 13, 937:  5, 938:  5, 939: 13, 940:  5, 941:  5, 942:  10, 943: 11, 944: 11,
         945: 11, 946: 10, 947: 11, 948: 11, 949: 12, 950: 12, 951: 12, 952: 12, 953: 13, 954: 12, 955: 12, 956: 13, 957:  5, 958: 12, 959: 13, 
         960: 12, 961: 12, 962: 12, 963: 12, 964: 12, 965:  5, 966:  9, 967:  2, 968:  9, 969: 10, 970:  2, 971:  2, 972:  5, 973:  5, 974:  5, 
         975:  9, 976:  7, 977:  7, 978:  7, 979:  7, 980:  7, 981:  7, 982: 10, 983:  9
     }
+    # Modifications
+    # 721: 11 -> -1 for testing
     # fmt: on
 
     def __init__(
@@ -195,7 +200,7 @@ class GNNForestAttr(RasterDataset):
         """
         for k in a.unique():
             k = int(k)
-            a[a == k] = self.remap_dict.get(k, -1)
+            a[a == k] = self.remap_dict.get(k, self.nodata)
         return a
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
@@ -225,6 +230,7 @@ class GNNForestAttr(RasterDataset):
         sample: dict[str, Any],
         show_titles: bool = True,
         suptitle: str | None = None,
+        channel: int = 0,
     ) -> Figure:
         """Plot a sample from the dataset.
 
@@ -235,34 +241,68 @@ class GNNForestAttr(RasterDataset):
                 above each panel. Defaults to True.
             suptitle (str, optional): Optional string to use as a suptitle for
                 the entire figure.
+            channel (int, optional): For multi-channel data, specifies which channel
+                to plot. Defaults to 0 (first channel). Ignored for single-channel data.
 
         Returns:
             Figure: A matplotlib Figure with the rendered sample.
 
+        Raises:
+            IndexError: If the specified channel index is out of bounds for multi-channel data.
+
         Note:
             If the sample contains a 'prediction' key, both mask and prediction
             will be plotted side by side. Otherwise, only the mask is displayed.
+            For multi-channel tensors with shape (C, H, W), the specified channel
+            is extracted as a 2D (H, W) array for visualization.
+            NoData values (self.nodata) are masked out and displayed as transparent.
         """
         mask = sample["mask"].squeeze()
+
+        # Handle multi-channel data by selecting the specified channel
+        if mask.ndim == 3:
+            if channel >= mask.shape[0]:
+                raise IndexError(
+                    f"Channel index {channel} out of bounds for mask with "
+                    f"{mask.shape[0]} channels"
+                )
+            mask = mask[channel]
+
+        # Create masked array to hide nodata values
+        mask = ma.masked_equal(mask, self.nodata)
+
         ncols = 1
 
         showing_predictions = "prediction" in sample
         if showing_predictions:
             pred = sample["prediction"].squeeze()
+
+            # Handle multi-channel predictions
+            if pred.ndim == 3:
+                if channel >= pred.shape[0]:
+                    raise IndexError(
+                        f"Channel index {channel} out of bounds for prediction with "
+                        f"{pred.shape[0]} channels"
+                    )
+                pred = pred[channel]
+
+            # Create masked array to hide nodata values in predictions
+            pred = ma.masked_equal(pred, self.nodata)
+
             ncols = 2
 
         fig, axs = plt.subplots(nrows=1, ncols=ncols, figsize=(ncols * 4, 4))
 
         if showing_predictions:
-            axs[0].imshow(mask)
+            axs[0].imshow(mask, interpolation="nearest")
             axs[0].axis("off")
-            axs[1].imshow(pred)
+            axs[1].imshow(pred, interpolation="nearest")
             axs[1].axis("off")
             if show_titles:
                 axs[0].set_title("Mask")
                 axs[1].set_title("Prediction")
         else:
-            axs.imshow(mask)
+            axs.imshow(mask, interpolation="nearest")
             axs.axis("off")
             if show_titles:
                 axs.set_title("Mask")
