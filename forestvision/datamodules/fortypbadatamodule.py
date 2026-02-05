@@ -23,18 +23,50 @@ from forestvision.transforms import (
     RemapFortypba,
     MinMaxScaler,
     InverseMinMaxScaler,
+    ReplaceNodataVal,
 )
 from forestvision.samplers import TileGeoSampler
 from forestvision.deploy import AnyRasterDataset
 
 torch.set_float32_matmul_precision("medium")
 
+os.environ["CPL_LOG"] = "/dev/null"
 
 # Load from .env file
 load_dotenv()
 GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
 TARGET_PATH = os.getenv("TARGET_PATH")
+REMAP = {
+    33: 11,    112: 11,   128: 11,   165: 11,   182: 11,   198: 11,   306: 10,   346: 11,
+    113: 11,   115: 11,   123: 11,   124: 11,   125: 10,   126: 11,   127: 11,   129: 10,
+    130: 11,   131: 11,   132: 11,   133: 11,   134: 10,   135: 11,   136: 10,   148: 11,
+    165: 11,   170: 10,   177: 11,   182: 11,   184: 11,   186: 11,   188: 10,   189: 10,
+    190: 10,   191: 10,   192: 10,   193: 10,   196: 10,   197: 10,   198: 11,   199: 11,
+    200: 10,   202: 10,   204: 10,   206: 10,   210: 10,   211: 10,   215: 10,   218: 10,
+    219: 10,   220: 10,   221: 10,   231: 10,   234: 10,   238: 10,   254: 10,   256: 10,
+    259: 10,   260: 10,   261: 10,   262: 10,   263: 10,   265: 10,   266: 10,   269: 10,
+    270: 10,   271: 10,   272: 10,   282: 10,   284: 10,   286: 10,   293: 10,   319: 10,
+    322: 10,   346: 11,   368: 10,   425: 11,   426: 10,   427: 10,   488: 10,   498: 10,
+    518: 10,   535: 10,   543: 11,   545: 10,   546: 10,   565: 11,   568: 11,   569: 11,
+    571: 11,   580: 11,   581: 10,   597: 11,   598: 10,   599: 11,   600: 11,   601: 10,
+    602: 11,   603: 11,   604: 11,   605: 11,   606: 11,   607: 10,   608: 11,   610: 11,
+    614: 10,   619: 10,   621: 11,   622: 11,   624: 11,   625: 11,   634: 11,   645: 10,
+    647: 11,   653: 11,   654: 10,   667: 11,   668: 11,   669: 11,   670: 11,   672: 11,
+    673: 11,   674: 11,   676: 11,   677: 11,   679: 11,   681: 11,   683: 11,   684: 11,
+    685: 11,   689: 11,   690: 11,   698: 11,   701: 11,   702: 11,   703: 11,   704: 11,
+    705: 11,   706: 11,   708: 11,   714: 11,   717: 10,   718: 11,   719: 11,   720: 11,
+    721: 11,   723: 11,   726: 11,   728: 11,   743: 11,   748: 11,   752: 11,   767: 11,
+    776: 11,   791: 11,   794: 11,   815: 10,   818: 10,   836: 11,   838: 11,   839: 11,
+    840: 11,   841: 11,   844: 11,   852: 11,   855: 10,   886: 10,   887: 11,   888: 11,
+    889: 11,   890: 10,   891: 10,   892: 11,   893: 10,   894: 11,   895: 11,   896: 10,
+    897: 10,   898: 10,   899: 10,   900: 10,   901: 11,   902: 10,   906: 10,   907: 11,
+    908: 11,   909: 11,   910: 11,   911: 11,   915: 11,   916: 11,   917: 11,   918: 11,
+    919: 11,   921: 11,   926: 11,   930: 11,   931: 11,   932: 11,   935: 11,   942: 11,
+    943: 11,   944: 11,   945: 11,   946: 11,   947: 11,   948: 11,   966: 9,    968: 9,
+    969: 9,    975: 9,
+}
 
+GNNForestAttr.remap_dict.update(REMAP)
 
 class ClimateNA(AnyRasterDataset):
     all_bands = ["AHM", "MAP", "TD"]
@@ -158,7 +190,7 @@ class ForTypesDataModule(CloudDataModule):
         self.root = root
         self.target_path = target_path or TARGET_PATH
         self.hparams_dict = hparams or {}
-        self.stats_path = stats_path
+        self.stats_path = os.path.join(self.root, stats_path)
         self.train_tiles_path = train_tiles_path
         self.val_tiles_path = val_tiles_path
         self.test_tiles_path = test_tiles_path
@@ -410,7 +442,14 @@ class ForTypesDataModule(CloudDataModule):
         # regardless of dataset composition
         target_transforms = v2.Compose(
             [
-                RemapFortypba(remap_dict=GNNForestAttr.remap_dict, on_key="mask"),
+                # RemapFortypba(remap_dict=GNNForestAttr.remap_dict, on_key="mask"),
+                ReplaceNodataVal(nodata=-2147483648, new_nodata=-1),
+                Normalize(
+                    mean=self.target_stats["mean"],
+                    std=self.target_stats["std"],
+                    on_key="mask",
+                    nodata=-1,
+                ),
             ]
         )
 
@@ -468,7 +507,7 @@ class ForTypesDataModule(CloudDataModule):
         Args:
             overwrite: Whether to overwrite existing data
         """
-        self.setup("fit")
+        self.setup("prepare")
         logging.info("Preparing training dataset...")
 
         # Statistics are now loaded from file in setup() method
@@ -589,9 +628,15 @@ class ForTypesDataModule(CloudDataModule):
             ValueError: If year is not provided for predict stage
         """
         if self.target_path:
-            self.target_dataset = GNNForestAttr(paths=self.target_path, res=10)
+            self.target_dataset = GNNForestAttr(
+                paths=self.target_path,
+                bands=["fortypba", "cancov", "qmd_dom", "ba_ge_3"],
+                res=10,
+            )
         else:
-            self.target_dataset = GNNForestAttr(res=10)
+            self.target_dataset = GNNForestAttr(
+                bands=["fortypba", "cancov", "qmd_dom", "ba_ge_3"], res=10
+            )
 
         if stage in ["fit", "validate"]:
             self._setup_fit_stage()
@@ -604,13 +649,102 @@ class ForTypesDataModule(CloudDataModule):
                 raise ValueError("year parameter required for predict stage")
             self._setup_predict_stage(year)
 
+        elif stage == "prepare":
+            self._setup_prepare_data()
+
         # Load statistics from file if available and not already loaded
         if self.input_stats is None and self.stats_path:
             self._load_stats_from_file()
 
-        self.setup_transforms()
+        if stage != "prepare":
+            self.setup_transforms()
 
     def _setup_fit_stage(self) -> None:
+        """Setup datasets for training and validation stages."""
+        self.train_tiles = GPDFeatureCollection(
+            os.path.join(self.root, self.train_tiles_path)
+        )
+        self.val_tiles = GPDFeatureCollection(
+            os.path.join(self.root, self.val_tiles_path)
+        )
+
+        self.training_satimagery_path = os.path.join(
+            self.root,
+            "training",
+            self.satimagery_class.__name__.lower(),
+            str(self.year),
+        )
+        self.training_dem_path = os.path.join(
+            self.root, "training", self.dem_class.__name__.lower(), str(self.year)
+        )
+        self.training_cimate_path = os.path.join(self.root, "training", "climatena")
+
+        validation_satimagery_path = self.training_satimagery_path.replace(
+            "training", "validation"
+        )
+        validation_dem_path = self.training_dem_path.replace("training", "validation")
+        # We will use the same path for training and validation climate data
+        validation_climate_path = self.training_cimate_path
+
+        training_satimagery_dataset = self.satimagery_class(
+            year=self.year,
+            roi=self.train_tiles.bounds,
+            path=self.training_satimagery_path,
+            transforms=self.init_transforms,
+            download=True,
+        )
+        training_dem_dataset = self.dem_class(
+            roi=self.train_tiles.bounds,
+            res=10,
+            path=self.training_dem_path,
+            transforms=self.init_transforms,
+            download=True,
+        )
+        training_climate_dataset = self.climate_class(
+            paths=self.training_cimate_path,
+            glob="*.tif",
+            crs=self.target_dataset.crs,
+            res=10,
+            is_image=True,
+            nodata=-9999,
+        )
+
+        val_satimagery_dataset = self.satimagery_class(
+            year=self.year,
+            roi=self.val_tiles.bounds,
+            path=validation_satimagery_path,
+            transforms=self.init_transforms,
+            download=True,
+        )
+        val_dem_dataset = self.dem_class(
+            roi=self.val_tiles.bounds,
+            res=10,
+            path=validation_dem_path,
+            transforms=self.init_transforms,
+            download=True,
+        )
+        # val_climate_dataset = self.climate_class(
+        #     paths=validation_climate_path,
+        #     glob="*.vrt",
+        #     crs=self.target_dataset.crs,
+        #     res=10,
+        #     is_image=True,
+        # )
+
+        # Combine datasets
+        self.input_dataset = (
+            training_satimagery_dataset
+            & training_dem_dataset
+            & training_climate_dataset
+        )
+        self.train_dataset = self.target_dataset & self.input_dataset
+
+        self.val_input_dataset = (
+            val_satimagery_dataset & val_dem_dataset & training_climate_dataset
+        )
+        self.val_dataset = self.target_dataset & self.val_input_dataset
+
+    def _setup_prepare_data(self):
         """Setup datasets for training and validation stages."""
         self.train_tiles = GPDFeatureCollection(
             os.path.join(self.root, self.train_tiles_path)
