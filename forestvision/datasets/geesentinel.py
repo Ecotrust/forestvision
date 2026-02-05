@@ -48,7 +48,6 @@ class GEESentinel2(GEERasterDataset):
         "B8",
         "B8A",
         "B9",
-        "B10",
         "B11",
         "B12",
     ]
@@ -64,6 +63,7 @@ class GEESentinel2(GEERasterDataset):
         year: int | None = None,
         date_start: str | None = None,
         date_end: str | None = None,
+        bands: list[str] | None = None,
         roi: Optional[BoundingBox] = None,
         season: str = "leafon",
         res: float = 10,
@@ -116,30 +116,18 @@ class GEESentinel2(GEERasterDataset):
         )
         self.res = res
         self.paths = path
-        self.bands = [
-            "B1",
-            "B2",
-            "B3",
-            "B4",
-            "B5",
-            "B6",
-            "B7",
-            "B8",
-            "B8A",
-            "B11",
-            "B12",
-        ]
+        self.bands = bands if bands is not None else self.all_bands
 
         if date_start is not None and date_end is not None:
             self.date_start = valid_date(date_start)
             self.date_end = valid_date(date_end)
         elif year is not None:
             if season == "leafoff":
-                self.date_start = f"{year - 1}-10-01"
-                self.date_end = f"{year}-03-31"
+                self.date_start = f"{year-1}-10-01"
+                self.date_end = f"{year-1}-12-01"
             elif season == "leafon":
-                self.date_start = f"{year}-04-01"
-                self.date_end = f"{year}-09-30"
+                self.date_start = f"{year}-06-01"
+                self.date_end = f"{year}-08-31"
             else:
                 raise ValueError(f"Invalid season: {season}")
         else:
