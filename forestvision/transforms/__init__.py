@@ -1,8 +1,18 @@
 from .transforms import (
     Normalize,
     ReplaceNodataVal,
+    RemapFortypba,
     Denormalize,
+    MinMaxScaler,
+    InverseMinMaxScaler,
     MaskFromRaster,
     ApplyMasks,
     ResizeRaster,
+    AppendNDVI,
+    AppendNBR,
+    AppendEVI,
+    AppendSAVI,
+    AppendMSAVI,
+    AppendNIRv,
+    SelectBands,
 )
