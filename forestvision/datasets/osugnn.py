@@ -144,13 +144,11 @@ class GNNForestAttr(RasterDataset):
         960: 12, 961: 12, 962: 12, 963: 12, 964: 12, 965:  5, 966:  9, 967:  2, 968:  9, 969: 10, 970:  2, 971:  2, 972:  5, 973:  5, 974:  5, 
         975:  9, 976:  7, 977:  7, 978:  7, 979:  7, 980:  7, 981:  7, 982: 10, 983:  9
     }
-    # Modifications
-    # 721: 11 -> -1 for testing
     # fmt: on
 
     def __init__(
         self,
-        paths: Path | Iterable[Path] = "data/datasets/osugnn",
+        paths: Path | Iterable[Path] = "data/datasets/gnn",
         bands: Sequence[str] = ["fortypba"],
         remap: bool = True,
         crs: CRS | None = None,
