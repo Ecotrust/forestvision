@@ -6,12 +6,14 @@ import threading
 import time
 import sys
 import traceback
+import warnings
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 from typing import Any, Callable, Dict, Optional, Union, Tuple, List, TYPE_CHECKING
 from enum import Enum, auto
 import requests
+import json
 from requests.exceptions import HTTPError, SSLError, ConnectionError
 import math
 from copy import copy
@@ -1102,6 +1104,175 @@ class GEERasterDataset(CloudRasterDataset):
         )
         self.overwrite = overwrite
         self.bypass_errors = bypass_errors
+
+        # Handle metadata (collection.json) validation
+        if self.paths and os.path.exists(os.path.join(self.paths, "collection.json")):
+            self._load_and_validate_metadata()
+
+    @property
+    def download(self) -> bool:
+        """Get download status."""
+        return self._download
+
+    @download.setter
+    def download(self, value: bool) -> None:
+        """Set download status and trigger metadata saving if path is provided."""
+        self._download = value
+        if value is True and self.paths is not None:
+            metadata_path = os.path.join(self.paths, "collection.json")
+            # Only create if it doesn't exist, OR if we are explicitly overwriting
+            if not os.path.exists(metadata_path) or self.overwrite:
+                self._save_metadata()
+
+    def _load_and_validate_metadata(self) -> None:
+        """Load STAC-like metadata and validate against current configuration."""
+        if not self.paths:
+            logging.debug("_load_and_validate_metadata: paths is None, skipping")
+            return
+            
+        metadata_path = os.path.join(self.paths, "collection.json")
+        
+        # Debug logging - always log what we're checking
+        logging.debug(f"_load_and_validate_metadata: checking {metadata_path}")
+        
+        if not os.path.exists(metadata_path):
+            logging.debug(f"_load_and_validate_metadata: metadata file not found at {metadata_path}")
+            return
+            
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+
+            logging.info(f"Loading metadata from {metadata_path}")
+
+            # 1. Sync all_bands from metadata if available
+            summaries = metadata.get("summaries", {})
+            eo_bands = summaries.get("eo:bands", [])
+            if eo_bands:
+                metadata_bands = [b["name"] for b in eo_bands]
+                # Only update if metadata has different bands
+                if metadata_bands != list(self.all_bands):
+                    logging.info(f"Updating all_bands from {list(self.all_bands)} to {metadata_bands} (from metadata)")
+                    self.all_bands = metadata_bands
+                else:
+                    logging.debug(f"all_bands already matches metadata: {metadata_bands}")
+            else:
+                logging.warning(f"No eo:bands found in metadata at {metadata_path}")
+
+            # 2. Validation
+            props = metadata.get("properties", {})
+            extent = metadata.get("extent", {})
+            spatial = extent.get("spatial", {})
+            bbox_list = spatial.get("bbox", [[]])[0]
+
+            # Validate ROI (Check if requested ROI is within stored ROI)
+            if self.roi and bbox_list:
+                m_minx, m_miny, m_maxx, m_maxy = bbox_list
+                # Requested ROI
+                r_minx, r_miny, r_maxx, r_maxy = self.roi.minx, self.roi.miny, self.roi.maxx, self.roi.maxy
+                
+                # We check if requested ROI is strictly inside the metadata ROI (with epsilon)
+                is_within = (
+                    (r_minx >= m_minx - 1e-6) and
+                    (r_miny >= m_miny - 1e-6) and
+                    (r_maxx <= m_maxx + 1e-6) and
+                    (r_maxy <= m_maxy + 1e-6)
+                )
+                
+                if not is_within:
+                    warnings.warn(
+                        f"Requested ROI { [r_minx, r_miny, r_maxx, r_maxy] } is not contained within "
+                        f"Metadata ROI {bbox_list} at {self.paths}"
+                    )
+
+            # Validate Dates
+            start_dt = props.get("start_datetime")
+            end_dt = props.get("end_datetime")
+            if getattr(self, "date_start", None) and start_dt:
+                # Metadata may contain T00:00:00Z or just the date
+                if self.date_start != start_dt[:10]:
+                    warnings.warn(
+                        f"Metadata start_date {start_dt} does not match requested {self.date_start} at {self.paths}"
+                    )
+            if getattr(self, "date_end", None) and end_dt:
+                if self.date_end != end_dt[:10]:
+                    warnings.warn(
+                        f"Metadata end_date {end_dt} does not match requested {self.date_end} at {self.paths}"
+                    )
+
+            # Validate Bands (Check if requested subset is within stored superset)
+            if getattr(self, "bands", None) and self.all_bands:
+                missing_bands = set(self.bands) - set(self.all_bands)
+                if missing_bands:
+                    warnings.warn(
+                        f"Requested bands {missing_bands} are missing from the stored dataset at {self.paths}. "
+                        f"Stored bands: {self.all_bands}"
+                    )
+
+        except Exception as e:
+            logging.warning(f"Failed to load or validate metadata at {metadata_path}: {e}")
+
+    def _save_metadata(self) -> None:
+        """Save current configuration to a STAC-like collection.json file."""
+        if not self.paths:
+            return
+
+        os.makedirs(self.paths, exist_ok=True)
+        metadata_path = os.path.join(self.paths, "collection.json")
+
+        # 1. Build Dynamic Collection ID: ClassName_YMD_YMD_10m_10B
+        id_parts = [self.__class__.__name__]
+        date_start = getattr(self, "date_start", None)
+        date_end = getattr(self, "date_end", None)
+        
+        season = getattr(self, "season", None)
+        if season:
+            id_parts.append(season)
+        else:
+            if date_start:
+                id_parts.append(date_start.replace("-", ""))
+            if date_end:
+                id_parts.append(date_end.replace("-", ""))
+        
+        if self.res is not None:
+            id_parts.append(f"{int(self.res)}m")
+            
+        bands = getattr(self, "bands", None) or getattr(self, "all_bands", [])
+        if bands:
+            id_parts.append(f"{len(bands)}B")
+            
+        collection_id = "_".join(id_parts)
+
+        # 2. Prepare band summaries
+        bands_summary = [{"name": b} for b in bands]
+
+        stac_collection = {
+            "id": collection_id,
+            "type": "Collection",
+            "description": f"ForestVision metadata for {self.__class__.__name__}",
+            "properties": {
+                "forestvision:class": self.__class__.__name__,
+                "forestvision:res": self.res,
+                "start_datetime": date_start,
+                "end_datetime": date_end,
+                "forestvision:season": getattr(self, "season", None),
+            },
+            "extent": {
+                "spatial": {
+                    "bbox": [[self.roi.minx, self.roi.miny, self.roi.maxx, self.roi.maxy]] if self.roi else []
+                }
+            },
+            "summaries": {
+                "eo:bands": bands_summary
+            }
+        }
+
+        try:
+            with open(metadata_path, "w") as f:
+                json.dump(stac_collection, f, indent=2)
+            logging.info(f"Saved metadata to {metadata_path}")
+        except Exception as e:
+            logging.error(f"Failed to save metadata to {metadata_path}: {e}")
 
     def _get_cmap(self) -> Tuple[ListedColormap, colors.BoundaryNorm]:
         """Get color map and normalization for visualization.
