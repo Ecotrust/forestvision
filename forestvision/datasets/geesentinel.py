@@ -56,6 +56,8 @@ class GEESentinel2(GEERasterDataset):
 
     nodata = 0
 
+    _res = 10
+
     instrument = "Sentinel 2 MSI"
 
     def __init__(
@@ -66,7 +68,7 @@ class GEESentinel2(GEERasterDataset):
         bands: list[str] | None = None,
         roi: Optional[BoundingBox] = None,
         season: str = "leafon",
-        res: float = 10,
+        res: Optional[float] = None,
         path: Optional[str] = None,
         crs: Optional[CRS] = CRS.from_epsg(5070),
         transforms: Callable[[Dict[str, Any]], Dict[str, Any]] | None = None,
@@ -114,9 +116,10 @@ class GEESentinel2(GEERasterDataset):
             overwrite=overwrite,
             cache=cache,
         )
-        self.res = res
+        self.res = res or self._res
         self.paths = path
         self.bands = bands if bands is not None else self.all_bands
+        self.season = season
 
         if date_start is not None and date_end is not None:
             self.date_start = valid_date(date_start)
