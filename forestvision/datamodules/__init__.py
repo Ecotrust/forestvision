@@ -1,5 +1,14 @@
-from .clouddatamodule import CloudDataModule
-from .emapremulator import eMapREmulatorDataModule
-from .fortypbadatamodule import ForTypesDataModule
+"""Data modules for forest vision tasks."""
 
-__all__ = ["CloudDataModule", "eMapREmulatorDataModule", "ForTypesDataModule"]
+from forestvision.datamodules.clouddatamodule import CloudDataModule
+from forestvision.datamodules.base import BaseGeoDataModule, DatasetConfig
+from forestvision.datamodules.fortypbadatamodule import ForTypesDataModule
+from forestvision.datamodules.emapremulator import eMapREmulatorDataModule
+
+__all__ = [
+    "CloudDataModule",
+    "BaseGeoDataModule",
+    "DatasetConfig",
+    "ForTypesDataModule",
+    "eMapREmulatorDataModule",
+]

@@ -72,7 +72,6 @@ class DatasetStats:
 
         self.channels = channels
         self.datset_name = dataset.__class__.__name__
-        self.samples = len(self.dataloader) * batch_size
         self.dim = on_dims
         self.overwrite = overwrite
         if nodata is None and hasattr(dataset, "nodata"):
@@ -88,8 +87,10 @@ class DatasetStats:
     def compute(self) -> dict[str, torch.Tensor]:
         none_or_notexists = Path(self.path).exists() if self.path else False
         ndpixels = 0
+        actual_samples = 0
         if any([none_or_notexists == False, self.overwrite]):
             for batch in tqdm(self.dataloader):
+                actual_samples += batch[self.data_key].shape[0]
                 image = batch[self.data_key].float()
                 
                 # Create nodata mask - handle None case safely
@@ -131,7 +132,7 @@ class DatasetStats:
                 "max": self._max,
                 "nodata": self.nodata,
                 "nodata_pixels": f"{ndpixels} ({100*(ndpixels/(self._count.sum() + ndpixels)).item():.2f}%)",
-                "sample_size": self.samples,
+                "sample_size": actual_samples,
             }
 
             if self.path:

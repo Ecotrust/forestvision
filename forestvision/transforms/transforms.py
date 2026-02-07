@@ -343,7 +343,7 @@ class RemapFortypba:
 class AppendNDVI:
     """Append NDVI band to an image.
 
-    This class wraps torchgeo.transforms.AppendNDVI to handle dictionary samples.
+    NDVI = (NIR - Red) / (NIR + Red)
 
     Args:
         index_nir (int): Index of the NIR band.
@@ -351,29 +351,23 @@ class AppendNDVI:
     """
 
     def __init__(self, index_nir: int, index_red: int):
-        from torchgeo.transforms import AppendNDVI as TGAppendNDVI
-
         self.index_nir = index_nir
         self.index_red = index_red
-        self.transform = TGAppendNDVI(index_nir=index_nir, index_red=index_red)
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
-        data = sample["image"]
-        original_ndim = data.ndim
+        data = sample["image"].float()
 
-        # Ensure data is 4D (B, C, H, W) for Kornia-based transforms
-        if data.ndim == 3:
-            # (C, H, W) -> (1, C, H, W)
-            data = data.unsqueeze(0)
+        nir = data[..., self.index_nir, :, :]
+        red = data[..., self.index_red, :, :]
 
-        # Apply NDVI append
-        data = self.transform(data)
+        # NDVI = (NIR - Red) / (NIR + Red)
+        ndvi = (nir - red) / (nir + red + 1e-8)
 
-        # Restore original dimensionality if we added a batch dimension
-        if original_ndim == 3:
-            data = data.squeeze(0)
+        # Clean up any potential NaNs or Inf
+        ndvi = torch.nan_to_num(ndvi, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(-3)
 
-        sample["image"] = data
+        # Append NDVI band
+        sample["image"] = torch.cat([data, ndvi], dim=-3)
         return sample
 
     def __repr__(self):
@@ -501,14 +495,10 @@ class AppendSAVI:
         self.L = L
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
-        data = sample["image"]
-        original_ndim = data.ndim
+        data = sample["image"].float()
 
-        if data.ndim == 3:
-            data = data.unsqueeze(0)
-
-        nir = data[:, self.index_nir, :, :].float()
-        red = data[:, self.index_red, :, :].float()
+        nir = data[..., self.index_nir, :, :]
+        red = data[..., self.index_red, :, :]
 
         # SAVI = (NIR - Red) * (1 + L) / (NIR + Red + L)
         numerator = (nir - red) * (1.0 + self.L)
@@ -516,14 +506,10 @@ class AppendSAVI:
         savi = numerator / (denominator + 1e-8)
 
         # Clean up any potential NaNs or Inf
-        savi = torch.nan_to_num(savi, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(1)
+        savi = torch.nan_to_num(savi, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(-3)
 
-        data = torch.cat([data, savi], dim=1)
-
-        if original_ndim == 3:
-            data = data.squeeze(0)
-
-        sample["image"] = data
+        # Append SAVI band
+        sample["image"] = torch.cat([data, savi], dim=-3)
         return sample
 
     def __repr__(self):
@@ -596,21 +582,19 @@ class AppendNIRv:
     Args:
         index_nir (int): Index of the NIR band.
         index_red (int): Index of the red band.
+        scale (bool): If True, scale the output NIRv by 1/10000.
     """
 
-    def __init__(self, index_nir: int, index_red: int):
+    def __init__(self, index_nir: int, index_red: int, scale: bool = False):
         self.index_nir = index_nir
         self.index_red = index_red
+        self.scale = scale
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
-        data = sample["image"]
-        original_ndim = data.ndim
+        data = sample["image"].float()
 
-        if data.ndim == 3:
-            data = data.unsqueeze(0)
-
-        nir = data[:, self.index_nir, :, :].float()
-        red = data[:, self.index_red, :, :].float()
+        nir = data[..., self.index_nir, :, :]
+        red = data[..., self.index_red, :, :]
 
         # NIRv = NIR * (NIR - Red) / (NIR + Red)
         numerator = nir - red
@@ -619,21 +603,20 @@ class AppendNIRv:
         ndvi = numerator / (denominator + 1e-8)
         nirv = nir * ndvi
 
+        if self.scale:
+            nirv = nirv / 10000.0
+
         # Clean up any potential NaNs or Inf
-        nirv = torch.nan_to_num(nirv, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(1)
+        nirv = torch.nan_to_num(nirv, nan=0.0, posinf=1.0, neginf=-1.0).unsqueeze(-3)
 
-        data = torch.cat([data, nirv], dim=1)
-
-        if original_ndim == 3:
-            data = data.squeeze(0)
-
-        sample["image"] = data
+        # Append NIRv band
+        sample["image"] = torch.cat([data, nirv], dim=-3)
         return sample
 
     def __repr__(self):
         return (
             f"{self.__class__.__name__}("
-            f"index_nir={self.index_nir}, index_red={self.index_red})"
+            f"index_nir={self.index_nir}, index_red={self.index_red}, scale={self.scale})"
         )
 
 
