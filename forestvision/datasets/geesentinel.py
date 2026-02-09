@@ -106,17 +106,17 @@ class GEESentinel2(GEERasterDataset):
             ValueError: If neither year nor date_start/date_end are provided, or if
                 an invalid season is specified.
         """
+        self.res = res or self._res
         super().__init__(
             roi=roi,
             path=path,
-            res=res,
+            res=self.res,
             crs=crs,
             transforms=transforms,
             download=download,
             overwrite=overwrite,
             cache=cache,
         )
-        self.res = res or self._res
         self.paths = path
         self.bands = bands if bands is not None else self.all_bands
         self.season = season
