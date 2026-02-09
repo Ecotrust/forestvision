@@ -590,9 +590,7 @@ class GEEMSImage:
         if not isinstance(image, ee.Image):
             raise ValueError("Input image must be an ee.Image object")
 
-        self._all_bands = image.bandNames().getInfo()
-        if not self._all_bands:
-            raise ValueError("Image must have at least one band")
+
 
         self.image = image
         self.dimensions: Tuple[int, int] = dimensions
@@ -685,7 +683,7 @@ class GEEMSImage:
             List[str]: List of band names to fetch from the image.
         """
         if not self._bands:
-            self._bands = self._all_bands
+            self._bands = self.image.bandNames().getInfo()
         return self._bands
 
     @bands.setter
@@ -698,7 +696,7 @@ class GEEMSImage:
         Raises:
             ValueError: If any band in value is not available in the image.
         """
-        invalid_bands = set(value) - set(self._all_bands)
+        invalid_bands = set(value) - set(self.bands)
         if invalid_bands:
             raise ValueError(f"Invalid bands: {invalid_bands}")
         self._bands: List[str] = value
@@ -1152,7 +1150,7 @@ class GEERasterDataset(CloudRasterDataset):
                 metadata_bands = [b["name"] for b in eo_bands]
                 # Only update if metadata has different bands
                 if metadata_bands != list(self.all_bands):
-                    logging.info(f"Updating all_bands from {list(self.all_bands)} to {metadata_bands} (from metadata)")
+                    logging.info("Updating all_bands from metadata")
                     self.all_bands = metadata_bands
                 else:
                     logging.debug(f"all_bands already matches metadata: {metadata_bands}")
