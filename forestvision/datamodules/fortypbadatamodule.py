@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from typing import Any, Dict, List, Optional, Union
 import warnings
 
@@ -23,44 +24,56 @@ from forestvision.deploy import AnyRasterDataset
 
 # Mute warnings
 os.environ["CPL_LOG"] = "/dev/null"
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 # Load from .env file
 load_dotenv()
 GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
 TARGET_PATH = os.getenv("TARGET_PATH")
 
+# fmt: off
 REMAP = {
-    33: 11, 112: 11, 128: 11, 165: 11, 182: 11, 198: 11, 306: 10, 346: 11,
-    113: 11, 115: 11, 123: 11, 124: 11, 125: 10, 126: 11, 127: 11, 129: 10,
-    130: 11, 131: 11, 132: 11, 133: 11, 134: 10, 135: 11, 136: 10, 148: 11,
-    170: 10, 177: 11, 184: 11, 186: 11, 188: 10, 189: 10,
-    190: 10, 191: 10, 192: 10, 193: 10, 196: 10, 197: 10, 199: 11,
-    200: 10, 202: 10, 204: 10, 206: 10, 210: 10, 211: 10, 215: 10, 218: 10,
-    219: 10, 220: 10, 221: 10, 231: 10, 234: 10, 238: 10, 254: 10, 256: 10,
-    259: 10, 260: 10, 261: 10, 262: 10, 263: 10, 265: 10, 266: 10, 269: 10,
-    270: 10, 271: 10, 272: 10, 282: 10, 284: 10, 286: 10, 293: 10, 319: 10,
-    322: 10, 368: 10, 425: 11, 426: 10, 427: 10, 488: 10, 498: 10,
-    518: 10, 535: 10, 543: 11, 545: 10, 546: 10, 565: 11, 568: 11, 569: 11,
-    571: 11, 580: 11, 581: 10, 597: 11, 598: 10, 599: 11, 600: 11, 601: 10,
-    602: 11, 603: 11, 604: 11, 605: 11, 606: 11, 607: 10, 608: 11, 610: 11,
-    614: 10, 619: 10, 621: 11, 622: 11, 624: 11, 625: 11, 634: 11, 645: 10,
-    647: 11, 653: 11, 654: 10, 667: 11, 668: 11, 669: 11, 670: 11, 672: 11,
-    673: 11, 674: 11, 676: 11, 677: 11, 679: 11, 681: 11, 683: 11, 684: 11,
-    685: 11, 689: 11, 690: 11, 698: 11, 701: 11, 702: 11, 703: 11, 704: 11,
-    705: 11, 706: 11, 708: 11, 714: 11, 717: 10, 718: 11, 719: 11, 720: 11,
-    721: 11, 723: 11, 726: 11, 728: 11, 743: 11, 748: 11, 752: 11, 767: 11,
-    776: 11, 791: 11, 794: 11, 815: 10, 818: 10, 836: 11, 838: 11, 839: 11,
-    840: 11, 841: 11, 844: 11, 852: 11, 855: 10, 886: 10, 887: 11, 888: 11,
-    889: 11, 890: 10, 891: 10, 892: 11, 893: 10, 894: 11, 895: 11, 896: 10,
-    897: 10, 898: 10, 899: 10, 900: 10, 901: 11, 902: 10, 906: 10, 907: 11,
-    908: 11, 909: 11, 910: 11, 911: 11, 915: 11, 916: 11, 917: 11, 918: 11,
-    919: 11, 921: 11, 926: 11, 930: 11, 931: 11, 932: 11, 935: 11, 942: 11,
-    943: 11, 944: 11, 945: 11, 946: 11, 947: 11, 948: 11, 966: 9, 968: 9,
-    969: 9, 975: 9,
+    # Forest type 9
+    966: 9,   968: 9,   969: 9,   975: 9,
+    
+    # Forest type 10
+    125: 10,  129: 10,  134: 10,  136: 10,  170: 10,  188: 10,  189: 10,
+    190: 10,  191: 10,  192: 10,  193: 10,  196: 10,  197: 10,  200: 10,
+    202: 10,  204: 10,  206: 10,  210: 10,  211: 10,  215: 10,  218: 10,
+    219: 10,  220: 10,  221: 10,  231: 10,  234: 10,  238: 10,  254: 10,
+    256: 10,  259: 10,  260: 10,  261: 10,  262: 10,  263: 10,  265: 10,
+    266: 10,  269: 10,  270: 10,  271: 10,  272: 10,  282: 10,  284: 10,
+    286: 10,  293: 10,  306: 10,  319: 10,  322: 10,  368: 10,  426: 10,
+    427: 10,  488: 10,  498: 10,  518: 10,  535: 10,  545: 10,  546: 10,
+    581: 10,  598: 10,  601: 10,  607: 10,  614: 10,  619: 10,  645: 10,
+    654: 10,  717: 10,  815: 10,  818: 10,  855: 10,  886: 10,  890: 10,
+    891: 10,  893: 10,  896: 10,  897: 10,  898: 10,  899: 10,  900: 10,
+    902: 10,  906: 10,
+    
+    # Forest type 11
+    33: 11,   112: 11,  113: 11,  115: 11,  123: 11,  124: 11,  126: 11,
+    127: 11,  128: 11,  130: 11,  131: 11,  132: 11,  133: 11,  135: 11,
+    148: 11,  165: 11,  177: 11,  182: 11,  184: 11,  186: 11,  199: 11,
+    346: 11,  425: 11,  543: 11,  565: 11,  568: 11,  569: 11,  571: 11,
+    580: 11,  597: 11,  599: 11,  600: 11,  602: 11,  603: 11,  604: 11,
+    605: 11,  606: 11,  608: 11,  610: 11,  621: 11,  622: 11,  624: 11,
+    625: 11,  634: 11,  647: 11,  653: 11,  667: 11,  668: 11,  669: 11,
+    670: 11,  672: 11,  673: 11,  674: 11,  676: 11,  677: 11,  679: 11,
+    681: 11,  683: 11,  684: 11,  685: 11,  689: 11,  690: 11,  698: 11,
+    701: 11,  702: 11,  703: 11,  704: 11,  705: 11,  706: 11,  708: 11,
+    714: 11,  718: 11,  719: 11,  720: 11,  721: 11,  723: 11,  726: 11,
+    728: 11,  743: 11,  748: 11,  752: 11,  767: 11,  776: 11,  791: 11,
+    794: 11,  836: 11,  838: 11,  839: 11,  840: 11,  841: 11,  844: 11,
+    852: 11,  887: 11,  888: 11,  889: 11,  892: 11,  894: 11,  895: 11,
+    901: 11,  907: 11,  908: 11,  909: 11,  910: 11,  911: 11,  915: 11,
+    916: 11,  917: 11,  918: 11,  919: 11,  921: 11,  926: 11,  930: 11,
+    931: 11,  932: 11,  935: 11,  942: 11,  943: 11,  944: 11,  945: 11,
+    946: 11,  947: 11,  948: 11,
 }
+# fmt: on
 
 GNNForestAttr.remap_dict.update(REMAP)
+
 
 class ClimateNA(AnyRasterDataset):
     all_bands = ["AHM", "MAP", "TD"]
@@ -68,6 +81,7 @@ class ClimateNA(AnyRasterDataset):
     rgb_bands = ["AHM", "MAP", "TD"]
     instrument = "ClimateNA"
     nodata = -9999
+
 
 class ForTypesDataModule(BaseGeoDataModule):
     """LightningDataModule for forest type classification, refactored to use BaseGeoDataModule."""
@@ -146,261 +160,127 @@ class ForTypesDataModule(BaseGeoDataModule):
             predict_tiles_path=predict_tiles_path,
             stats_path=stats_path,
             hparams=hparams,
-            **kwargs
+            **kwargs,
         )
-        
+
         # Stat loading and transform setup (kept for compatibility with current workflow)
         self.input_stats = None
         self.target_stats = None
         self._transforms_applied = False
 
     def setup(self, stage: str, year: Optional[int] = None) -> None:
-        super().setup(stage, year)
-        
-        # Load stats if available
-        if self.input_stats is None and self.stats_path and os.path.exists(self.stats_path):
+        """Setup datasets and load stats from JSON file."""
+        # Load stats BEFORE calling super().setup() so they're available during dataset creation
+        if self.stats_path and os.path.exists(self.stats_path):
             self._load_stats_from_file()
-            
-        if stage != "prepare":
-            self.setup_transforms()
+        else:
+            logging.warning(f"Stats file not found at {self.stats_path}. Using identity normalization (mean=0, std=1).")
+            self._set_identity_stats()
+        
+        super().setup(stage, year)
+
+    def _set_identity_stats(self):
+        """Set identity stats (mean=0, std=1) for all datasets when no stats file exists."""
+        # For input datasets, we need to know the channel count
+        # We'll set identity stats - they can be overridden later
+        for cfg in self.input_configs:
+            # Use placeholder identity stats - actual channel count determined during data loading
+            cfg.mean = [0.0]  # Will be expanded to match actual channels
+            cfg.std = [1.0]
+        
+        for cfg in self.target_configs:
+            cfg.mean = [0.0]
+            cfg.std = [1.0]
 
     def _load_stats_from_file(self):
+        """Load JSON stats and populate transforms."""
+        import json
+
         try:
             logging.info(f"Loading statistics from {self.stats_path}")
-            stats_dict = torch.load(self.stats_path)
-            if "input_stats" in stats_dict and "target_stats" in stats_dict:
-                raw_input_stats = stats_dict["input_stats"]
-                
-                # Handle list-based stats (new format)
-                if isinstance(raw_input_stats, list):
-                    all_means, all_stds = [], []
-                    
-                    # Match stats by config index
-                    for i, cfg in enumerate(self.input_configs):
-                        if i >= len(raw_input_stats):
-                            logging.error(f"Config index {i} exceeds available stats (len={len(raw_input_stats)})")
-                            continue
-                        
-                        ds_stats = self._deserialize_stats(raw_input_stats[i])
-                        ds_name = cfg.dataset_class.__name__
-                        
-                        # Verify class names match for safety
-                        stored_class = ds_stats.get('dataset_class', 'Unknown')
-                        if stored_class != ds_name:
-                            logging.warning(
-                                f"Config index {i}: Expected {ds_name}, found {stored_class} in stats. "
-                                "Using stats anyway (order-based matching)."
-                            )
-                        
-                        # Subset stats if a custom band list is requested
-                        if len(ds_stats.get("mean", [])) != len(cfg.bands):
-                            try:
-                                # Use all_bands from class or instance metadata
-                                band_ref = getattr(cfg.dataset_class, "all_bands", None)
-                                indices = [band_ref.index(b) for b in cfg.bands]
-                                all_means.extend([ds_stats["mean"][i] for i in indices])
-                                all_stds.extend([ds_stats["std"][i] for i in indices])
-                                logging.info(f"Subsetted stats for {ds_name} (config index {i})")
-                            except (AttributeError, ValueError, IndexError) as e:
-                                logging.warning(f"Could not subset stats for {ds_name}: {e}. Using all stats.")
-                                all_means.extend(ds_stats.get("mean", []))
-                                all_stds.extend(ds_stats.get("std", []))
-                        else:
-                            all_means.extend(ds_stats.get("mean", []))
-                            all_stds.extend(ds_stats.get("std", []))
-                    
-                    if all_means:
-                        self.input_stats = {
-                            "mean": torch.tensor(all_means),
-                            "std": torch.tensor(all_stds)
-                        }
-                        logging.info(f"Successfully loaded list-based input statistics ({len(all_means)} channels)")
-                    else:
-                        logging.error("No input statistics could be loaded from list format")
-                        return
-                else:
-                    # Legacy dict-based format - reject it
-                    raise ValueError(
-                        "Stats file uses legacy dict-based format. "
-                        "Please regenerate stats with: "
-                        "python scripts/prepare_data.py --config <your_config.yaml> --overwrite"
-                    )
-                
-                # Update datamodule properties for trainer access
-                self.hparams["input_stats"] = self._serialize_stats(self.input_stats)
-                
-                # Handle target stats
-                raw_target_stats = self._deserialize_stats(stats_dict["target_stats"])
-                
-                # Align target stats with requested target bands
-                all_target_means, all_target_stds = [], []
-                for cfg in self.target_configs:
-                    target_band_ref = getattr(cfg.dataset_class, "all_bands", None)
-                    if target_band_ref:
-                        try:
-                            indices = [target_band_ref.index(b) for b in cfg.bands]
-                            all_target_means.extend([raw_target_stats["mean"][i] for i in indices])
-                            all_target_stds.extend([raw_target_stats["std"][i] for i in indices])
-                            logging.info(f"Subsetted target stats for {cfg.dataset_class.__name__}")
-                        except (ValueError, IndexError):
-                            all_target_means.extend(raw_target_stats["mean"])
-                            all_target_stds.extend(raw_target_stats["std"])
-                    else:
-                        all_target_means.extend(raw_target_stats["mean"])
-                        all_target_stds.extend(raw_target_stats["std"])
 
-                if all_target_means:
-                    self.target_stats = {
-                        "mean": torch.tensor(all_target_means),
-                        "std": torch.tensor(all_target_stds)
-                    }
-                else:
-                    self.target_stats = raw_target_stats
+            with open(self.stats_path, "r") as f:
+                stats = json.load(f)
+
+            # 1. Aggregated Input Stats
+            all_means = []
+            all_stds = []
+            for entry in stats.get("input_stats", []):
+                all_means.extend(entry.get("mean", []))
+                all_stds.extend(entry.get("std", []))
+
+            self.input_stats = {
+                "mean": torch.tensor(all_means),
+                "std": torch.tensor(all_stds),
+            }
+
+            # 2. Aggregated Target Stats
+            target_json = stats.get("target_stats", {})
+            self.target_stats = {
+                "mean": torch.tensor(target_json.get("mean", [0.0])),
+                "std": torch.tensor(target_json.get("std", [1.0])),
+            }
+
+            # 3. Populate top-level combined transforms with these stats
+            # This also handles subsetting if SelectBands is present
+            if self.input_transforms:
+                self.input_transforms = self._populate_normalize_stats(
+                    self.input_transforms, all_means, all_stds
+                )
                 
-                self.hparams["target_stats"] = self._serialize_stats(self.target_stats)
-                logging.info("Successfully loaded and aligned statistics from file")
+                # Update aggregated stats to match final selected bands for model hparams
+                # Search for Normalize transform in the chain (handles both dict and objects)
+                def get_norm_stats(obj):
+                    if isinstance(obj, dict):
+                        if "Normalize" in obj.get("class_path", ""):
+                            ia = obj.get("init_args", {})
+                            return ia.get("mean"), ia.get("std")
+                        for v in obj.values():
+                            res = get_norm_stats(v)
+                            if res: return res
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            res = get_norm_stats(item)
+                            if res: return res
+                    elif hasattr(obj, "mean") and hasattr(obj, "std"):
+                        return obj.mean, obj.std
+                    elif hasattr(obj, "transforms"):
+                        for t in obj.transforms:
+                            res = get_norm_stats(t)
+                            if res: return res
+                    return None
                 
+                stats_pair = get_norm_stats(self.input_transforms)
+                if stats_pair and stats_pair[0] is not None:
+                    self.input_stats["mean"] = torch.tensor(stats_pair[0])
+                    self.input_stats["std"] = torch.tensor(stats_pair[1])
+
+            if self.target_transforms:
+                self.target_transforms = self._populate_normalize_stats(
+                    self.target_transforms, target_json.get("mean"), target_json.get("std")
+                )
+                
+                # Same for target stats
+                stats_pair = get_norm_stats(self.target_transforms)
+                if stats_pair and stats_pair[0] is not None:
+                    self.target_stats["mean"] = torch.tensor(stats_pair[0])
+                    self.target_stats["std"] = torch.tensor(stats_pair[1])
+
+            self.hparams["input_stats"] = self._serialize_stats(self.input_stats)
+            self.hparams["target_stats"] = self._serialize_stats(self.target_stats)
+
+            logging.info(f"Successfully loaded statistics: {len(all_means)} input channels")
+            
         except Exception as e:
             logging.error(f"Failed to load statistics: {e}")
             raise
 
     def setup_transforms(self):
-        if self.input_stats is None or self.target_stats is None:
-            return
-
-        # Target transforms applied to the final combined dataset
-        target_transforms = v2.Compose([
-            ReplaceNodataVal(nodata=-2147483648, new_nodata=-1),
-            Normalize(mean=self.target_stats["mean"], std=self.target_stats["std"], on_key="mask", nodata=-1),
-        ])
-
-        # We apply target transforms to the combined training/val datasets
-        if self.train_dataset:
-            self.train_dataset.transforms = target_transforms
-        if self.val_dataset:
-            self.val_dataset.transforms = target_transforms
-
-        # For input datasets, we apply normalization PER-DATASET to avoid shape mismatches
-        # during broadcast in IntersectionDataset.
-        stats_file = torch.load(self.stats_path)
-        input_stats_list = stats_file["input_stats"]
-        
-        def apply_input_transforms(dataset):
-            from torchgeo.datasets import IntersectionDataset
-            
-            # Track which config index we're at as we traverse
-            idx_counter = [0]
-            
-            def traverse_and_apply(ds):
-                if isinstance(ds, IntersectionDataset):
-                    if hasattr(ds, "datasets"):
-                        for child in ds.datasets:
-                            traverse_and_apply(child)
-                    else:
-                        traverse_and_apply(ds.dataset1)
-                        traverse_and_apply(ds.dataset2)
-                else:
-                    # Leaf dataset - check if it's a target dataset
-                    is_target = any(isinstance(ds, cfg.dataset_class) for cfg in self.target_configs)
-                    
-                    if not is_target and idx_counter[0] < len(input_stats_list):
-                        # This is an input dataset - apply its stats
-                        stats = self._deserialize_stats(input_stats_list[idx_counter[0]])
-                        ds_name = ds.__class__.__name__
-                        
-                        # Verify class name matches for safety
-                        stored_class = stats.get('dataset_class', 'Unknown')
-                        if stored_class != ds_name:
-                            logging.warning(
-                                f"Config index {idx_counter[0]}: Expected {ds_name}, "
-                                f"found {stored_class} in stats"
-                            )
-                        
-                        # Ensure mean/std match the number of base bands currently requested.
-                        if len(stats["mean"]) == len(ds.bands):
-                            m = torch.tensor(stats["mean"])
-                            s = torch.tensor(stats["std"])
-                        else:
-                            # Mismatch: try to subset stats based on band names
-                            # Prioritize instance metadata (all_bands) which might be synced from collection.json
-                            band_ref = getattr(ds, "all_bands", None) or getattr(ds.__class__, "all_bands", None)
-                            if band_ref:
-                                try:
-                                    # Map currently requested bands to indices in the statistical baseline (all_bands)
-                                    indices = [band_ref.index(b) for b in ds.bands]
-                                    
-                                    # Safety check: ensure indices are within the stats array bounds
-                                    max_stat_idx = len(stats["mean"]) - 1
-                                    valid_indices = [i for i in indices if i <= max_stat_idx]
-                                    
-                                    if len(valid_indices) != len(indices):
-                                        missing = [ds.bands[i] for i, idx in enumerate(indices) if idx > max_stat_idx]
-                                        logging.warning(f"Statistics for {ds_name} missing bands: {missing}")
-                                        idx_counter[0] += 1
-                                        return
-
-                                    m = torch.tensor(stats["mean"])[indices]
-                                    s = torch.tensor(stats["std"])[indices]
-                                    logging.info(f"Successfully subsetted statistics for {ds_name} using metadata")
-                                except (ValueError, IndexError) as e:
-                                    logging.warning(f"Could not subset stats for {ds_name}: {e}")
-                                    idx_counter[0] += 1
-                                    return
-                            else:
-                                logging.warning(
-                                    f"Skipping normalization for {ds_name}: Stats channel count ({len(stats['mean'])}) "
-                                    f"does not match requested bands ({len(ds.bands)}) and no metadata available."
-                                )
-                                idx_counter[0] += 1
-                                return
-
-                        # Create normalization transform
-                        norm = Normalize(mean=m, std=s, on_key="image")
-                        
-                        # Use a robust wrapper to handle extra bands added by transforms (like NDVI)
-                        def robust_norm(sample):
-                            img = sample["image"]
-                            num_stats_channels = len(m)
-                            
-                            if img.shape[-3] > num_stats_channels:
-                                # Normalize only base bands, leave extra bands (indices) as they are
-                                base_img = img[..., :num_stats_channels, :, :]
-                                extra_img = img[..., num_stats_channels:, :, :]
-                                
-                                sample["image"] = base_img
-                                sample = norm(sample)
-                                
-                                sample["image"] = torch.cat([sample["image"], extra_img], dim=-3)
-                            else:
-                                sample = norm(sample)
-                            return sample
-
-                        # Preserve existing transforms and append normalization
-                        existing_transforms = ds.transforms
-                        if existing_transforms:
-                            ds.transforms = v2.Compose([existing_transforms, robust_norm])
-                        else:
-                            ds.transforms = robust_norm
-                            
-                        logging.info(f"Applied robust per-dataset normalization to {ds_name} (config index {idx_counter[0]}, {len(m)} base bands)")
-                        idx_counter[0] += 1
-            
-            traverse_and_apply(dataset)
-
-        # Apply to all input datasets in the tree
-        for stage_attr in ["train_dataset", "val_dataset"]:
-            ds = getattr(self, stage_attr, None)
-            if ds:
-                apply_input_transforms(ds)
+        """Hook for future use. Normalization is now handled per-dataset via transforms config."""
+        pass
 
     def train_dataloader(self):
-        if self.input_stats is not None and not self._transforms_applied:
-            self.setup_transforms()
-            self._transforms_applied = True
         return super().train_dataloader()
 
     def val_dataloader(self):
-        if self.input_stats is not None and not self._transforms_applied:
-            self.setup_transforms()
-            self._transforms_applied = True
         return super().val_dataloader()

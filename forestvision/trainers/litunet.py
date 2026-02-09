@@ -41,6 +41,7 @@ class RegressionUNet(BaseTask):
         ignore_index=None,
     ):
         super().__init__()
+        self.save_hyperparameters()
 
     def compute_loss(self, y_hat, y, mask=None):
         if self.hparams["loss"] == "l1ssim":
@@ -104,14 +105,20 @@ class RegressionUNet(BaseTask):
 
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["mask"].float()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_hat = self(x)
 
         if y_hat.ndim != y.ndim:
             y = y.unsqueeze(dim=1)
 
         mask = torch.zeros_like(y, dtype=torch.bool)
-        if self.hparams["ignore_index"] is not None:
-            mask = y == self.hparams["ignore_index"]
+        if ignore_idx is not None:
+            mask = y == ignore_idx
 
         loss = self.compute_loss(y_hat, y, mask)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
@@ -126,14 +133,20 @@ class RegressionUNet(BaseTask):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["mask"].float()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_hat = self(x)
 
         if y_hat.ndim != y.ndim:
             y = y.unsqueeze(dim=1)
 
         mask = torch.zeros_like(y, dtype=torch.bool)
-        if self.hparams["ignore_index"] is not None:
-            mask = y == self.hparams["ignore_index"]
+        if ignore_idx is not None:
+            mask = y == ignore_idx
 
         loss = self.compute_loss(y_hat, y, mask)
         self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
@@ -195,25 +208,61 @@ class RegressionUNet(BaseTask):
             self.logger.experiment.add_figure("test_images", fig, self.global_step)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=self.hparams["lr"], weight_decay=1e-5
         )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=10
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
+        }
 
     def plot_batch(self, batch, n=7, rgb_bands=[3, 2, 1]):
         """Plot a sample of n images from batch."""
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")  # clear previous plots if any
 
-        try:
-            input_stats = self.trainer.datamodule.input_stats
-            target_stats = self.trainer.datamodule.target_stats
-        except AttributeError:
-            input_stats = self.input_stats
-            target_stats = self.target_stats
+        # Robust stats lookup
+        input_stats = self.hparams.get("input_stats")
+        target_stats = self.hparams.get("target_stats")
+
+        if input_stats is None:
+            input_stats = getattr(self.trainer.datamodule, "input_stats", None) if hasattr(self, "trainer") else None
+        if input_stats is None:
+            input_stats = getattr(self, "input_stats", None)
+
+        if target_stats is None:
+            target_stats = getattr(self.trainer.datamodule, "target_stats", None) if hasattr(self, "trainer") else None
+        if target_stats is None:
+            target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats):
             if stats is not None:
-                return Denormalize(mean=stats["mean"], std=stats["std"])(tensor)
+                m, s = stats["mean"], stats["std"]
+                
+                # Convert back to tensor if they were serialized to lists in hparams
+                if isinstance(m, list):
+                    m = torch.tensor(m)
+                if isinstance(s, list):
+                    s = torch.tensor(s)
+                
+                # Ensure device match
+                m = m.to(tensor.device)
+                s = s.to(tensor.device)
+
+                # Defensive slicing: ensure channel count matches tensor if stats are longer
+                num_tensor_channels = tensor.shape[-3]
+                if len(m) > num_tensor_channels:
+                    print('Warning: Stats have more channels than tensor. Slicing stats to match tensor channels.')
+                    m = m[:num_tensor_channels]
+                    s = s[:num_tensor_channels]
+                    
+                return Denormalize(mean=m, std=s)(tensor)
             return tensor
 
         x, y = batch["image"], batch["mask"].float()
@@ -271,6 +320,7 @@ class SegmentationUNet(BaseTask):
 
     target_key = "mask"
     input_stats: dict = None
+    target_stats: dict = None
 
     def __init__(
         self,
@@ -362,11 +412,26 @@ class SegmentationUNet(BaseTask):
             lr=self.hparams["lr"],
             weight_decay=self.hparams["weight_decay"],
         )
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=10
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
+        }
 
     def training_step(self, batch, batch_idx):
         """Training step for classification."""
         x, y = batch["image"], batch["mask"].long()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_logits = self(x)  # Model outputs logits
 
         # Compute loss using logits (FocalLoss expects logits and applies softmax internally)
@@ -386,6 +451,12 @@ class SegmentationUNet(BaseTask):
     def validation_step(self, batch, batch_idx):
         """Validation step for classification."""
         x, y = batch["image"], batch["mask"].long()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_logits = self(x)  # Model outputs logits
 
         loss = self.criterion(y_logits, y.squeeze(1))
@@ -445,14 +516,42 @@ class SegmentationUNet(BaseTask):
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")  # clear previous plots if any
 
-        try:
-            input_stats = self.trainer.datamodule.input_stats
-        except AttributeError:
-            input_stats = self.input_stats
+        # Robust stats lookup
+        input_stats = self.hparams.get("input_stats")
+        target_stats = self.hparams.get("target_stats")
+
+        if input_stats is None:
+            input_stats = getattr(self.trainer.datamodule, "input_stats", None) if hasattr(self, "trainer") else None
+        if input_stats is None:
+            input_stats = getattr(self, "input_stats", None)
+
+        if target_stats is None:
+            target_stats = getattr(self.trainer.datamodule, "target_stats", None) if hasattr(self, "trainer") else None
+        if target_stats is None:
+            target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats):
             if stats is not None:
-                return Denormalize(mean=stats["mean"], std=stats["std"])(tensor)
+                m, s = stats["mean"], stats["std"]
+                
+                # Convert back to tensor if they were serialized to lists in hparams
+                if isinstance(m, list):
+                    m = torch.tensor(m)
+                if isinstance(s, list):
+                    s = torch.tensor(s)
+
+                # Ensure device match
+                m = m.to(tensor.device)
+                s = s.to(tensor.device)
+
+                # Defensive slicing: ensure channel count matches tensor if stats are longer
+                num_tensor_channels = tensor.shape[-3]
+                if len(m) > num_tensor_channels:
+                    print('Warning: Stats have more channels than tensor. Slicing stats to match tensor channels.')
+                    m = m[:num_tensor_channels]
+                    s = s[:num_tensor_channels]
+                    
+                return Denormalize(mean=m, std=s)(tensor)
             return tensor
 
         x, y = batch["image"], batch["mask"]
@@ -596,82 +695,96 @@ class MultiTaskUNet(BaseTask):
 
     target_key = "mask"
     input_stats: dict = None
+    target_stats: dict = None
 
     def __init__(
         self,
         in_channels: int = 3,
-        num_classes: int = 1,
+        num_seg_classes: int = 14,
+        num_reg_targets: int = 1,
         loss: str = "ce",
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
         ignore_index: int = None,
         dropout: float = 0.0,
+        scheduler_patience: int = 10,
+        scheduler_factor: float = 0.5,
+        seg_loss_weight: float = 0.6,
+        reg_loss_weight: float = 0.4,
         labels: dict = None,
         colormap: dict = None,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        # Save hyperparameters, excluding visualization-only params
+        self.save_hyperparameters(ignore=['labels', 'colormap'])
+        # Store as instance attributes (not hyperparameters)
         self.labels = labels or {}
         self.colormap = colormap or {}
         self.validation_step_outputs = []
 
     def configure_models(self):
         """Initialize the UNet model for classification."""
+        # Compute total output channels from explicit parameters
+        num_classes = self.hparams["num_seg_classes"] + self.hparams["num_reg_targets"]
         self.model = UNet(
             in_channels=self.hparams["in_channels"],
-            out_channels=self.hparams["num_classes"],
+            out_channels=num_classes,
             dropout=self.hparams["dropout"],
         )
 
-    def compute_loss(self, y, logits, ignore_index=-1):
+    def compute_loss(self, y, logits, ignore_index=None):
         """Compute multi-task loss (Focal for classification + L1 for regression)."""
+        # Use hparams ignore_index if not provided
+        if ignore_index is None:
+            ignore_index = self.hparams.get("ignore_index", -1)
+        
         # Ensure logits and y have matching spatial dimensions
         if logits.shape[2:] != y.shape[2:]:
-            target_h, target_w = y.shape[2:]
             logits = F.interpolate(
-                logits, size=(target_h, target_w), mode="bilinear", align_corners=False
+                logits, size=y.shape[2:], mode="bilinear", align_corners=False
             )
 
-        # Classification is always channel 0
-        ndmask = y[:, 0, :] == ignore_index
+        # Derive class counts from hparams
+        num_seg = self.hparams["num_seg_classes"]   # Segmentation classes
+        num_reg = self.hparams["num_reg_targets"]   # Regression targets
         
-        focal = FocalLoss(
-            mode="multiclass",
-            gamma=2,
-            reduction="mean",
-            ignore_index=ignore_index,
-        )
+        # Split outputs: [B, num_seg + num_reg, H, W]
+        seg_logits = logits[:, :num_seg]                    # [B, num_seg, H, W]
+        reg_logits = logits[:, num_seg:num_seg+num_reg]     # [B, num_reg, H, W]
         
-        # Split logits into classification (first 14) and regression (remaining)
-        num_seg_classes = 14
-        fty, fat = (logits[:, :num_seg_classes], logits[:, num_seg_classes:])
+        # Create mask from classification channel
+        ndmask = y[:, 0] == ignore_index  # [B, H, W]
         
-        focal_loss = focal(fty, y[:, 0, :, :])
-
-        # Regression channels (variable count starting from index 1 in target tensor)
-        mae = nn.L1Loss(reduction="none")
-        num_regression_targets = y.shape[1] - 1
+        # Classification loss
+        focal_loss = self.focal_loss(seg_logits, y[:, 0].long())
         
-        if num_regression_targets > 0:
-            reg_losses = []
-            for i in range(num_regression_targets):
-                # Map fat[i] to y[i+1]
-                loss_i = mae(fat[:, i, :], y[:, i + 1, :])[~ndmask].mean()
-                reg_losses.append(loss_i)
+        # Regression loss (vectorized)
+        if num_reg > 0:
+            reg_target = y[:, 1:num_reg+1]  # [B, num_reg, H, W]
+            reg_loss_all = self.mae_loss(reg_logits, reg_target)  # [B, num_reg, H, W]
             
-            # Simple average of regression losses for now
-            l1_loss = torch.stack(reg_losses).mean()
-            return focal_loss * 0.6 + l1_loss * 0.4
+            # Apply mask and average - expand mask to match reg_loss_all shape
+            ndmask_expanded = ndmask.unsqueeze(1).expand_as(reg_loss_all)
+            reg_loss = reg_loss_all[~ndmask_expanded].mean()
+            
+            # Combine losses using configurable weights
+            seg_w = self.hparams["seg_loss_weight"]
+            reg_w = self.hparams["reg_loss_weight"]
+            total_loss = focal_loss * seg_w + reg_loss * reg_w
+            
+            return total_loss
         
         return focal_loss
 
     def configure_losses(self) -> None:
-        """Initialize the loss criterion.
-
-        Raises:
-            ValueError: If *loss* is invalid.
-        """
-        pass
+        """Initialize the loss criterion."""
+        self.focal_loss = FocalLoss(
+            mode="multiclass",
+            gamma=2,
+            reduction="mean",
+            ignore_index=self.hparams.get("ignore_index", -1),
+        )
+        self.mae_loss = nn.L1Loss(reduction="none")
 
     def configure_metrics(self) -> None:
         """Initialize the performance metrics for classification."""
@@ -679,18 +792,18 @@ class MultiTaskUNet(BaseTask):
             {
                 "accuracy": Accuracy(
                     task="multiclass",
-                    num_classes=self.hparams["num_classes"],  # Keep +1 for ignore_index
+                    num_classes=self.hparams["num_seg_classes"],
                     ignore_index=self.hparams["ignore_index"],
                 ),
                 "kappa": CohenKappa(
                     task="multiclass",
-                    num_classes=self.hparams["num_classes"],
+                    num_classes=self.hparams["num_seg_classes"],
                     weights="quadratic",
                     ignore_index=self.hparams["ignore_index"],
                 ),
                 "jaccard": JaccardIndex(
                     task="multiclass",
-                    num_classes=self.hparams["num_classes"],
+                    num_classes=self.hparams["num_seg_classes"],
                     ignore_index=self.hparams["ignore_index"],
                 ),
             }
@@ -702,7 +815,7 @@ class MultiTaskUNet(BaseTask):
         # Confusion matrix for validation epoch end
         self.confusion_matrix = ConfusionMatrix(
             task="multiclass",
-            num_classes=14,
+            num_classes=self.hparams["num_seg_classes"],
             ignore_index=self.hparams["ignore_index"],
         )
 
@@ -725,17 +838,35 @@ class MultiTaskUNet(BaseTask):
             lr=self.hparams["lr"],
             weight_decay=self.hparams["weight_decay"],
         )
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=self.hparams["scheduler_factor"], patience=self.hparams["scheduler_patience"]
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
+        }
 
     def training_step(self, batch, batch_idx):
         """Training step for classification."""
         x, y = batch["image"], batch["mask"].long()
+
+        # Sanitize target: remap all negative values to ignore_index
+        # This prevents large negative NoData values (e.g. -2147483648) from crashing torchmetrics
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_logits = self(x)  # Model outputs logits
 
-        loss = self.compute_loss(y, y_logits, self.hparams["ignore_index"])
+        loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
 
-        ft_logits, fa_logits = (y_logits[:, :14], y_logits[:, 14:])
+        # Use explicit parameter for segmentation classes
+        num_seg = self.hparams["num_seg_classes"]
+        ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
 
         ft_probs = ft_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
@@ -792,12 +923,20 @@ class MultiTaskUNet(BaseTask):
     def validation_step(self, batch, batch_idx):
         """Validation step for classification."""
         x, y = batch["image"], batch["mask"].long()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_logits = self(x)  # Model outputs logits
 
-        loss = self.compute_loss(y, y_logits, self.hparams["ignore_index"])
+        loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("val_loss", loss, on_epoch=True, sync_dist=True)
 
-        ft_logits, fa_logits = (y_logits[:, :14], y_logits[:, 14:])
+        # Use explicit parameter for segmentation classes
+        num_seg = self.hparams["num_seg_classes"]
+        ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
         ft_probs = ft_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
 
@@ -897,26 +1036,48 @@ class MultiTaskUNet(BaseTask):
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")  # clear previous plots if any
 
-        try:
-            input_stats = self.trainer.datamodule.input_stats
-            target_stats = self.trainer.datamodule.target_stats
-        except AttributeError:
-            input_stats = self.input_stats
-            target_stats = self.target_stats
+        # Robust stats lookup
+        input_stats = self.hparams.get("input_stats")
+        target_stats = self.hparams.get("target_stats")
+
+        if input_stats is None:
+            input_stats = getattr(self.trainer.datamodule, "input_stats", None) if hasattr(self, "trainer") else None
+        if input_stats is None:
+            input_stats = getattr(self, "input_stats", None)
+
+        if target_stats is None:
+            target_stats = getattr(self.trainer.datamodule, "target_stats", None) if hasattr(self, "trainer") else None
+        if target_stats is None:
+            target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats):
             if stats is not None:
                 m, s = stats["mean"], stats["std"]
+
+                # Convert back to tensor if they were serialized to lists in hparams
+                if isinstance(m, list):
+                    m = torch.tensor(m)
+                if isinstance(s, list):
+                    s = torch.tensor(s)
+
+                # Ensure device match
+                m = m.to(tensor.device)
+                s = s.to(tensor.device)
+
                 num_stats_channels = len(m)
-                if tensor.shape[-3] > num_stats_channels:
-                    # Robust revert: only denormalize base bands
-                    base_tensor = tensor[..., :num_stats_channels, :, :]
-                    extra_tensor = tensor[..., num_stats_channels:, :, :]
-                    
-                    reverted_base = Denormalize(mean=m, std=s)(base_tensor)
-                    return torch.cat([reverted_base, extra_tensor], dim=-3)
-                else:
-                    return Denormalize(mean=m, std=s)(tensor)
+                num_tensor_channels = tensor.shape[-3]
+                
+                # STRICT CHECK: Stats must match tensor channels exactly
+                if num_stats_channels != num_tensor_channels:
+                    raise ValueError(
+                        f"Stats channel mismatch in MultiTaskUNet.revert(): "
+                        f"stats has {num_stats_channels} channels but tensor has {num_tensor_channels} channels. "
+                        f"This indicates the stats file was computed with a different configuration than the training data. "
+                        f"To fix this, regenerate the stats file using: "
+                        f"python scripts/prepare_data.py --config <your_config.yaml> --from-batches --overwrite"
+                    )
+                
+                return Denormalize(mean=m, std=s)(tensor)
             return tensor
 
         x, y, y_hat = batch["image"], batch["mask"], batch["prediction"]

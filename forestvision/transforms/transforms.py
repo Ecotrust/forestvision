@@ -1,4 +1,4 @@
-from typing import List, Tuple, Union, Any
+from typing import List, Tuple, Union, Any, Optional
 
 import numpy
 import torch
@@ -39,36 +39,51 @@ class Normalize:
         std: The standard deviation value to normalize the data.
         on_key: The key of the data to change the no data value.
         nodata: If provided nodata values won't not be normalized.
+        identity_channels: List of channel indices to set to identity (mean=0, std=1).
     """
 
     def __init__(
         self,
-        mean: Union[torch.Tensor, Tuple[float], List[float], float],
-        std: Union[torch.Tensor, Tuple[float], List[float], float],
+        mean: Union[torch.Tensor, Tuple[float], List[float], float, None] = None,
+        std: Union[torch.Tensor, Tuple[float], List[float], float, None] = None,
         on_key: str = "image",
         nodata: int = None,
+        identity_channels: Optional[List[int]] = None,
     ):
         assert on_key in ["image", "mask"], "on_key must be either 'image' or 'mask'"
 
-        if isinstance(mean, float):
-            mean = torch.tensor([mean])
-
-        if isinstance(std, float):
-            std = torch.tensor([std])
-
-        if isinstance(mean, (tuple, list)):
-            mean = torch.tensor(mean)
-
-        if isinstance(std, (tuple, list)):
-            std = torch.tensor(std)
-
+        # mean/std can be None - will be populated later by datamodule
         self.mean = mean
         self.std = std
         self.on_key = on_key
         self.nodata = nodata
+        self.identity_channels = identity_channels or []
+
+    def _ensure_tensor(self, value, name: str) -> torch.Tensor:
+        """Convert value to tensor if needed."""
+        if value is None:
+            raise RuntimeError(
+                f"Normalize transform for '{self.on_key}' was not populated with {name}. "
+                f"Ensure stats file exists and datamodule has stats_path configured."
+            )
+        if isinstance(value, float):
+            return torch.tensor([value])
+        if isinstance(value, (tuple, list)):
+            return torch.tensor(value)
+        return value
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         data = sample[self.on_key].float()
+
+        # Convert mean/std to tensors and apply identity channels
+        mean = self._ensure_tensor(self.mean, "mean").clone()
+        std = self._ensure_tensor(self.std, "std").clone()
+        
+        # Apply identity channels (mean=0, std=1)
+        for idx in self.identity_channels:
+            if 0 <= idx < len(mean):
+                mean[idx] = 0.0
+                std[idx] = 1.0
 
         # Store original shape for restoration
         original_shape = data.shape
@@ -82,7 +97,7 @@ class Normalize:
             data = data.unsqueeze(0).unsqueeze(0)
         elif data.ndim == 3:
             # Distinguish between (B, H, W) for masks and (C, H, W) for images
-            if self.on_key == "mask" and len(self.mean) == 1:
+            if self.on_key == "mask" and len(mean) == 1:
                 # (B, H, W) -> (B, 1, H, W)
                 data = data.unsqueeze(1)
             else:
@@ -91,7 +106,7 @@ class Normalize:
         # else: data.ndim == 4, already in correct format
 
         # Apply normalization
-        data = tvF.normalize(data, self.mean, self.std)
+        data = tvF.normalize(data, mean, std)
 
         # Restore original shape
         data = data.view(original_shape)
@@ -348,9 +363,10 @@ class AppendNDVI:
     Args:
         index_nir (int): Index of the NIR band.
         index_red (int): Index of the red band.
+        dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, index_nir: int, index_red: int):
+    def __init__(self, index_nir: int, index_red: int, dataset: Any = None):
         self.index_nir = index_nir
         self.index_red = index_red
 
@@ -429,9 +445,12 @@ class AppendEVI:
         index_nir (int): Index of the NIR band.
         index_red (int): Index of the red band.
         index_blue (int): Index of the blue band.
+        dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, index_nir: int, index_red: int, index_blue: int):
+    def __init__(
+        self, index_nir: int, index_red: int, index_blue: int, dataset: Any = None
+    ):
         self.index_nir = index_nir
         self.index_red = index_red
         self.index_blue = index_blue
@@ -487,9 +506,10 @@ class AppendSAVI:
         index_nir (int): Index of the NIR band.
         index_red (int): Index of the red band.
         L (float): Soil brightness correction factor (default: 0.5).
+        dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, index_nir: int, index_red: int, L: float = 0.5):
+    def __init__(self, index_nir: int, index_red: int, L: float = 0.5, dataset: Any = None):
         self.index_nir = index_nir
         self.index_red = index_red
         self.L = L
@@ -530,9 +550,10 @@ class AppendMSAVI:
     Args:
         index_nir (int): Index of the NIR band.
         index_red (int): Index of the red band.
+        dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, index_nir: int, index_red: int):
+    def __init__(self, index_nir: int, index_red: int, dataset: Any = None):
         self.index_nir = index_nir
         self.index_red = index_red
 
@@ -583,9 +604,12 @@ class AppendNIRv:
         index_nir (int): Index of the NIR band.
         index_red (int): Index of the red band.
         scale (bool): If True, scale the output NIRv by 1/10000.
+        dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, index_nir: int, index_red: int, scale: bool = False):
+    def __init__(
+        self, index_nir: int, index_red: int, scale: bool = False, dataset: Any = None
+    ):
         self.index_nir = index_nir
         self.index_red = index_red
         self.scale = scale
@@ -625,9 +649,10 @@ class SelectBands:
 
     Args:
         indices (list[int]): List of band indices to select and/or reorder.
+        dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, indices: list[int]):
+    def __init__(self, indices: list[int], dataset: Any = None):
         self.indices = indices
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
