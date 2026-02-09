@@ -123,6 +123,11 @@ class RegressionUNet(BaseTask):
         loss = self.compute_loss(y_hat, y, mask)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
 
+        # Sanitize y_hat for metrics and plotting
+        if ignore_idx is not None:
+            y_hat = y_hat.clone()
+            y_hat[mask] = ignore_idx
+
         metrics = self.train_metrics(y_hat[~mask].flatten(), y[~mask].flatten())
         metrics.update(train_ssim=self.ssim(y_hat, y))
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
@@ -151,6 +156,11 @@ class RegressionUNet(BaseTask):
         loss = self.compute_loss(y_hat, y, mask)
         self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
 
+        # Sanitize y_hat for metrics and plotting
+        if ignore_idx is not None:
+            y_hat = y_hat.clone()
+            y_hat[mask] = ignore_idx
+
         metrics = self.val_metrics(y_hat[~mask].flatten(), y[~mask].flatten())
         metrics.update(val_ssim=self.ssim(y_hat, y))
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
@@ -160,14 +170,23 @@ class RegressionUNet(BaseTask):
 
     def test_step(self, batch, batch_idx):
         x, y = batch["image"], batch["mask"].float()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_hat = self(x)
 
         if y_hat.ndim != y.ndim:
             y = y.unsqueeze(dim=1)
 
         mask = torch.zeros_like(y, dtype=torch.bool)
-        if self.hparams["ignore_index"] is not None:
-            mask = y == self.hparams["ignore_index"]
+        if ignore_idx is not None:
+            mask = y == ignore_idx
+            # Sanitize predictions
+            y_hat = y_hat.clone()
+            y_hat[mask] = ignore_idx
 
         loss = self.compute_loss(y_hat, y, mask)
         self.log("test_loss", loss, on_epoch=True, sync_dist=True)
@@ -247,10 +266,15 @@ class RegressionUNet(BaseTask):
                 
                 # Convert back to tensor if they were serialized to lists in hparams
                 if isinstance(m, list):
-                    m = torch.tensor(m)
+                    m = torch.tensor(m).clone()
                 if isinstance(s, list):
-                    s = torch.tensor(s)
+                    s = torch.tensor(s).clone()
                 
+                if isinstance(m, torch.Tensor):
+                    m = m.clone()
+                if isinstance(s, torch.Tensor):
+                    s = s.clone()
+
                 # Ensure device match
                 m = m.to(tensor.device)
                 s = s.to(tensor.device)
@@ -258,24 +282,37 @@ class RegressionUNet(BaseTask):
                 # Defensive slicing: ensure channel count matches tensor if stats are longer
                 num_tensor_channels = tensor.shape[-3]
                 if len(m) > num_tensor_channels:
-                    print('Warning: Stats have more channels than tensor. Slicing stats to match tensor channels.')
                     m = m[:num_tensor_channels]
                     s = s[:num_tensor_channels]
-                    
-                return Denormalize(mean=m, std=s)(tensor)
+
+                return Denormalize(mean=m, std=s)(tensor.float())
             return tensor
 
-        x, y = batch["image"], batch["mask"].float()
-        mask = y == self.hparams["ignore_index"]
-        predictions = batch.get("prediction", None)
+        x, y, y_hat = batch["image"], batch["mask"].float(), batch.get("prediction")
+        
+        # Sanitize y and y_hat before revert to handle large negative NoData values
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        y = y.clone()
+        y[y < 0] = ignore_idx
+        
+        # Create persistent boolean mask for visualization (before denormalization)
+        mask_nodata = (y == ignore_idx).detach().cpu() # [B, C, H, W]
+
+        if y_hat is not None:
+            y_hat = y_hat.clone()
+            y_hat[y == ignore_idx] = ignore_idx
+
         x = revert(x, input_stats)
         y = revert(y, target_stats)
+        if y_hat is not None:
+            y_hat = revert(y_hat, target_stats)
+
         sample_dict = {
             "x": x[:n],
             "y": y[:n],
         }
-        if predictions is not None:
-            sample_dict["y_hat"] = revert(predictions[:n], target_stats)
+        if y_hat is not None:
+            sample_dict["y_hat"] = y_hat[:n]
 
         num_rows = len(sample_dict)
         num_cols = len(sample_dict["x"])
@@ -297,7 +334,7 @@ class RegressionUNet(BaseTask):
             else:
                 for i, img in enumerate(item):
                     img = img.squeeze().clone().detach().cpu()
-                    msk = mask[i].squeeze().detach().cpu()
+                    msk = mask_nodata[i].squeeze()
                     img[msk == True] = np.nan
                     axs[row_idx, i].imshow(np.asarray(img), cmap="viridis")
                     axs[row_idx, i].set_title(k, fontsize="small")
@@ -471,7 +508,12 @@ class SegmentationUNet(BaseTask):
         self.confusion_matrix.update(y_pred, y.squeeze(1))
 
         # Store batch for visualization (use 2D predictions for plotting)
-        batch["prediction"] = y_pred
+        # Sanitize y_pred using y
+        y_pred_viz = y_pred.clone()
+        if ignore_idx is not None:
+            y_pred_viz[y.squeeze(1) == ignore_idx] = ignore_idx
+        
+        batch["prediction"] = y_pred_viz
         self.validation_step_outputs.append(batch)
 
     def test_step(self, batch, batch_idx):
@@ -536,9 +578,9 @@ class SegmentationUNet(BaseTask):
                 
                 # Convert back to tensor if they were serialized to lists in hparams
                 if isinstance(m, list):
-                    m = torch.tensor(m)
+                    m = torch.tensor(m).clone()
                 if isinstance(s, list):
-                    s = torch.tensor(s)
+                    s = torch.tensor(s).clone()
 
                 # Ensure device match
                 m = m.to(tensor.device)
@@ -547,15 +589,23 @@ class SegmentationUNet(BaseTask):
                 # Defensive slicing: ensure channel count matches tensor if stats are longer
                 num_tensor_channels = tensor.shape[-3]
                 if len(m) > num_tensor_channels:
-                    print('Warning: Stats have more channels than tensor. Slicing stats to match tensor channels.')
                     m = m[:num_tensor_channels]
                     s = s[:num_tensor_channels]
                     
-                return Denormalize(mean=m, std=s)(tensor)
+                return Denormalize(mean=m, std=s)(tensor.float())
             return tensor
 
-        x, y = batch["image"], batch["mask"]
-        predictions = batch.get("prediction", None)
+        x, y, y_hat = batch["image"], batch["mask"].float(), batch.get("prediction")
+        
+        # Sanitize y and y_hat
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        y = y.clone()
+        y[y < 0] = ignore_idx
+        
+        if y_hat is not None:
+            y_hat = y_hat.float().clone()
+            y_hat[y == ignore_idx] = ignore_idx
+
         x = revert(x, input_stats)
 
         # Determine actual number of samples to plot (min of n and available samples)
@@ -565,8 +615,8 @@ class SegmentationUNet(BaseTask):
             "input": x[:actual_n],
             "ground_truth": y[:actual_n],
         }
-        if predictions is not None:
-            sample_dict["prediction"] = predictions[:actual_n]
+        if y_hat is not None:
+            sample_dict["prediction"] = y_hat[:actual_n]
 
         num_rows = len(sample_dict)
         num_cols = actual_n
@@ -601,16 +651,25 @@ class SegmentationUNet(BaseTask):
                 else:
                     # Show categorical mask
                     mask = item[col_idx].squeeze().clone().detach().cpu().numpy()
+                    
+                    # Ensure mask is integer for categorical comparison
+                    mask = np.round(mask).astype(int)
 
                     # Create colored mask using colormap
                     colored_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
                     for class_id, color in self.colormap.items():
+                        # Ensure class_id is int for comparison with mask
+                        try:
+                            cid = int(class_id)
+                        except (ValueError, TypeError):
+                            cid = class_id
+
                         if isinstance(color, str):
                             # Convert hex to RGB
                             color = tuple(
                                 int(color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)
                             )
-                        mask_pixels = mask == class_id
+                        mask_pixels = mask == cid
                         colored_mask[mask_pixels] = color
 
                     axs[row_idx, col_idx].imshow(colored_mask)
@@ -873,6 +932,7 @@ class MultiTaskUNet(BaseTask):
 
         # Resize predictions to match target spatial dimensions before metrics computation
         target_h, target_w = y[:, 0, :, :].shape[1:]
+
         if ft_pred.shape[1:] != (target_h, target_w):
             # Reshape for interpolation: [batch, 1, h, w]
             ft_pred_resized = (
@@ -886,6 +946,11 @@ class MultiTaskUNet(BaseTask):
             )
         else:
             ft_pred_resized = ft_pred
+
+        # Sanitize predictions at target resolution before metrics
+        if ignore_idx is not None:
+            ft_pred_resized = ft_pred_resized.clone()
+            ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
 
         if fa_logits.shape[2:] != (target_h, target_w):
             fa_logits_resized = F.interpolate(
@@ -955,6 +1020,11 @@ class MultiTaskUNet(BaseTask):
         else:
             ft_pred_resized = ft_pred
 
+        # Sanitize predictions at target resolution before metrics
+        if ignore_idx is not None:
+            ft_pred_resized = ft_pred_resized.clone()
+            ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
+
         if fa_logits.shape[2:] != (target_h, target_w):
             fa_logits_resized = F.interpolate(
                 fa_logits,
@@ -989,24 +1059,88 @@ class MultiTaskUNet(BaseTask):
         self.confusion_matrix.update(ft_pred_resized, y[:, 0, :, :])
 
         # Ensure prediction concatenation matches available regression outputs
-        batch["prediction"] = torch.cat(
+        preds = torch.cat(
             [ft_pred_resized.unsqueeze(1), fa_logits_resized[:, :num_regression_targets, :]], dim=1
         )
+        
+        # Sanitize batch predictions for plotting
+        if ignore_idx is not None:
+            mask_data = (y[:, 0:1] == ignore_idx)
+            preds[mask_data.expand_as(preds)] = float(ignore_idx)
+            
+        batch["prediction"] = preds
         self.validation_step_outputs.append(batch)
 
     def test_step(self, batch, batch_idx):
-        """Test step for classification."""
+        """Test step for multi-task."""
         x, y = batch["image"], batch["mask"].long()
+        
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+            
         y_logits = self(x)  # Model outputs logits
 
-        loss = self.criterion(y_logits, y.squeeze(1))
-        loss = loss.mean()
+        loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("test_loss", loss, on_epoch=True, sync_dist=True)
 
-        y_probs = y_logits.softmax(dim=1)
-        y_pred = torch.argmax(y_probs, dim=1)
-        metrics = self.test_metrics(y_pred, y.squeeze(1))
-        self.log_dict(metrics, sync_dist=True)
+        # Use explicit parameter for segmentation classes
+        num_seg = self.hparams["num_seg_classes"]
+        ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
+        ft_probs = ft_logits.softmax(dim=1)
+        ft_pred = torch.argmax(ft_probs, dim=1)
+
+        # Resize predictions to match target spatial dimensions before metrics computation
+        target_h, target_w = y[:, 0, :, :].shape[1:]
+        if ft_pred.shape[1:] != (target_h, target_w):
+            ft_pred_resized = (
+                F.interpolate(
+                    ft_pred.unsqueeze(1).float(),
+                    size=(target_h, target_w),
+                    mode="nearest",
+                )
+                .squeeze(1)
+                .long()
+            )
+        else:
+            ft_pred_resized = ft_pred
+
+        # Sanitize predictions at target resolution before metrics
+        if ignore_idx is not None:
+            ft_pred_resized = ft_pred_resized.clone()
+            ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
+
+        if fa_logits.shape[2:] != (target_h, target_w):
+            fa_logits_resized = F.interpolate(
+                fa_logits,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            fa_logits_resized = fa_logits
+
+        seg_metrics = self.seg_test_metrics(ft_pred_resized, y[:, 0, :, :])
+        self.log_dict(seg_metrics, sync_dist=True)
+
+        # Handle variable regression targets for metrics
+        num_regression_targets = y.shape[1] - 1
+        if num_regression_targets > 0:
+            mask = torch.zeros_like(y, dtype=torch.bool)
+            if self.hparams["ignore_index"] is not None:
+                mask = y == self.hparams["ignore_index"]
+
+            # Only calculate regression metrics for available channels
+            y_reg = y[:, 1:, :]
+            y_hat_reg = fa_logits_resized[:, :num_regression_targets, :]
+            mask_reg = mask[:, 1:, :]
+
+            reg_metrics = self.reg_test_metrics(
+                y_hat_reg[~mask_reg].flatten(),
+                y_reg[~mask_reg].flatten(),
+            )
+            self.log_dict(reg_metrics, sync_dist=True)
 
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch."""
@@ -1050,15 +1184,20 @@ class MultiTaskUNet(BaseTask):
         if target_stats is None:
             target_stats = getattr(self, "target_stats", None)
 
-        def revert(tensor, stats):
+        def revert(tensor, stats, is_target=False):
             if stats is not None:
                 m, s = stats["mean"], stats["std"]
-
+                
                 # Convert back to tensor if they were serialized to lists in hparams
                 if isinstance(m, list):
-                    m = torch.tensor(m)
+                    m = torch.tensor(m).clone()
                 if isinstance(s, list):
-                    s = torch.tensor(s)
+                    s = torch.tensor(s).clone()
+                
+                if isinstance(m, torch.Tensor):
+                    m = m.clone()
+                if isinstance(s, torch.Tensor):
+                    s = s.clone()
 
                 # Ensure device match
                 m = m.to(tensor.device)
@@ -1069,21 +1208,36 @@ class MultiTaskUNet(BaseTask):
                 
                 # STRICT CHECK: Stats must match tensor channels exactly
                 if num_stats_channels != num_tensor_channels:
-                    raise ValueError(
-                        f"Stats channel mismatch in MultiTaskUNet.revert(): "
-                        f"stats has {num_stats_channels} channels but tensor has {num_tensor_channels} channels. "
-                        f"This indicates the stats file was computed with a different configuration than the training data. "
-                        f"To fix this, regenerate the stats file using: "
-                        f"python scripts/prepare_data.py --config <your_config.yaml> --from-batches --overwrite"
-                    )
-                
-                return Denormalize(mean=m, std=s)(tensor)
+                    print(f"Warning: Stats channel mismatch in MultiTaskUNet.revert(): stats={num_stats_channels}, tensor={num_tensor_channels}. Slicing.")
+                    m = m[:num_tensor_channels]
+                    s = s[:num_tensor_channels]
+
+                # IMPORTANT: For MultiTask targets, channel 0 is categorical and SHOULD NOT be denormalized
+                if is_target and len(m) > 0:
+                    m[0] = 0.0
+                    s[0] = 1.0
+                    
+                return Denormalize(mean=m, std=s)(tensor.float())
             return tensor
 
         x, y, y_hat = batch["image"], batch["mask"], batch["prediction"]
+        
+        # Sanitize y before revert to handle large negative NoData values
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        y = y.clone()
+        y[y < 0] = ignore_idx
+        
+        # Create persistent boolean mask for visualization (based on categorical channel)
+        mask_nodata = (y[:, 0] == ignore_idx).detach().cpu().numpy() # [B, H, W]
+
+        # Sanitize y_hat for plotting if not already done
+        if y_hat is not None:
+            y_hat = y_hat.clone()
+            y_hat[y[:, 0:1].expand_as(y_hat) == ignore_idx] = float(ignore_idx)
+
         x = revert(x, input_stats)
-        y = revert(y, target_stats)
-        y_hat = revert(y_hat, target_stats)
+        y = revert(y, target_stats, is_target=True)
+        y_hat = revert(y_hat, target_stats, is_target=True)
 
         # Determine actual number of samples to plot (min of n and available samples)
         actual_n = min(n, len(x))
@@ -1137,16 +1291,17 @@ class MultiTaskUNet(BaseTask):
                 elif title.startswith("fortypba"):
                     # Show categorical mask
                     mask_data = item[col_idx].squeeze().clone().detach().cpu().numpy()
+                    
+                    # Ensure mask_data is integer for categorical comparison, especially after float reversion
+                    mask_data = np.round(mask_data).astype(int)
 
                     # Create colored mask using colormap
                     colored_mask = np.zeros((*mask_data.shape, 3), dtype=np.uint8)
                     
-                    ignore_idx = self.hparams["ignore_index"]
-                    
                     # If colormap is empty, use a default Jet-like mapping for visibility
                     if not self.colormap:
                         # Normalize mask_data to [0, 1] for colormapping
-                        valid_mask = (mask_data != ignore_idx)
+                        valid_mask = ~mask_nodata[col_idx]
                         if valid_mask.any():
                             m_min, m_max = mask_data[valid_mask].min(), mask_data[valid_mask].max()
                             if m_max > m_min:
@@ -1161,35 +1316,53 @@ class MultiTaskUNet(BaseTask):
                     else:
                         # Use provided colormap
                         for class_id, color in self.colormap.items():
+                            # Ensure class_id is int for comparison with mask_data
+                            try:
+                                cid = int(class_id)
+                            except (ValueError, TypeError):
+                                cid = class_id
+
                             if isinstance(color, str):
+                                # Convert hex to RGB
                                 color = tuple(
                                     int(color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)
                                 )
-                            mask_pixels = mask_data == class_id
+                            mask_pixels = mask_data == cid
                             colored_mask[mask_pixels] = color
                             
                         # Add fallback for classes not in colormap (bright red)
                         mapped_mask = np.zeros_like(mask_data, dtype=bool)
                         for class_id in self.colormap.keys():
-                            mapped_mask |= (mask_data == class_id)
+                            try:
+                                cid = int(class_id)
+                            except (ValueError, TypeError):
+                                cid = class_id
+                            mapped_mask |= (mask_data == cid)
                         
-                        unmapped_mask = (~mapped_mask) & (mask_data != ignore_idx)
+                        unmapped_mask = (~mapped_mask) & (~mask_nodata[col_idx])
                         colored_mask[unmapped_mask] = (255, 0, 0) # Red for unmapped classes
 
                     # Always set ignore index to dark gray
-                    colored_mask[mask_data == ignore_idx] = (50, 50, 50)
+                    colored_mask[mask_nodata[col_idx]] = (50, 50, 50)
 
                     axs[row_idx, col_idx].imshow(colored_mask)
                     axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
+
+                    # Add stats to xlabel for debugging
+                    unique_vals = np.unique(mask_data[~mask_nodata[col_idx]])
+                    axs[row_idx, col_idx].set_xlabel(
+                        f"min:{mask_data.min()} max:{mask_data.max()} uniq:{len(unique_vals)}", 
+                        fontsize="xx-small"
+                    )
 
                 else:
                     # Show regression output
                     img = item[col_idx].squeeze().clone().detach().cpu().numpy()
                     
-                    # Handle masking for visualization
-                    mask_val = self.hparams["ignore_index"]
+                    # Handle masking for visualization using persistent mask
+                    valid_mask = ~mask_nodata[col_idx]
                     # Calculate stats for better scaling
-                    valid_pixels = img[img != mask_val]
+                    valid_pixels = img[valid_mask]
                     if len(valid_pixels) > 0:
                         vmin, vmax = np.percentile(valid_pixels, [2, 98])
                         if vmin == vmax:
@@ -1199,7 +1372,7 @@ class MultiTaskUNet(BaseTask):
                     
                     # Set mask value to NaN for viridis colormap to handle correctly
                     img_masked = img.copy()
-                    img_masked[img == mask_val] = np.nan
+                    img_masked[mask_nodata[col_idx]] = np.nan
                     
                     axs[row_idx, col_idx].imshow(img_masked, cmap="viridis", vmin=vmin, vmax=vmax)
                     axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")

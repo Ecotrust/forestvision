@@ -6,41 +6,44 @@ This script:
 1. Accepts a config.yaml file as argument
 2. Extracts data preparation parameters from the config
 3. Downloads required data
-4. Computes and saves statistics for specified sample keys
+4. Computes and saves statistics for each dataset individually using DatasetStats
 
 Usage:
-    python scripts/prepare_data.py data/fortypba/conf/fortypes.yaml
+    python scripts/prepare_data.py --config data/fortypba/conf/fortypes.yaml
 
     # Compute only image statistics
-    python scripts/prepare_data.py data/fortypba/conf/fortypes.yaml --on-keys image
+    python scripts/prepare_data.py --config data/fortypba/conf/fortypes.yaml --on-keys image
 
-    # Compute only mask statistics
-    python scripts/prepare_data.py data/fortypba/conf/fortypes.yaml --on-keys mask
+    # Compute only mask statistics  
+    python scripts/prepare_data.py --config data/fortypba/conf/fortypes.yaml --on-keys mask
 
     # Skip download (data already exists)
-    python scripts/prepare_data.py data/fortypba/conf/fortypes.yaml --skip-download
+    python scripts/prepare_data.py --config data/fortypba/conf/fortypes.yaml --skip-download
+    
 """
 
 import os
 import argparse
 import logging
-import importlib
+import pydoc
+import inspect
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import yaml
+import json
 import ee
 import dotenv 
 
 import torch
-from torchgeo.datasets import GeoDataset, IntersectionDataset
-from geopandas import GeoDataFrame
-
 from tqdm import tqdm
+
 from forestvision.samplers import TileGeoSampler
-from forestvision.datasets import DatasetStats
+from forestvision.datasets.utils import DatasetStats
+from forestvision.datasets import GPDFeatureCollection
 
 os.environ["CPL_LOG"] = "/dev/null"
+
 
 class TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
@@ -51,95 +54,146 @@ class TqdmLoggingHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+
 def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file.
-
-    Args:
-        config_path: Path to config YAML file
-
-    Returns:
-        Dictionary containing configuration
-    """
+    """Load configuration from YAML file."""
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     return config
 
 
-def extract_datamodule_args(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract datamodule arguments from config."""
-    if "data" not in config:
-        raise ValueError("Config must contain 'data' section")
+def get_identity_channels(transforms_cfg: Any, key: str = "image") -> List[int]:
+    """Extract identity_channels for a specific key from transform configuration."""
+    if not transforms_cfg:
+        return []
 
-    if "class_path" not in config["data"]:
-        raise ValueError("Config must contain 'data.class_path'")
+    def find_identity(obj):
+        if isinstance(obj, dict):
+            cls_path = obj.get("class_path", "")
+            if "Normalize" in cls_path:
+                init_args = obj.get("init_args", {})
+                if init_args.get("on_key") == key:
+                    return init_args.get("identity_channels", [])
+            
+            # Recurse into all dictionary values
+            for v in obj.values():
+                res = find_identity(v)
+                if res:
+                    return res
+        elif isinstance(obj, list):
+            for item in obj:
+                res = find_identity(item)
+                if res:
+                    return res
+        return []
 
-    class_path = config["data"]["class_path"]
-
-    if "init_args" not in config["data"]:
-        raise ValueError("Config must contain 'data.init_args' section")
-
-    data_args = config["data"]["init_args"].copy()
-    data_args["class_path"] = class_path
-
-    required_keys = ["root", "year", "train_tiles_path"]
-    for key in required_keys:
-        if key not in data_args:
-            raise ValueError(f"Missing required config key: {key}")
-
-    return data_args
-
-
-def import_class(class_path: str):
-    """Dynamically import a class from a module path.
-
-    Args:
-        class_path: Full path to class (e.g., 'forestvision.datamodules.ForTypesDataModule')
-
-    Returns:
-        The imported class
-    """
-    module_path, class_name = class_path.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
+    return find_identity(transforms_cfg)
 
 
-def get_stats(
-    dataset: GeoDataset,
-    tiles: GeoDataFrame,
-    nodata: int | None = None,
-    overwrite: bool = False,
-) -> dict:
-    """Compute dataset statistics including mean and standard deviation."""
-    sampler = TileGeoSampler(dataset, tiles=tiles)
+def resolve_class(class_path: str):
+    """Dynamically resolve a class from a module path string."""
+    cls = pydoc.locate(class_path)
+    if cls is None:
+        raise ImportError(f"Could not locate class: {class_path}")
+    return cls
 
-    # Disable transforms temporarily to compute raw stats
-    original_transforms = dataset.transforms
-    dataset.transforms = None
 
-    try:
-        # Check actual tensor shape from a sample to ensure consistency with DatasetStats.
-        # This accounts for any active transforms in the tree.
-        sample = dataset[next(iter(sampler))]
-        key = "image" if dataset.is_image else "mask"
-        channels = sample[key].shape[0]
+def instantiate_transforms(transforms_cfg: Any, dataset: Any = None) -> Any:
+    """Instantiate transforms from configuration, skipping Normalize."""
+    if transforms_cfg is None:
+        return None
 
-        if nodata is None:
-            nodata = dataset.nodata
+    def instantiate(obj, ds=None):
+        if isinstance(obj, dict) and "class_path" in obj:
+            cls_path = obj["class_path"]
+            # Skip Normalize during preparation
+            if cls_path == "forestvision.transforms.Normalize":
+                return None
+                
+            cls = pydoc.locate(cls_path)
+            if cls is None:
+                raise ImportError(f"Could not locate class: {cls_path}")
 
-        stats_calculator = DatasetStats(
-            dataset,
-            sampler,
-            path=None,
-            batch_size=5,
-            num_workers=5,
-            channels=channels,
-            nodata=nodata,
-            overwrite=overwrite,
-        )
-        return stats_calculator.compute()
-    finally:
-        # Restore transforms
-        dataset.transforms = original_transforms
+            init_args = obj.get("init_args", {}).copy()
+            
+            # Check if the class accepts a 'dataset' argument
+            sig = inspect.signature(cls.__init__)
+            if "dataset" in sig.parameters and ds is not None:
+                init_args["dataset"] = ds
+
+            # Recursively instantiate arguments
+            resolved_args = {k: instantiate(v, ds=ds) for k, v in init_args.items()}
+            # Filter out None results from recursion (skipped transforms)
+            resolved_args = {k: v for k, v in resolved_args.items() if v is not None}
+            
+            return cls(**resolved_args)
+        elif isinstance(obj, list):
+            items = [instantiate(item, ds=ds) for item in obj]
+            # Filter out None (skipped transforms)
+            items = [item for item in items if item is not None]
+            if not items:
+                return None
+            # If it was a list intended for Compose, we'll need to handle it
+            return items
+        elif isinstance(obj, dict):
+            return {k: instantiate(v, ds=ds) for k, v in obj.items()}
+        return obj
+
+    res = instantiate(transforms_cfg, ds=dataset)
+    
+    # If the top level was a Compose (often the case), and we filtered its list
+    if isinstance(res, list) and len(res) > 0:
+        from torchvision.transforms import v2
+        return v2.Compose(res)
+    
+    return res
+
+
+def instantiate_dataset(
+    cfg_dict: Dict[str, Any],
+    root: str,
+    year: int,
+    stage: str = "training",
+    roi: Optional[Any] = None,
+):
+    """Instantiate a dataset from configuration dictionary."""
+    cls_path = cfg_dict.get("dataset_class")
+    if isinstance(cls_path, str):
+        dataset_class = resolve_class(cls_path)
+    else:
+        dataset_class = cls_path
+
+    path_template = cfg_dict.get("path_template", "")
+    path = path_template.format(root=root, year=year, stage=stage)
+    if not os.path.isabs(path):
+        path = os.path.join(root, path)
+
+    bands = cfg_dict.get("bands", [])
+    kwargs = cfg_dict.get("kwargs", {}).copy()
+
+    # Handle constructor arguments
+    sig = inspect.signature(dataset_class.__init__)
+    if "paths" in sig.parameters:
+        kwargs["paths"] = path
+    elif "path" in sig.parameters:
+        kwargs["path"] = path
+        
+    if "year" in sig.parameters and "year" not in kwargs:
+        kwargs["year"] = year
+
+    if "roi" in sig.parameters:
+        kwargs["roi"] = roi
+
+    # Create dataset instance
+    ds = dataset_class(bands=bands, transforms=None, **kwargs)
+    
+    # Apply transforms but EXCLUDE Normalize
+    # This ensures DatasetStats sees the final channels (post-Append and post-SelectBands)
+    transforms_cfg = cfg_dict.get("transforms")
+    if transforms_cfg:
+        ds.transforms = instantiate_transforms(transforms_cfg, dataset=ds)
+        
+    return ds
 
 
 def prepare_data(
@@ -147,10 +201,9 @@ def prepare_data(
     on_keys: List[str] = None,
     skip_download: bool = False,
     overwrite: bool = False,
-    target_identity_channels: List[int] = None,
     download_all_bands: bool = False,
 ) -> None:
-    """Prepare data by downloading and computing statistics."""
+    """Prepare data by downloading and computing statistics using DatasetStats."""
     tqdm_handler = TqdmLoggingHandler()
     tqdm_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     root_logger = logging.getLogger()
@@ -161,183 +214,236 @@ def prepare_data(
         on_keys = ["image", "mask"]
 
     config = load_config(config_path)
-    data_args = extract_datamodule_args(config)
-
-    datamodule_class = import_class(data_args["class_path"])
-
-    root = data_args["root"]
-    year = data_args["year"]
-    train_tiles_path = data_args["train_tiles_path"]
-    stats_path = data_args.get("stats_path", f"train_stats_{year}.pt")
-
+    if "data" not in config or "init_args" not in config["data"]:
+        raise ValueError("Config must contain 'data.init_args' section")
+    
+    data_args = config["data"]["init_args"]
+    root = data_args.get("root", ".")
+    year = data_args.get("year")
+    train_tiles_path = data_args.get("train_tiles_path")
+    
+    if not train_tiles_path:
+        raise ValueError("Config must contain 'train_tiles_path'")
+    
+    train_tiles = GPDFeatureCollection(os.path.join(root, train_tiles_path))
+    
+    stats_path = data_args.get("stats_path", f"train_stats_{year}.json")
     if not os.path.isabs(stats_path):
         stats_path = os.path.join(root, stats_path)
 
-    if os.path.exists(stats_path) and not overwrite:
-        print(f"Statistics file already exists at {stats_path}")
-        return
+    # Ensure .json extension
+    if stats_path.endswith('.pt'):
+        stats_path = stats_path[:-3] + '.json'
 
+    # Check overwrite
+    if os.path.exists(stats_path) and not overwrite:
+        logging.info(f"Statistics file already exists at {stats_path}. Use --overwrite to recompute.")
+        return
+    elif os.path.exists(stats_path):
+        logging.info(f"Overwriting existing stats file: {stats_path}")
+
+    # Extract dataset configs
+    input_datasets_cfg = data_args.get("input_datasets", [])
+    target_datasets_cfg = data_args.get("target_datasets", [])
+
+    all_stats = {
+        "input_stats": [],
+        "target_stats": {},
+        "year": year,
+    }
+
+    roi = train_tiles.bounds if hasattr(train_tiles, "bounds") else None
+
+    # Retrieve Validation Data if needed
+    val_tiles_path = data_args.get("val_tiles_path")
+    if not skip_download and val_tiles_path:
+        logging.info("Retrieving validation data...")
+        val_tiles = GPDFeatureCollection(os.path.join(root, val_tiles_path))
+        val_roi = val_tiles.bounds if hasattr(val_tiles, "bounds") else None
+        
+        all_ds_cfgs = (input_datasets_cfg or []) + (target_datasets_cfg or [])
+        for cfg in all_ds_cfgs:
+            ds = instantiate_dataset(cfg, root, year, stage="validation", roi=val_roi)
+            if hasattr(ds, "download") or hasattr(ds, "_download"):
+                logging.info(f"Downloading validation data for {ds.__class__.__name__}...")
+                sampler = TileGeoSampler(ds, val_tiles.data)
+                loader = torch.utils.data.DataLoader(
+                    ds, 
+                    sampler=sampler, 
+                    batch_size=15, 
+                    num_workers=5, 
+                    collate_fn=lambda x: x 
+                )
+                for _ in tqdm(loader, desc=f"Downloading val {ds.__class__.__name__}", leave=False):
+                    pass
+
+    # Extract identity channels from global transforms
+    input_identity = get_identity_channels(data_args.get("input_transforms"), "image")
+    target_identity = get_identity_channels(data_args.get("target_transforms"), "mask")
+    
+    if input_identity:
+        logging.info(f"Identity channels detected for input: {input_identity}")
+    if target_identity:
+        logging.info(f"Identity channels detected for target: {target_identity}")
+
+    # Process Input Datasets
+    if "image" in on_keys:
+        logging.info("Computing statistics for input datasets...")
+        for i, cfg in enumerate(input_datasets_cfg):
+            ds = instantiate_dataset(cfg, root, year, roi=roi)
+            
+            # Download if requested
+            if not skip_download and hasattr(ds, "download"):
+                logging.info(f"Downloading {ds.__class__.__name__}...")
+                sampler = TileGeoSampler(ds, train_tiles.data)
+                loader = torch.utils.data.DataLoader(
+                    ds, 
+                    sampler=sampler, 
+                    batch_size=15, 
+                    num_workers=5, 
+                    collate_fn=lambda x: x
+                )
+                for _ in tqdm(loader, desc=f"Downloading {ds.__class__.__name__}", leave=False):
+                    pass
+
+            # Compute stats
+            sampler = TileGeoSampler(ds, train_tiles.data)
+            
+            # Determine actual channel count by taking a single sample
+            # This accounts for appended bands from transforms
+            sample = ds[next(iter(sampler))]
+            data_key = "image" if not hasattr(ds, "is_image") or ds.is_image else "mask"
+            actual_channels = sample[data_key].shape[0]
+            logging.info(f"Actual channels after transforms: {actual_channels}")
+
+            stats_calculator = DatasetStats(
+                dataset=ds,
+                sampler=sampler,
+                batch_size=15,
+                num_workers=5,
+                channels=actual_channels,
+            )
+            ds_stats = stats_calculator.compute()
+
+            # Force identity stats if requested
+            mean_list = ds_stats["mean"].tolist()
+            std_list = ds_stats["std"].tolist()
+            
+            # Note: For input datasets, identity_channels are currently global indices
+            # in the full stack. This check assumes we only have one input dataset or
+            # that indices align. 
+            # BUT: We only force identity if the index is within range of this dataset's stats.
+            for idx in input_identity:
+                if 0 <= idx < len(mean_list):
+                    mean_list[idx] = 0.0
+                    std_list[idx] = 1.0
+
+            formatted_stats = {
+                "dataset_class": ds.__name__ if hasattr(ds, "__name__") else ds.__class__.__name__,
+                "mean": mean_list,
+                "std": std_list,
+                "min": ds_stats["min"].tolist(),
+                "max": ds_stats["max"].tolist(),
+                "config_index": i,
+            }
+
+            if ds_stats.get("nodata") is not None:
+                formatted_stats["nodata_info"] = {
+                    "value": ds_stats["nodata"],
+                    "pixels": ds_stats["nodata_pixels"],
+                }
+
+            all_stats["input_stats"].append(formatted_stats)
+
+    # Process Target Datasets
+    if "mask" in on_keys:
+        logging.info("Computing statistics for target datasets...")
+        for i, cfg in enumerate(target_datasets_cfg):
+            ds = instantiate_dataset(cfg, root, year, roi=roi)
+
+            sampler = TileGeoSampler(ds, train_tiles.data)
+            
+            # Determine actual channel count
+            sample = ds[next(iter(sampler))]
+            actual_channels = sample["mask"].shape[0]
+            
+            stats_calculator = DatasetStats(
+                dataset=ds,
+                sampler=sampler,
+                batch_size=15,
+                num_workers=5,
+                channels=actual_channels,
+            )
+            ds_stats = stats_calculator.compute()
+
+            if i == 0:
+                mean_list = ds_stats["mean"].tolist()
+                std_list = ds_stats["std"].tolist()
+                
+                # Force identity for categorical target channels
+                for idx in target_identity:
+                    if 0 <= idx < len(mean_list):
+                        logging.info(f"Forcing identity stats for target channel {idx}")
+                        mean_list[idx] = 0.0
+                        std_list[idx] = 1.0
+
+                target_stats = {
+                    "mean": mean_list,
+                    "std": std_list,
+                    "min": ds_stats["min"].tolist(),
+                    "max": ds_stats["max"].tolist(),
+                }
+                all_stats["target_stats"] = target_stats
+
+                if ds_stats.get("nodata") is not None:
+                    all_stats["target_nodata_info"] = {
+                        "value": ds_stats["nodata"],
+                        "pixels": ds_stats["nodata_pixels"],
+                    }
+
+    # Save to JSON
     output_dir = os.path.dirname(stats_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-
-    for split in ["training", "validation", "test"]:
-        split_dir = os.path.join(root, split)
-        if not os.path.exists(split_dir):
-            os.makedirs(split_dir, exist_ok=True)
-
-    datamodule = datamodule_class(**data_args)
-
-    if not skip_download:
-        # Lower logging level to WARNING during download phase to mute INFO:root:Downloading GEE...
-        original_level = root_logger.getEffectiveLevel()
-        root_logger.setLevel(logging.WARNING)
         
-        datamodule.setup("fit")
-        datamodule.prepare_data(
-            overwrite=overwrite,
-            download_all_bands=download_all_bands
-        )
-        
-        # Restore logging level
-        root_logger.setLevel(original_level)
-    else:
-        datamodule.setup("prepare")
+    with open(stats_path, 'w') as f:
+        json.dump(all_stats, f, indent=2)
 
-    def extract_datasets(dataset):
-        if isinstance(dataset, IntersectionDataset):
-            result = []
-            if hasattr(dataset, "datasets"):
-                for ds in dataset.datasets:
-                    result.extend(extract_datasets(ds))
-            else:
-                result.extend(extract_datasets(dataset.dataset1))
-                result.extend(extract_datasets(dataset.dataset2))
-            return result
-        else:
-            return [dataset]
+    logging.info(f"Statistics saved to: {stats_path}")
 
-    all_datasets = extract_datasets(datamodule.train_dataset)
-    train_tiles = datamodule.train_tiles
+    # Print summary report
+    print(f"\n{'='*60}")
+    print(f"{'DATA PREPARATION SUMMARY':^60}")
+    print(f"{'='*60}")
+    print(f"Stats Path: {stats_path}")
+    print(f"Year:       {year}")
+    
+    if all_stats.get("input_stats"):
+        print(f"\nInput Datasets:")
+        for entry in all_stats["input_stats"]:
+            name = entry["dataset_class"]
+            channels = len(entry["mean"])
+            print(f"  - {name:<15} | Channels: {channels}")
+            mean_str = ", ".join([f"{m:.2f}" for m in entry["mean"][:5]])
+            if channels > 5: mean_str += " ..."
+            print(f"    Mean: [{mean_str}]")
+            
+            if "nodata_info" in entry:
+                nd = entry["nodata_info"]
+                print(f"    Nodata: Value={nd['value']}, Pixels={nd['pixels']}")
 
-    input_datasets = []
-    target_dataset = None
-
-    target_class_names = []
-    for cfg in datamodule.target_configs:
-        cls = cfg.dataset_class
-        name = cls.__name__ if hasattr(cls, "__name__") else str(cls).split(".")[-1]
-        target_class_names.append(name)
-
-    for ds in all_datasets:
-        ds_name = ds.__class__.__name__
-        if ds_name in target_class_names:
-            target_dataset = ds
-        else:
-            input_datasets.append(ds)
-
-    if not target_dataset:
-        raise ValueError("Could not identify target dataset in tree.")
-
-    def create_placeholder_stats():
-        return {
-            "mean": torch.tensor([0.0]),
-            "std": torch.tensor([1.0]),
-            "min": torch.tensor([0.0]),
-            "max": torch.tensor([1.0]),
-            "nodata": 0,
-            "nodata_pixels": "0 (0.00%)",
-            "sample_size": 0,
-        }
-
-    all_input_stats = []
-    for i, ds in enumerate(input_datasets):
-        if "image" in on_keys:
-            input_stats = get_stats(
-                ds,
-                train_tiles.data,
-                overwrite=overwrite,
-            )
-        else:
-            input_stats = create_placeholder_stats()
-        
-        # Add metadata to track which config this corresponds to
-        input_stats['dataset_class'] = ds.__class__.__name__
-        input_stats['config_index'] = i
-        input_stats['path'] = str(getattr(ds, 'path', getattr(ds, 'paths', 'unknown')))
-        all_input_stats.append(input_stats)
-
-    if "mask" in on_keys:
-        target_stats = get_stats(
-            target_dataset,
-            train_tiles.data,
-            nodata=getattr(target_dataset, "nodata", None),
-            overwrite=overwrite,
-        )
-
-        # Apply identity normalization (mean=0, std=1) to specified channels
-        # (e.g. classification labels) so they remain unscaled in the datamodule.
-        if target_identity_channels:
-            num_channels = len(target_stats["mean"])
-            for idx in target_identity_channels:
-                if 0 <= idx < num_channels:
-                    logging.info(f"Setting identity stats for target channel {idx}")
-                    target_stats["mean"][idx] = 0.0
-                    target_stats["std"][idx] = 1.0
-                else:
-                    logging.warning(f"Target identity index {idx} out of range (max={num_channels-1})")
-    else:
-        target_stats = create_placeholder_stats()
-
-    _serialize_stats = getattr(datamodule_class, "_serialize_stats", None)
-    if _serialize_stats is None:
-        raise AttributeError(
-            f"Datamodule class {data_args['class_path']} must have a _serialize_stats method"
-        )
-
-    serialized_input_stats = _serialize_stats(all_input_stats)
-    serialized_target_stats = _serialize_stats(target_stats)
-
-    stats_dict = {
-        "input_stats": serialized_input_stats,
-        "target_stats": serialized_target_stats,
-        "year": year,
-        "inputs_class": [ds.__class__.__name__ for ds in input_datasets],
-        "target_class": target_dataset.__class__.__name__,
-    }
-
-    torch.save(stats_dict, stats_path)
+    if all_stats.get("target_stats"):
+        target = all_stats["target_stats"]
+        channels = len(target["mean"])
+        print(f"\nTarget Dataset:")
+        print(f"  - Combined        | Channels: {channels}")
+        mean_str = ", ".join([f"{m:.2f}" for m in target["mean"][:5]])
+        if channels > 5: mean_str += " ..."
+        print(f"    Mean: [{mean_str}]")
+            
+    print(f"{'='*60}\n")
 
     root_logger.removeHandler(tqdm_handler)
-
-    print(f"\n{'='*50}")
-    print(f"Data Preparation Summary")
-    print(f"{'='*50}")
-    print(f"Stats saved to: {stats_path}")
-    print(f"Year: {year}")
-    
-    if "image" in on_keys:
-        print(f"\nInput Statistics (Combined Splits):")
-        for stats in all_input_stats:
-            ds_name = stats.get('dataset_class', 'Unknown')
-            ds_path = stats.get('path', 'Unknown')
-            print(f"\n  Dataset: {ds_name} (Index: {stats.get('config_index', '?')})")
-            print(f"    Path: {ds_path}")
-            print(f"    Bands: {len(stats['mean'])}")
-            print(f"    Mean: {stats['mean'].tolist()}")
-            print(f"    Std:  {stats['std'].tolist()}")
-            print(f"    Min:  {stats['min'].tolist()}")
-            print(f"    Max:  {stats['max'].tolist()}")
-            print(f"    NoData Pixels: {stats['nodata_pixels']}")
-            print(f"    Sample Size: {stats['sample_size']}")
-    
-    if "mask" in on_keys:
-        print(f"\nTarget Statistics ({target_dataset.__class__.__name__}):")
-        print(f"    Mean: {target_stats['mean'].tolist()}")
-        print(f"    Std:  {target_stats['std'].tolist()}")
-        print(f"    Min:  {target_stats['min'].tolist()}")
-        print(f"    Max:  {target_stats['max'].tolist()}")
-    print(f"{'='*50}\n")
 
 
 def main():
@@ -349,8 +455,8 @@ def main():
         "--on-keys",
         nargs="+",
         choices=["image", "mask"],
-        default=["image"],
-        help="Which sample types to compute statistics for (default: image)",
+        default=["image", "mask"],
+        help="Which sample types to compute statistics for (default: image mask)",
     )
     parser.add_argument(
         "--skip-download",
@@ -361,18 +467,10 @@ def main():
         "--overwrite", action="store_true", help="Overwrite existing statistics file"
     )
     parser.add_argument(
-        "--target-identity-channels",
-        nargs="+",
-        type=int,
-        default=[0],
-        help="Target channel indices to set to identity normalization (mean=0, std=1). Default: [0]",
-    )
-    parser.add_argument(
         "--download-all-bands",
         action="store_true",
         help="Download all available bands instead of just the selected bands from config",
     )
-
     args = parser.parse_args()
 
     prepare_data(
@@ -380,13 +478,16 @@ def main():
         on_keys=args.on_keys,
         skip_download=args.skip_download,
         overwrite=args.overwrite,
-        target_identity_channels=args.target_identity_channels,
         download_all_bands=args.download_all_bands,
     )
 
 
 if __name__ == "__main__":
-    ee_project = dotenv.load_dotenv('.')
-    ee.Authenticate()
-    ee.Initialize(project=ee_project, opt_url='https://earthengine-highvolume.googleapis.com')
+    # Load env for GEE
+    dotenv.load_dotenv('.')
+    ee_project = os.getenv("GEE_PROJECT_NAME")
+    try:
+        ee.Initialize(project=ee_project, opt_url='https://earthengine-highvolume.googleapis.com')
+    except Exception as e:
+        print(f"EE Init failed: {e}. Ensure you are authenticated.")
     main()
