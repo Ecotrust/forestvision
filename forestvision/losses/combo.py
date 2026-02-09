@@ -7,17 +7,36 @@ import torch
 
 class L1SSIMComboLoss(nn.Module):
     def __init__(self, w: list = [1, 1]):
-        self.w = w
         super(L1SSIMComboLoss, self).__init__()
+        self.w = w
+        self.ssim = StructuralSimilarityIndexMeasure()
 
     def forward(self, inputs: Tensor, targets: Tensor, mask: Tensor = None) -> Tensor:
-        ssim = StructuralSimilarityIndexMeasure().to(inputs.device)
-        l1_loss = nn.L1Loss(reduction="none").to(inputs.device)
-        l1 = l1_loss(inputs, targets)
+        # L1 Loss
+        l1_all = F.l1_loss(inputs, targets, reduction="none")
         if mask is not None:
-            l1 = l1[~mask]
-        ssim_loss = 1 - ssim(inputs, targets)  # * 0.5
-        return l1.mean() * self.w[0] + ssim_loss.item() * self.w[1]
+            l1_valid = l1_all[~mask]
+            l1_loss = (
+                l1_valid.mean()
+                if l1_valid.numel() > 0
+                else torch.tensor(0.0, device=inputs.device)
+            )
+        else:
+            l1_loss = l1_all.mean()
+
+        # SSIM Loss
+        # SSIM is sensitive to extreme values. If we have a mask, we fill masked regions
+        # with target values to ensure they don't contribute to the loss.
+        if mask is not None:
+            inputs_masked = inputs.clone()
+            inputs_masked[mask] = targets[mask]
+            ssim_val = self.ssim(inputs_masked, targets)
+        else:
+            ssim_val = self.ssim(inputs, targets)
+
+        ssim_loss = 1 - ssim_val
+
+        return l1_loss * self.w[0] + ssim_loss * self.w[1]
 
 
 if __name__ == "__main__":

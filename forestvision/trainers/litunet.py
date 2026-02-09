@@ -52,7 +52,13 @@ class RegressionUNet(BaseTask):
             loss = loss.unsqueeze(1)
         if mask is not None:
             loss = loss[~mask]
-        return loss.mean()
+
+        # Guard against fully masked batch
+        return (
+            loss.mean()
+            if loss.numel() > 0
+            else torch.tensor(0.0, device=y_hat.device, requires_grad=True)
+        )
 
     def configure_losses(self) -> None:
         """Initialize the loss criterion.
@@ -394,13 +400,13 @@ class SegmentationUNet(BaseTask):
         loss: str = self.hparams["loss"]
         if loss == "ce":
             self.criterion: nn.Module = nn.CrossEntropyLoss(
-                reduction="none", ignore_index=self.hparams["ignore_index"]
+                reduction="mean", ignore_index=self.hparams["ignore_index"]
             )
         elif loss == "focal":
             self.criterion: nn.Module = FocalLoss(
                 mode="multiclass",
                 gamma=2,
-                reduction="none",
+                reduction="mean",
                 ignore_index=self.hparams["ignore_index"],
             )
         else:
@@ -473,7 +479,6 @@ class SegmentationUNet(BaseTask):
 
         # Compute loss using logits (FocalLoss expects logits and applies softmax internally)
         loss = self.criterion(y_logits, y.squeeze(1))
-        loss = loss.mean()
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
 
         # Compute predictions for metrics (apply softmax + argmax)
@@ -497,7 +502,6 @@ class SegmentationUNet(BaseTask):
         y_logits = self(x)  # Model outputs logits
 
         loss = self.criterion(y_logits, y.squeeze(1))
-        loss = loss.mean()
         self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
 
         y_probs = y_logits.softmax(dim=1)
@@ -522,7 +526,6 @@ class SegmentationUNet(BaseTask):
         y_logits = self(x)  # Model outputs logits
 
         loss = self.criterion(y_logits, y.squeeze(1))
-        loss = loss.mean()
         self.log("test_loss", loss, on_epoch=True, sync_dist=True)
 
         y_probs = y_logits.softmax(dim=1)
@@ -796,7 +799,7 @@ class MultiTaskUNet(BaseTask):
         # Use hparams ignore_index if not provided
         if ignore_index is None:
             ignore_index = self.hparams.get("ignore_index", -1)
-        
+
         # Ensure logits and y have matching spatial dimensions
         if logits.shape[2:] != y.shape[2:]:
             logits = F.interpolate(
@@ -804,35 +807,39 @@ class MultiTaskUNet(BaseTask):
             )
 
         # Derive class counts from hparams
-        num_seg = self.hparams["num_seg_classes"]   # Segmentation classes
-        num_reg = self.hparams["num_reg_targets"]   # Regression targets
-        
+        num_seg = self.hparams["num_seg_classes"]  # Segmentation classes
+        num_reg = self.hparams["num_reg_targets"]  # Regression targets
+
         # Split outputs: [B, num_seg + num_reg, H, W]
-        seg_logits = logits[:, :num_seg]                    # [B, num_seg, H, W]
-        reg_logits = logits[:, num_seg:num_seg+num_reg]     # [B, num_reg, H, W]
-        
-        # Create mask from classification channel
-        ndmask = y[:, 0] == ignore_index  # [B, H, W]
-        
+        seg_logits = logits[:, :num_seg]  # [B, num_seg, H, W]
+        reg_logits = logits[:, num_seg : num_seg + num_reg]  # [B, num_reg, H, W]
+
         # Classification loss
         focal_loss = self.focal_loss(seg_logits, y[:, 0].long())
-        
+
         # Regression loss (vectorized)
         if num_reg > 0:
-            reg_target = y[:, 1:num_reg+1]  # [B, num_reg, H, W]
+            reg_target = y[:, 1 : num_reg + 1]  # [B, num_reg, H, W]
             reg_loss_all = self.mae_loss(reg_logits, reg_target)  # [B, num_reg, H, W]
-            
-            # Apply mask and average - expand mask to match reg_loss_all shape
-            ndmask_expanded = ndmask.unsqueeze(1).expand_as(reg_loss_all)
-            reg_loss = reg_loss_all[~ndmask_expanded].mean()
-            
+
+            # Use per-channel masking for regression targets to handle mismatched nodata
+            reg_mask = reg_target == ignore_index
+            reg_loss_valid = reg_loss_all[~reg_mask]
+
+            # Guard against fully masked batch
+            reg_loss = (
+                reg_loss_valid.mean()
+                if reg_loss_valid.numel() > 0
+                else torch.tensor(0.0, device=logits.device)
+            )
+
             # Combine losses using configurable weights
             seg_w = self.hparams["seg_loss_weight"]
             reg_w = self.hparams["reg_loss_weight"]
             total_loss = focal_loss * seg_w + reg_loss * reg_w
-            
+
             return total_loss
-        
+
         return focal_loss
 
     def configure_losses(self) -> None:
@@ -1165,7 +1172,7 @@ class MultiTaskUNet(BaseTask):
 
         self.validation_step_outputs.clear()
 
-    def plot_batch(self, batch, n=5, rgb_bands=[3, 2, 1]):
+    def plot_batch(self, batch, n=5, rgb_bands=[2, 1, 0]):
         """Plot a sample of n images from batch for classification."""
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")  # clear previous plots if any
