@@ -56,10 +56,11 @@ model:
     # lr: 0.0001  # Range: [1e-5, 1e-2] (log scale)
     # dropout: 0.5  # Range: [0.1, 0.7]
     # seg_loss_weight: 0.6  # Range: [0.3, 0.8]
-    # reg_loss_weight: 0.4  # Complementary to seg_loss_weight
     # weight_decay: 0.0001  # Range: [1e-6, 1e-2] (log scale)
     # scheduler_patience: 3  # Range: [2, 10] (integer)
     # scheduler_factor: 0.5  # Range: [0.1, 0.8]
+    # focal_alpha: 0.25  # Range: [0.1, 1.0]
+    # focal_gamma: 2.0  # Range: [1.0, 5.0]
 
 # Data configuration
 data:

@@ -374,6 +374,8 @@ class SegmentationUNet(BaseTask):
         weight_decay: float = 1e-4,
         ignore_index: int = None,
         dropout: float = 0.0,
+        focal_alpha: float = None,
+        focal_gamma: float = 2.0,
         labels: dict = None,
         colormap: dict = None,
     ):
@@ -405,7 +407,8 @@ class SegmentationUNet(BaseTask):
         elif loss == "focal":
             self.criterion: nn.Module = FocalLoss(
                 mode="multiclass",
-                gamma=2,
+                alpha=self.hparams.get("focal_alpha"),
+                gamma=self.hparams.get("focal_gamma", 2.0),
                 reduction="mean",
                 ignore_index=self.hparams["ignore_index"],
             )
@@ -771,8 +774,9 @@ class MultiTaskUNet(BaseTask):
         dropout: float = 0.0,
         scheduler_patience: int = 10,
         scheduler_factor: float = 0.5,
-        seg_loss_weight: float = 0.6,
-        reg_loss_weight: float = 0.4,
+        seg_loss_weight: float = 0.4,
+        focal_alpha: float = None,
+        focal_gamma: float = 2.0,
         labels: dict = None,
         colormap: dict = None,
     ):
@@ -835,7 +839,7 @@ class MultiTaskUNet(BaseTask):
 
             # Combine losses using configurable weights
             seg_w = self.hparams["seg_loss_weight"]
-            reg_w = self.hparams["reg_loss_weight"]
+            reg_w = 1 - seg_w  
             total_loss = focal_loss * seg_w + reg_loss * reg_w
 
             return total_loss
@@ -846,7 +850,8 @@ class MultiTaskUNet(BaseTask):
         """Initialize the loss criterion."""
         self.focal_loss = FocalLoss(
             mode="multiclass",
-            gamma=2,
+            alpha=self.hparams.get("focal_alpha"),
+            gamma=self.hparams.get("focal_gamma", 2.0),
             reduction="mean",
             ignore_index=self.hparams.get("ignore_index", -1),
         )
