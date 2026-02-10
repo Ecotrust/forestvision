@@ -99,6 +99,19 @@ def get_search_space(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[s
         0.1, 
         0.8
     )
+
+    # Focal Loss hyperparameters
+    search_space["focal_alpha"] = trial.suggest_float(
+        "focal_alpha",
+        0.1,
+        1.0
+    )
+
+    search_space["focal_gamma"] = trial.suggest_float(
+        "focal_gamma",
+        1.0,
+        5.0
+    )
     
     # Data hyperparameters
     search_space["batch_size"] = trial.suggest_categorical(
@@ -134,6 +147,8 @@ def create_model_config(
         "weight_decay": search_space["weight_decay"],
         "scheduler_patience": search_space["scheduler_patience"],
         "scheduler_factor": search_space["scheduler_factor"],
+        "focal_alpha": search_space["focal_alpha"],
+        "focal_gamma": search_space["focal_gamma"],
     })
     
     model_config["init_args"] = init_args
