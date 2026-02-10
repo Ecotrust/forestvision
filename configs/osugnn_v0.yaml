@@ -16,12 +16,13 @@ model:
     num_seg_classes: 14  # fortypba with 13 forest types + NF
     num_reg_targets: 3   # cancov, qmd_dom, ba_ge_3
     loss: "focal"
-    lr: 0.0001
-    weight_decay: 0.0001
-    ignore_index: -2147483648
-    dropout: 0.5
-    scheduler_patience: 3
-    scheduler_factor: 0.5
+    lr: 0.000233
+    weight_decay: 0.000114
+    ignore_index: -1
+    dropout: 0.571
+    scheduler_patience: 7
+    scheduler_factor: 0.1325
+    seg_loss_weight: 0.4
     labels:
       0: NF
       1: shr
@@ -58,9 +59,9 @@ data:
   init_args:
     root: data/
     year: 2021
-    batch_size: 36
+    batch_size: 48
     patch_size: 32
-    stats_path: dev/train_test_120p10m_stats.json
+    stats_path: dev/osugnn_v0_stats.json
     train_tiles_path: dev/tiles/train_test_120p10m.geojson
     val_tiles_path: dev/tiles/val_test_120p10m.geojson
     test_tiles_path: dev/tiles/test_64p30m.geojson
@@ -116,5 +117,5 @@ data:
             init_args:
               on_key: "mask"
               identity_channels: [0]
-              nodata: -2147483648
+              nodata: -1
 

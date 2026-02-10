@@ -1239,13 +1239,15 @@ class MultiTaskUNet(BaseTask):
         y = y.clone()
         y[y < 0] = ignore_idx
         
-        # Create persistent boolean mask for visualization (based on categorical channel)
-        mask_nodata = (y[:, 0] == ignore_idx).detach().cpu().numpy() # [B, H, W]
+        # Create persistent boolean masks for visualization [B, C, H, W]
+        # We track nodata per-channel to handle mismatched NoData patterns in MultiTask
+        mask_nodata = (y == ignore_idx).detach().cpu().numpy()
 
         # Sanitize y_hat for plotting if not already done
         if y_hat is not None:
             y_hat = y_hat.clone()
-            y_hat[y[:, 0:1].expand_as(y_hat) == ignore_idx] = float(ignore_idx)
+            # Mask y_hat using y's NoData mask (expanded to match y_hat channels if needed)
+            y_hat[y == ignore_idx] = float(ignore_idx)
 
         x = revert(x, input_stats)
         y = revert(y, target_stats, is_target=True)
@@ -1304,7 +1306,12 @@ class MultiTaskUNet(BaseTask):
                     # Show categorical mask
                     mask_data = item[col_idx].squeeze().clone().detach().cpu().numpy()
                     
-                    # Ensure mask_data is integer for categorical comparison, especially after float reversion
+                    # Map the correct channel index for masking
+                    # y[:actual_n, 0] was used for fortypba, so channel is 0
+                    ch_idx = 0
+                    current_mask = mask_nodata[col_idx, ch_idx]
+
+                    # Ensure mask_data is integer for categorical comparison
                     mask_data = np.round(mask_data).astype(int)
 
                     # Create colored mask using colormap
@@ -1313,7 +1320,7 @@ class MultiTaskUNet(BaseTask):
                     # If colormap is empty, use a default Jet-like mapping for visibility
                     if not self.colormap:
                         # Normalize mask_data to [0, 1] for colormapping
-                        valid_mask = ~mask_nodata[col_idx]
+                        valid_mask = ~current_mask
                         if valid_mask.any():
                             m_min, m_max = mask_data[valid_mask].min(), mask_data[valid_mask].max()
                             if m_max > m_min:
@@ -1321,28 +1328,25 @@ class MultiTaskUNet(BaseTask):
                             else:
                                 norm_mask = np.zeros_like(mask_data, dtype=float)
                             
-                            # Use matplotlib to get a colored version
                             import matplotlib.cm as cm
                             cmap = cm.get_cmap('tab20')
                             colored_mask = (cmap(norm_mask)[..., :3] * 255).astype(np.uint8)
                     else:
                         # Use provided colormap
                         for class_id, color in self.colormap.items():
-                            # Ensure class_id is int for comparison with mask_data
                             try:
                                 cid = int(class_id)
                             except (ValueError, TypeError):
                                 cid = class_id
 
                             if isinstance(color, str):
-                                # Convert hex to RGB
                                 color = tuple(
                                     int(color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)
                                 )
                             mask_pixels = mask_data == cid
                             colored_mask[mask_pixels] = color
                             
-                        # Add fallback for classes not in colormap (bright red)
+                        # Add fallback for classes not in colormap
                         mapped_mask = np.zeros_like(mask_data, dtype=bool)
                         for class_id in self.colormap.keys():
                             try:
@@ -1351,17 +1355,17 @@ class MultiTaskUNet(BaseTask):
                                 cid = class_id
                             mapped_mask |= (mask_data == cid)
                         
-                        unmapped_mask = (~mapped_mask) & (~mask_nodata[col_idx])
-                        colored_mask[unmapped_mask] = (255, 0, 0) # Red for unmapped classes
+                        unmapped_mask = (~mapped_mask) & (~current_mask)
+                        colored_mask[unmapped_mask] = (255, 0, 0)
 
-                    # Always set ignore index to dark gray
-                    colored_mask[mask_nodata[col_idx]] = (50, 50, 50)
+                    # Always set ignore index to black
+                    colored_mask[current_mask] = (0, 0, 0)
 
                     axs[row_idx, col_idx].imshow(colored_mask)
                     axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
 
                     # Add stats to xlabel for debugging
-                    unique_vals = np.unique(mask_data[~mask_nodata[col_idx]])
+                    unique_vals = np.unique(mask_data[~current_mask])
                     axs[row_idx, col_idx].set_xlabel(
                         f"min:{mask_data.min()} max:{mask_data.max()} uniq:{len(unique_vals)}", 
                         fontsize="xx-small"
@@ -1371,9 +1375,15 @@ class MultiTaskUNet(BaseTask):
                     # Show regression output
                     img = item[col_idx].squeeze().clone().detach().cpu().numpy()
                     
+                    # Calculate channel index to retrieve the correct NoData mask
+                    # fortypba is at row_idx 1 and 2, then regression starts
+                    # For a more robust mapping, we look at which regression target this is
+                    reg_ch_offset = row_idx - 3  # Regression starts after fortypba and fortypba_pred
+                    ch_idx = 1 + (reg_ch_offset // 2) # Channel 1, 2, 3... in y
+                    current_mask = mask_nodata[col_idx, ch_idx]
+                    
                     # Handle masking for visualization using persistent mask
-                    valid_mask = ~mask_nodata[col_idx]
-                    # Calculate stats for better scaling
+                    valid_mask = ~current_mask
                     valid_pixels = img[valid_mask]
                     if len(valid_pixels) > 0:
                         vmin, vmax = np.percentile(valid_pixels, [2, 98])
@@ -1384,7 +1394,7 @@ class MultiTaskUNet(BaseTask):
                     
                     # Set mask value to NaN for viridis colormap to handle correctly
                     img_masked = img.copy()
-                    img_masked[mask_nodata[col_idx]] = np.nan
+                    img_masked[current_mask] = np.nan
                     
                     axs[row_idx, col_idx].imshow(img_masked, cmap="viridis", vmin=vmin, vmax=vmax)
                     axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
