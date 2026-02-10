@@ -155,6 +155,7 @@ def instantiate_dataset(
     year: int,
     stage: str = "training",
     roi: Optional[Any] = None,
+    download: bool = False,
 ):
     """Instantiate a dataset from configuration dictionary."""
     cls_path = cfg_dict.get("dataset_class")
@@ -183,6 +184,9 @@ def instantiate_dataset(
 
     if "roi" in sig.parameters:
         kwargs["roi"] = roi
+    
+    if "download" in sig.parameters:
+        kwargs["download"] = download
 
     # Create dataset instance
     ds = dataset_class(bands=bands, transforms=None, **kwargs)
@@ -263,7 +267,9 @@ def prepare_data(
         
         all_ds_cfgs = (input_datasets_cfg or []) + (target_datasets_cfg or [])
         for cfg in all_ds_cfgs:
-            ds = instantiate_dataset(cfg, root, year, stage="validation", roi=val_roi)
+            ds = instantiate_dataset(
+                cfg, root, year, stage="validation", roi=val_roi, download=not skip_download
+            )
             if hasattr(ds, "download") or hasattr(ds, "_download"):
                 logging.info(f"Downloading validation data for {ds.__class__.__name__}...")
                 sampler = TileGeoSampler(ds, val_tiles.data)
@@ -290,7 +296,7 @@ def prepare_data(
     if "image" in on_keys:
         logging.info("Computing statistics for input datasets...")
         for i, cfg in enumerate(input_datasets_cfg):
-            ds = instantiate_dataset(cfg, root, year, roi=roi)
+            ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
             
             # Download if requested
             if not skip_download and hasattr(ds, "download"):
@@ -359,7 +365,7 @@ def prepare_data(
     if "mask" in on_keys:
         logging.info("Computing statistics for target datasets...")
         for i, cfg in enumerate(target_datasets_cfg):
-            ds = instantiate_dataset(cfg, root, year, roi=roi)
+            ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
 
             sampler = TileGeoSampler(ds, train_tiles.data)
             
