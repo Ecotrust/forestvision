@@ -70,10 +70,13 @@ REMAP = {
     931: 11,  932: 11,  935: 11,  942: 11,  943: 11,  944: 11,  945: 11,
     946: 11,  947: 11,  948: 11,
 
+    # Set NF to nodata
+    # 0: -2147483648
+
 }
 # fmt: on
 
-GNNForestAttr.remap_dict.update(REMAP)
+# GNNForestAttr.remap_dict.update(REMAP)
 
 
 class ClimateNA(AnyRasterDataset):
