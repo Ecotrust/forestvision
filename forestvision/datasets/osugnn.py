@@ -77,7 +77,7 @@ class GNNForestAttr(RasterDataset):
     # fmt: off
     # GNN --> ODF code mapping
     remap_dict = {
-         -1:  0,   1:  0,   2:  6,   3:  7,   4:  7,   5:  7,   6:  9,   7:  2,   8:  2,   9: 12,  10: 12,  11: 12,  12: 13,  13: 12,  14: 12,
+         -1:  -2147483648,   1:  0,   2:  6,   3:  7,   4:  7,   5:  7,   6:  9,   7:  2,   8:  2,   9: 12,  10: 12,  11: 12,  12: 13,  13: 12,  14: 12,
          15: 12,  16: 12,  17: 12,  18: 12,  19: 12,  20: 12,  21: 12,  22: 12,  23: 12,  24: 12,  25: 12,  26: 12,  27:  5,  28:  5,  29: 12,
          30: 13,  31: 12,  32:  5,  33:  9,  34:  9,  35: 11,  36:  9,  37:  9,  38:  9,  39:  5,  40:  5,  41:  5,  42: 10,  43: 11,  44:  5,
          45:  5,  46:  5,  47: 13,  48:  5,  49:  5,  50:  5,  51:  5,  52: 13,  53: 13,  54:  5,  55:  5,  56:  5,  57:  5,  58:  9,  59:  5,
@@ -220,6 +220,8 @@ class GNNForestAttr(RasterDataset):
         if self.remap and "fortypba" in self.bands:
             fortypba_idx = self.bands.index("fortypba")
             fortypba = sample["mask"][fortypba_idx]
+            mask = sample["mask"] < 0
+            sample["mask"][mask] = self.nodata            
             sample["mask"][fortypba_idx] = self.remap_fortypba(fortypba)
         return sample
 
