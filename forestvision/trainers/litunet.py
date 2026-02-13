@@ -330,7 +330,10 @@ class RegressionUNet(BaseTask):
             if k == "x":
                 item = item[:, rgb_bands]
                 for i, img in enumerate(item):
-                    img = minmax_scaling(img, self.hparams["ignore_index"])
+                    img = minmax_scaling(img, ignore_idx)
+                    if ignore_idx is not None:
+                        # Ensure nodata pixels are true black (0) after scaling for visualization
+                        img[img == ignore_idx] = 0.0
                     img = tvF.to_pil_image(img)
                     axs[0, i].imshow(np.asarray(img))
                     axs[0, i].set_title("Input", fontsize="small")
@@ -342,12 +345,17 @@ class RegressionUNet(BaseTask):
                     img = img.squeeze().clone().detach().cpu()
                     msk = mask_nodata[i].squeeze()
                     img[msk == True] = np.nan
-                    axs[row_idx, i].imshow(np.asarray(img), cmap="viridis")
+                    
+                    # Create a colormap that shows NaN as black
+                    cmap = plt.get_cmap("viridis").copy()
+                    cmap.set_bad(color="black")
+                    
+                    axs[row_idx, i].imshow(np.asarray(img), cmap=cmap)
                     axs[row_idx, i].set_title(k, fontsize="small")
                     axs[row_idx, i].get_xaxis().set_ticks([])
                     axs[row_idx, i].get_yaxis().set_ticks([])
                     axs[row_idx, i].set_xlabel(
-                        f"min:{img.min().item():.2f} max:{img.max().item():.2f} mean:{img.mean().item():.2f}",
+                        f"min:{img.nanmin().item():.2f} max:{img.nanmax().item():.2f} mean:{img.nanmean().item():.2f}",
                         fontsize="xx-small",
                     )
             row_idx += 1
@@ -650,7 +658,10 @@ class SegmentationUNet(BaseTask):
                         # For 1 channel, create grayscale RGB
                         img = torch.stack([img_tensor[0], img_tensor[0], img_tensor[0]])
 
-                    img = minmax_scaling(img, self.hparams["ignore_index"])
+                    img = minmax_scaling(img, ignore_idx)
+                    if ignore_idx is not None:
+                        # Ensure nodata pixels are true black (0) after scaling for visualization
+                        img[img == ignore_idx] = 0.0
                     img = tvF.to_pil_image(img)
                     axs[row_idx, col_idx].imshow(np.asarray(img))
                     axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
@@ -1180,7 +1191,7 @@ class MultiTaskUNet(BaseTask):
     def plot_batch(self, batch, n=5, rgb_bands=[2, 1, 0]):
         """Plot a sample of n images from batch for classification."""
         plt.rcParams["savefig.bbox"] = "tight"
-        plt.close("all")  # clear previous plots if any
+        plt.close("all")
 
         # Robust stats lookup
         input_stats = self.hparams.get("input_stats")
@@ -1279,8 +1290,13 @@ class MultiTaskUNet(BaseTask):
             squeeze=False,
         )
 
+        # Prepare regression colormap once to show NaNs as black
+        reg_cmap = plt.get_cmap("viridis").copy()
+        reg_cmap.set_bad(color="black")
+
         for row_idx, (title, item) in enumerate(sample_dict.items()):
             for col_idx in range(num_cols):
+                ax = axs[row_idx, col_idx]
                 if title == "input":
                     # Handle different channel counts
                     img_tensor = item[col_idx]
@@ -1296,18 +1312,25 @@ class MultiTaskUNet(BaseTask):
                         # For 1 channel, create grayscale RGB
                         img = torch.stack([img_tensor[0], img_tensor[0], img_tensor[0]])
 
-                    img = minmax_scaling(img, self.hparams["ignore_index"])
+                    # Explicitly identify NoData areas for input images to show in black
+                    # Use the combined target mask as a reference for NoData areas in visualization
+                    # combined_nodata = mask_nodata[col_idx].any(axis=0)
+
+                    img = minmax_scaling(img, ignore_idx)
+                    img = img.clone()
+                    # Ensure all channels are black where we have NoData (force to 0.0 after scaling)
+                    # img[:, combined_nodata] = 0.0
+
                     img = tvF.to_pil_image(img)
                     img = tvF.adjust_contrast(img, 2)
                     img = tvF.adjust_brightness(img, 1)
-                    axs[row_idx, col_idx].imshow(np.asarray(img))
-                    axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
+                    ax.imshow(np.asarray(img))
+                    ax.set_title(f"{title}", fontsize="small")
                 elif title.startswith("fortypba"):
                     # Show categorical mask
                     mask_data = item[col_idx].squeeze().clone().detach().cpu().numpy()
                     
-                    # Map the correct channel index for masking
-                    # y[:actual_n, 0] was used for fortypba, so channel is 0
+                    # fortypba is at channel 0
                     ch_idx = 0
                     current_mask = mask_nodata[col_idx, ch_idx]
 
@@ -1317,9 +1340,8 @@ class MultiTaskUNet(BaseTask):
                     # Create colored mask using colormap
                     colored_mask = np.zeros((*mask_data.shape, 3), dtype=np.uint8)
                     
-                    # If colormap is empty, use a default Jet-like mapping for visibility
                     if not self.colormap:
-                        # Normalize mask_data to [0, 1] for colormapping
+                        # Default colormapping if empty
                         valid_mask = ~current_mask
                         if valid_mask.any():
                             m_min, m_max = mask_data[valid_mask].min(), mask_data[valid_mask].max()
@@ -1346,7 +1368,7 @@ class MultiTaskUNet(BaseTask):
                             mask_pixels = mask_data == cid
                             colored_mask[mask_pixels] = color
                             
-                        # Add fallback for classes not in colormap
+                        # Add fallback for classes not in colormap (red)
                         mapped_mask = np.zeros_like(mask_data, dtype=bool)
                         for class_id in self.colormap.keys():
                             try:
@@ -1361,12 +1383,12 @@ class MultiTaskUNet(BaseTask):
                     # Always set ignore index to black
                     colored_mask[current_mask] = (0, 0, 0)
 
-                    axs[row_idx, col_idx].imshow(colored_mask)
-                    axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
+                    ax.imshow(colored_mask)
+                    ax.set_title(f"{title}", fontsize="small")
 
                     # Add stats to xlabel for debugging
                     unique_vals = np.unique(mask_data[~current_mask])
-                    axs[row_idx, col_idx].set_xlabel(
+                    ax.set_xlabel(
                         f"min:{mask_data.min()} max:{mask_data.max()} uniq:{len(unique_vals)}", 
                         fontsize="xx-small"
                     )
@@ -1376,13 +1398,10 @@ class MultiTaskUNet(BaseTask):
                     img = item[col_idx].squeeze().clone().detach().cpu().numpy()
                     
                     # Calculate channel index to retrieve the correct NoData mask
-                    # fortypba is at row_idx 1 and 2, then regression starts
-                    # For a more robust mapping, we look at which regression target this is
-                    reg_ch_offset = row_idx - 3  # Regression starts after fortypba and fortypba_pred
-                    ch_idx = 1 + (reg_ch_offset // 2) # Channel 1, 2, 3... in y
+                    reg_ch_offset = row_idx - 3
+                    ch_idx = 1 + (reg_ch_offset // 2)
                     current_mask = mask_nodata[col_idx, ch_idx]
                     
-                    # Handle masking for visualization using persistent mask
                     valid_mask = ~current_mask
                     valid_pixels = img[valid_mask]
                     if len(valid_pixels) > 0:
@@ -1392,22 +1411,20 @@ class MultiTaskUNet(BaseTask):
                     else:
                         vmin, vmax = None, None
                     
-                    # Set mask value to NaN for viridis colormap to handle correctly
                     img_masked = img.copy()
                     img_masked[current_mask] = np.nan
                     
-                    axs[row_idx, col_idx].imshow(img_masked, cmap="viridis", vmin=vmin, vmax=vmax)
-                    axs[row_idx, col_idx].set_title(f"{title}", fontsize="small")
+                    ax.imshow(img_masked, cmap=reg_cmap, vmin=vmin, vmax=vmax)
+                    ax.set_title(f"{title}", fontsize="small")
                     
-                    # Add stats to xlabel for debugging
                     if len(valid_pixels) > 0:
-                         axs[row_idx, col_idx].set_xlabel(
-                             f"min:{valid_pixels.min():.1f} max:{valid_pixels.max():.1f}", 
+                         ax.set_xlabel(
+                             f"min:{np.nanmin(img_masked):.1f} max:{np.nanmax(img_masked):.1f} mean:{np.nanmean(img_masked):.1f}", 
                              fontsize="xx-small"
                          )
 
-                axs[row_idx, col_idx].get_xaxis().set_ticks([])
-                axs[row_idx, col_idx].get_yaxis().set_ticks([])
+                ax.get_xaxis().set_ticks([])
+                ax.get_yaxis().set_ticks([])
 
         plt.tight_layout()
         return fig
