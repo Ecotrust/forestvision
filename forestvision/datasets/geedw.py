@@ -80,7 +80,8 @@ class GEEDynamicWorld(GEERasterDataset):
         date_end: str,
         roi: Optional[BoundingBox] = None,
         res: float = 10,
-        class_name: Optional[str] | None = None,
+        class_name: Optional[str] = None,
+        bands: Optional[str] | None = None,
         path: Optional[str] = None,
         crs: Optional[CRS] = CRS.from_epsg(5070),
         transforms: Callable[[Dict[str, Any]], Dict[str, Any]] | None = None,
@@ -99,8 +100,8 @@ class GEEDynamicWorld(GEERasterDataset):
                 Region of interest to fetch data from.
             res : float
                 Resolution of the dataset. Default is 10.
-            bands : list
-                List of bands to be used. Default is ["label"].
+            bands : str
+                Bands to be used. Default is "label".
             path : str
                 Directory where Sentinel-2 data are stored or will be stored if download option
                 is set to True. If path is provided and a matching file exists, the image will be
@@ -130,7 +131,7 @@ class GEEDynamicWorld(GEERasterDataset):
         self.class_name = class_name
         self.date_start = date_start
         self.date_end = date_end
-        self.bands = ["label"]
+        self.bands = bands or ["label"]
 
     @property
     def collection(self):
@@ -143,7 +144,7 @@ class GEEDynamicWorld(GEERasterDataset):
     def _reducer(self, collection: ee.ImageCollection) -> ee.Image:
         """Reduce collection to a single image."""
         image = collection.reduce(ee.Reducer.mode())
-        if self.class_name in self.all_bands[:7]:
+        if self.class_name in self.all_bands and self.bands == ["label"]:
             class_idx = self.all_bands.index(self.class_name)
             return image.eq(class_idx)
         else:
