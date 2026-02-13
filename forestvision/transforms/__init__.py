@@ -15,4 +15,5 @@ from .transforms import (
     AppendMSAVI,
     AppendNIRv,
     SelectBands,
+    CombineGNNDWMask,
 )

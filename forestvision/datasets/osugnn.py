@@ -77,7 +77,7 @@ class GNNForestAttr(RasterDataset):
     # fmt: off
     # GNN --> ODF code mapping
     remap_dict = {
-         -1: -1,   1:  0,   2:  6,   3:  7,   4:  7,   5:  7,   6:  9,   7:  2,   8:  2,   9: 12,  10: 12,  11: 12,  12: 13,  13: 12,  14: 12,
+         1:  0,   2:  6,   3:  7,   4:  7,   5:  7,   6:  9,   7:  2,   8:  2,   9: 12,  10: 12,  11: 12,  12: 13,  13: 12,  14: 12,
          15: 12,  16: 12,  17: 12,  18: 12,  19: 12,  20: 12,  21: 12,  22: 12,  23: 12,  24: 12,  25: 12,  26: 12,  27:  5,  28:  5,  29: 12,
          30: 13,  31: 12,  32:  5,  33:  9,  34:  9,  35: 11,  36:  9,  37:  9,  38:  9,  39:  5,  40:  5,  41:  5,  42: 10,  43: 11,  44:  5,
          45:  5,  46:  5,  47: 13,  48:  5,  49:  5,  50:  5,  51:  5,  52: 13,  53: 13,  54:  5,  55:  5,  56:  5,  57:  5,  58:  9,  59:  5,
@@ -142,7 +142,7 @@ class GNNForestAttr(RasterDataset):
         930: 11, 931: 11, 932: 11, 933:  5, 934:  5, 935: 10, 936: 13, 937:  5, 938:  5, 939: 13, 940:  5, 941:  5, 942:  10, 943: 11, 944: 11,
         945: 11, 946: 10, 947: 11, 948: 11, 949: 12, 950: 12, 951: 12, 952: 12, 953: 13, 954: 12, 955: 12, 956: 13, 957:  5, 958: 12, 959: 13, 
         960: 12, 961: 12, 962: 12, 963: 12, 964: 12, 965:  5, 966:  9, 967:  2, 968:  9, 969: 10, 970:  2, 971:  2, 972:  5, 973:  5, 974:  5, 
-        975:  9, 976:  7, 977:  7, 978:  7, 979:  7, 980:  7, 981:  7, 982: 10, 983:  9, -2147483648: -1
+        975:  9, 976:  7, 977:  7, 978:  7, 979:  7, 980:  7, 981:  7, 982: 10, 983:  9
     }
     # fmt: on
 
@@ -214,17 +214,52 @@ class GNNForestAttr(RasterDataset):
         Note:
             If remap is enabled and 'fortypba' band is selected, forest type codes
             will be remapped using the built-in remapping dictionary.
+            Remapping is applied BEFORE transforms to ensure transforms see
+            remapped ODF values rather than raw GNN codes.
         """
-        sample = super().__getitem__(idx)
+        # Save and temporarily disable transforms to load raw data first
+        original_transforms = self.transforms
+        self.transforms = None
 
-        if self.remap and "fortypba" in self.bands:
-            self.nodata = -1
-            fortypba_idx = self.bands.index("fortypba")
-            fortypba = sample["mask"][fortypba_idx]
-            mask = sample["mask"] < 0
-            sample["mask"][mask] = self.nodata            
-            sample["mask"][fortypba_idx] = self.remap_fortypba(fortypba)
-        return sample
+        try:
+            # Get raw data without transforms
+            sample = super().__getitem__(idx)
+
+            # Apply remapping FIRST (before transforms)
+            if self.remap and "fortypba" in self.bands:
+                true_nodata = self.nodata
+                self.nodata = -1
+                fortypba_idx = self.bands.index("fortypba")
+                mask_nodata = sample["mask"] == true_nodata
+                mask_negative = (sample["mask"] < 0) 
+                sample["mask"][mask_negative] = 0
+                sample["mask"][mask_nodata] = self.nodata
+
+                if sample["mask"].ndim == 2:
+                    # Single band case: shape is (H, W)
+                    # sample["mask"][mask_nodata] = self.nodata
+                    sample["mask"] = self.remap_fortypba(sample["mask"])
+
+                elif sample["mask"].ndim == 3:
+                    # Multi-band case: shape is (C, H, W)
+                    fortypba = sample["mask"][fortypba_idx]
+                    sample["mask"][fortypba_idx] = self.remap_fortypba(fortypba)
+
+                else:
+                    raise ValueError(
+                        f"Unexpected mask dimensionality: {sample['mask'].ndim}. "
+                        f"Expected 2 (H, W) or 3 (C, H, W)."
+                    )
+
+            # Apply transforms AFTER remapping
+            if original_transforms is not None:
+                sample = original_transforms(sample)
+
+            return sample
+
+        finally:
+            # Always restore transforms
+            self.transforms = original_transforms
 
     def plot(
         self,

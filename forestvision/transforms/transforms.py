@@ -182,12 +182,6 @@ class MaskFromRaster:
     and can invert the mask.
     """
 
-    # we want to avoid importing cv2 unless necessary
-    try:
-        import cv2 as cv
-    except ImportError:
-        cv = None
-
     def __init__(
         self,
         from_class: int = 0,
@@ -204,9 +198,17 @@ class MaskFromRaster:
             invert: If True, invert the mask (select everything except the class).
         """
         self.from_class = from_class
-        self.apply_filter = apply_filter
         self.kernel = numpy.ones(_to_tuple(kernel_size), numpy.uint8)
         self.invert = invert
+        if apply_filter:
+            try:
+                import cv2
+
+                self.cv = cv2
+            except ImportError:
+                self.cv = None
+
+        self.apply_filter = apply_filter
 
     def _filter(self, mask: torch.Tensor) -> torch.Tensor:
         if self.cv is None:
@@ -848,3 +850,164 @@ class InverseMinMaxScaler:
             tensor[nodata_mask] = self.nodata
 
         return tensor
+
+
+class CombineGNNDWMask:
+    """Combine GNN forest types with Dynamic World labels to create a refined mask.
+
+    This transform is applied to GNNForestAttr samples. It fetches corresponding
+    Dynamic World land cover data and refines the GNN forest type classification
+    (fortypba) based on DW labels, while preserving other GNN attributes
+    (cancov, qmd_dom, ba_ge_3) unchanged.
+
+    Output mask classes (band 0 - fortypba):
+        - 0: Non-forest (from DW classes 4, 6, 7, 8)
+        - 1: Shrub/grass (from DW classes 2, 5)
+        - 14: Water (from DW class 0)
+        - nodata: Areas of disagreement between GNN and DW classifications
+        - >1: Forest types (preserved from GNN)
+
+    The output preserves all GNN bands, with only band 0 (fortypba) modified.
+
+    This transform should be applied to a GNNForestAttr dataset via the
+    `transforms` parameter.
+
+    Args:
+        dw_class: Dynamic World dataset class (e.g., GEEDynamicWorldLabels)
+        dw_path: Path to the DW dataset directory
+        date_start: Start date for DW image collection (e.g., "2021-06-01")
+        date_end: End date for DW image collection (e.g., "2021-08-31")
+        **dw_kwargs: Additional keyword arguments passed to dw_class constructor
+            (e.g., res, roi, download, etc.)
+
+    Example:
+        >>> from forestvision.datasets import GNNForestAttr
+        >>> from forestvision.datasets.geedw import GEEDynamicWorldLabels
+        >>> from forestvision.transforms import CombineGNNDWMask
+        >>> gnn = GNNForestAttr(
+        ...     paths="data/datasets/gnn/2021",
+        ...     bands=["fortypba", "cancov", "qmd_dom", "ba_ge_3"],
+        ...     res=10
+        ... )
+        >>> gnn.transforms = CombineGNNDWMask(
+        ...     dw_class=GEEDynamicWorldLabels,
+        ...     dw_path="data/datasets/geedw/2021",
+        ...     date_start="2021-06-01",
+        ...     date_end="2021-08-31",
+        ...     res=10
+        ... )
+        >>> sample = gnn[tile]  # Returns GNN mask with DW-refined fortypba
+    """
+
+    def __init__(
+        self,
+        dw_class: Union[type, str],
+        dw_path: str,
+        date_start: str,
+        date_end: str,
+        roi: Optional[List[float]] = None,
+    ):
+        """Initialize CombineGNNDWMask transform.
+
+        Args:
+            dw_class: Dynamic World dataset class to instantiate, or string class path
+                (e.g., "forestvision.datasets.GEEDynamicWorldLabels")
+            dw_path: Path to DW dataset files
+            date_start: Start date for DW collection
+            date_end: End date for DW collection
+            **dw_kwargs: Additional arguments for DW class (res, roi, download, etc.)
+        """
+        import pydoc
+        from torchgeo.datasets import BoundingBox
+
+        # Resolve class path string to actual class if needed
+        if isinstance(dw_class, str):
+            resolved_class = pydoc.locate(dw_class)
+            if resolved_class is None:
+                raise ImportError(f"Could not locate DW dataset class: {dw_class}")
+            dw_class = resolved_class
+
+        # Convert list [minx, maxx, miny, maxy] to BoundingBox
+        if roi is not None:
+            bbox = BoundingBox(minx=roi[0], maxx=roi[1], miny=roi[2], maxy=roi[3], mint=0, maxt=1e12)
+        else:
+            bbox = None
+
+        self.dw = dw_class(
+            date_start=date_start,
+            date_end=date_end,
+            path=dw_path,
+            roi=bbox,
+            res=10,
+            download=True
+        )
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Apply DW-GNN mask combination to a GNN sample.
+
+        Args:
+            sample: Dictionary containing GNN data with keys:
+                - "mask": GNN mask with 4 bands (C, H, W) - fortypba, cancov,
+                  qmd_dom, ba_ge_3
+                - "bbox": BoundingBox for spatial reference
+                - "crs": Coordinate reference system
+
+        Returns:
+            Modified sample with refined fortypba (band 0) based on DW labels,
+            while preserving bands 1-3 unchanged.
+        """
+        # GNN mask: (4, H, W) - bands: fortypba, cancov, qmd_dom, ba_ge_3
+        gnn_mask = sample["mask"].clone() 
+        dim = gnn_mask.dim()
+        if dim == 2:
+            # If mask is (H, W), add channel dimension: (H, W) -> (1, H, W)
+            gnn_mask = gnn_mask.unsqueeze(0)
+   
+        # Fetch corresponding DW data using bbox from GNN sample
+        bbox = sample["bounds"]
+        dw_sample = self.dw[bbox]
+        dw_mask = dw_sample["mask"].squeeze(0) 
+
+        # Extract fortypba (band 0) for masking logic
+        fortypba = gnn_mask[0].clone()
+
+        # Apply masking logic based on DW labels
+        # Non-forest from DW classes 4, 6, 7, 8
+        nf_msk = (dw_mask == 2) | (dw_mask == 7) | (dw_mask == 8)
+        urb_msk = dw_mask == 6
+        # Shrub and grass from DW classes 2, 5
+        shr_msk = (dw_mask == 5) 
+        # Water from DW class 0
+        wt = dw_mask == 0
+        # Nullify areas of disagreement between GNN and DW
+        # - GNN says shrub (1) but DW doesn't say shrub (5)
+        # - GNN says forest (>1) but DW doesn't say forest (1)
+        null_msk = ((fortypba == 1) & (dw_mask != 5)) | ((fortypba > 1) & (dw_mask != 1))
+
+        # Apply classifications
+        fortypba[wt] = 14
+        fortypba[nf_msk] = 0
+        fortypba[shr_msk] = 1
+        fortypba[null_msk] = -1 # nodata
+        fortypba[urb_msk] = -1 
+        
+
+        # Update band 0 in the GNN mask, preserve bands 1-3
+        if dim == 2:
+            sample["mask"] = fortypba.unsqueeze(0)  # Restore (1, H, W)
+        else:
+            gnn_mask[0] = fortypba
+            gnn_mask[1:, wt] = 0
+            gnn_mask[1:, nf_msk] = 0
+            null_all = fortypba == -1
+            gnn_mask[:, null_all] = -1
+            sample["mask"] = gnn_mask
+
+        return sample
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"dw_class={self.dw.__class__.__name__}, "
+            f"dw_path={getattr(self.dw, 'path', None)})"
+        )
