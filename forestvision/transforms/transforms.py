@@ -873,7 +873,7 @@ class CombineGNNDWMask:
     `transforms` parameter.
 
     Args:
-        dw_class: Dynamic World dataset class (e.g., GEEDynamicWorldLabels)
+        dw_class: Dynamic World dataset class (e.g., GEEDynamicWorld)
         dw_path: Path to the DW dataset directory
         date_start: Start date for DW image collection (e.g., "2021-06-01")
         date_end: End date for DW image collection (e.g., "2021-08-31")
@@ -882,7 +882,7 @@ class CombineGNNDWMask:
 
     Example:
         >>> from forestvision.datasets import GNNForestAttr
-        >>> from forestvision.datasets.geedw import GEEDynamicWorldLabels
+        >>> from forestvision.datasets.geedw import GEEDynamicWorld
         >>> from forestvision.transforms import CombineGNNDWMask
         >>> gnn = GNNForestAttr(
         ...     paths="data/datasets/gnn/2021",
@@ -890,7 +890,7 @@ class CombineGNNDWMask:
         ...     res=10
         ... )
         >>> gnn.transforms = CombineGNNDWMask(
-        ...     dw_class=GEEDynamicWorldLabels,
+        ...     dw_class=GEEDynamicWorld,
         ...     dw_path="data/datasets/geedw/2021",
         ...     date_start="2021-06-01",
         ...     date_end="2021-08-31",
@@ -911,7 +911,7 @@ class CombineGNNDWMask:
 
         Args:
             dw_class: Dynamic World dataset class to instantiate, or string class path
-                (e.g., "forestvision.datasets.GEEDynamicWorldLabels")
+                (e.g., "forestvision.datasets.GEEDynamicWorld")
             dw_path: Path to DW dataset files
             date_start: Start date for DW collection
             date_end: End date for DW collection
@@ -997,10 +997,10 @@ class CombineGNNDWMask:
             sample["mask"] = fortypba.unsqueeze(0)  # Restore (1, H, W)
         else:
             gnn_mask[0] = fortypba
-            gnn_mask[1:, wt] = 0
-            gnn_mask[1:, nf_msk] = 0
             null_all = fortypba == -1
             gnn_mask[:, null_all] = -1
+            gnn_mask[1:, nf_msk] = 0
+            gnn_mask[1:, wt] = 0
             sample["mask"] = gnn_mask
 
         return sample
