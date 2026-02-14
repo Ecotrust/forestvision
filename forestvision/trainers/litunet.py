@@ -1188,7 +1188,7 @@ class MultiTaskUNet(BaseTask):
 
         self.validation_step_outputs.clear()
 
-    def plot_batch(self, batch, n=5, rgb_bands=[2, 1, 0]):
+    def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0]):
         """Plot a sample of n images from batch for classification."""
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")
