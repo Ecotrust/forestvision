@@ -487,6 +487,10 @@ class BaseGeoDataModule(CloudDataModule):
                                for downloading the full dataset once, then experimenting with
                                different band combinations without re-downloading.
         """
+        if not getattr(self, 'download', True):
+            logging.info("Skipping data download (download=False)")
+            return
+        
         # Try to setup all stages, but catch errors if ROI/tiles are missing for some
         for stage in ["prepare", "test"]:
             try:

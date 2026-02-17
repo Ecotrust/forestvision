@@ -106,8 +106,12 @@ class ForTypesDataModule(BaseGeoDataModule):
         target_datasets: Optional[List[Dict[str, Any]]] = None,
         ee_project: Optional[str] = None,
         hparams: Optional[Dict[str, Any]] = None,
+        download: bool = True,
         **kwargs: Any,
     ) -> None:
+        # Store download flag for use in prepare_data
+        self.download = download
+        
         # Initialize Earth Engine
         ee_project = ee_project or GEE_PROJECT_NAME
         try:
