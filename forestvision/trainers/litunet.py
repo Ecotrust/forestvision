@@ -22,7 +22,7 @@ from segmentation_models_pytorch.losses import FocalLoss
 
 from ..models import UNet
 from ..datasets import minmax_scaling
-from ..losses import L1SSIMComboLoss
+from ..losses import L1SSIMComboLoss, MultiTaskLossWrapper
 
 
 class RegressionUNet(BaseTask):
@@ -257,25 +257,33 @@ class RegressionUNet(BaseTask):
         target_stats = self.hparams.get("target_stats")
 
         if input_stats is None:
-            input_stats = getattr(self.trainer.datamodule, "input_stats", None) if hasattr(self, "trainer") else None
+            input_stats = (
+                getattr(self.trainer.datamodule, "input_stats", None)
+                if hasattr(self, "trainer")
+                else None
+            )
         if input_stats is None:
             input_stats = getattr(self, "input_stats", None)
 
         if target_stats is None:
-            target_stats = getattr(self.trainer.datamodule, "target_stats", None) if hasattr(self, "trainer") else None
+            target_stats = (
+                getattr(self.trainer.datamodule, "target_stats", None)
+                if hasattr(self, "trainer")
+                else None
+            )
         if target_stats is None:
             target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats):
             if stats is not None:
                 m, s = stats["mean"], stats["std"]
-                
+
                 # Convert back to tensor if they were serialized to lists in hparams
                 if isinstance(m, list):
                     m = torch.tensor(m).clone()
                 if isinstance(s, list):
                     s = torch.tensor(s).clone()
-                
+
                 if isinstance(m, torch.Tensor):
                     m = m.clone()
                 if isinstance(s, torch.Tensor):
@@ -295,14 +303,14 @@ class RegressionUNet(BaseTask):
             return tensor
 
         x, y, y_hat = batch["image"], batch["mask"].float(), batch.get("prediction")
-        
+
         # Sanitize y and y_hat before revert to handle large negative NoData values
         ignore_idx = self.hparams.get("ignore_index", -1)
         y = y.clone()
         y[y < 0] = ignore_idx
-        
+
         # Create persistent boolean mask for visualization (before denormalization)
-        mask_nodata = (y == ignore_idx).detach().cpu() # [B, C, H, W]
+        mask_nodata = (y == ignore_idx).detach().cpu()  # [B, C, H, W]
 
         if y_hat is not None:
             y_hat = y_hat.clone()
@@ -345,11 +353,11 @@ class RegressionUNet(BaseTask):
                     img = img.squeeze().clone().detach().cpu()
                     msk = mask_nodata[i].squeeze()
                     img[msk == True] = np.nan
-                    
+
                     # Create a colormap that shows NaN as black
                     cmap = plt.get_cmap("viridis").copy()
                     cmap.set_bad(color="black")
-                    
+
                     axs[row_idx, i].imshow(np.asarray(img), cmap=cmap)
                     axs[row_idx, i].set_title(k, fontsize="small")
                     axs[row_idx, i].get_xaxis().set_ticks([])
@@ -527,7 +535,7 @@ class SegmentationUNet(BaseTask):
         y_pred_viz = y_pred.clone()
         if ignore_idx is not None:
             y_pred_viz[y.squeeze(1) == ignore_idx] = ignore_idx
-        
+
         batch["prediction"] = y_pred_viz
         self.validation_step_outputs.append(batch)
 
@@ -577,19 +585,27 @@ class SegmentationUNet(BaseTask):
         target_stats = self.hparams.get("target_stats")
 
         if input_stats is None:
-            input_stats = getattr(self.trainer.datamodule, "input_stats", None) if hasattr(self, "trainer") else None
+            input_stats = (
+                getattr(self.trainer.datamodule, "input_stats", None)
+                if hasattr(self, "trainer")
+                else None
+            )
         if input_stats is None:
             input_stats = getattr(self, "input_stats", None)
 
         if target_stats is None:
-            target_stats = getattr(self.trainer.datamodule, "target_stats", None) if hasattr(self, "trainer") else None
+            target_stats = (
+                getattr(self.trainer.datamodule, "target_stats", None)
+                if hasattr(self, "trainer")
+                else None
+            )
         if target_stats is None:
             target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats):
             if stats is not None:
                 m, s = stats["mean"], stats["std"]
-                
+
                 # Convert back to tensor if they were serialized to lists in hparams
                 if isinstance(m, list):
                     m = torch.tensor(m).clone()
@@ -605,17 +621,17 @@ class SegmentationUNet(BaseTask):
                 if len(m) > num_tensor_channels:
                     m = m[:num_tensor_channels]
                     s = s[:num_tensor_channels]
-                    
+
                 return Denormalize(mean=m, std=s)(tensor.float())
             return tensor
 
         x, y, y_hat = batch["image"], batch["mask"].float(), batch.get("prediction")
-        
+
         # Sanitize y and y_hat
         ignore_idx = self.hparams.get("ignore_index", -1)
         y = y.clone()
         y[y < 0] = ignore_idx
-        
+
         if y_hat is not None:
             y_hat = y_hat.float().clone()
             y_hat[y == ignore_idx] = ignore_idx
@@ -668,7 +684,7 @@ class SegmentationUNet(BaseTask):
                 else:
                     # Show categorical mask
                     mask = item[col_idx].squeeze().clone().detach().cpu().numpy()
-                    
+
                     # Ensure mask is integer for categorical comparison
                     mask = np.round(mask).astype(int)
 
@@ -773,26 +789,28 @@ class MultiTaskUNet(BaseTask):
     input_stats: dict = None
     target_stats: dict = None
 
-    def crop_to_match(self, tensor: torch.Tensor, target_shape: tuple[int, int]) -> torch.Tensor:
+    def crop_to_match(
+        self, tensor: torch.Tensor, target_shape: tuple[int, int]
+    ) -> torch.Tensor:
         """Center crop tensor to match target spatial dimensions.
-        
+
         Args:
             tensor: Input tensor of shape [B, C, H, W]
             target_shape: Tuple of (target_h, target_w)
-        
+
         Returns:
             Cropped tensor of shape [B, C, target_h, target_w]
         """
         _, _, h, w = tensor.shape
         target_h, target_w = target_shape
-        
+
         if h == target_h and w == target_w:
             return tensor
-        
+
         # Calculate center crop positions
         top = (h - target_h) // 2
         left = (w - target_w) // 2
-        
+
         return tvF.crop(tensor, top=top, left=left, height=target_h, width=target_w)
 
     def __init__(
@@ -807,19 +825,27 @@ class MultiTaskUNet(BaseTask):
         dropout: float = 0.0,
         scheduler_patience: int = 10,
         scheduler_factor: float = 0.5,
-        seg_loss_weight: float = 0.4,
         focal_alpha: float = None,
         focal_gamma: float = 2.0,
         labels: dict = None,
         colormap: dict = None,
+        use_uncertainty_weighting: bool = True,
+        init_log_vars: float = 0.0,
+        use_loss_normalization: bool = True,
+        loss_norm_momentum: float = 0.9,
     ):
         super().__init__()
         # Save hyperparameters, excluding visualization-only params
-        self.save_hyperparameters(ignore=['labels', 'colormap'])
+        self.save_hyperparameters(ignore=["labels", "colormap"])
         # Store as instance attributes (not hyperparameters)
         self.labels = labels or {}
         self.colormap = colormap or {}
         self.validation_step_outputs = []
+        # Store for loss logging
+        self._last_loss_logs = {}
+        # Running average normalization buffers (initialized to 1.0)
+        self.register_buffer("seg_loss_ema", torch.tensor(1.0))
+        self.register_buffer("reg_loss_ema", torch.tensor(1.0))
 
     def configure_models(self):
         """Initialize the UNet model for classification."""
@@ -832,7 +858,17 @@ class MultiTaskUNet(BaseTask):
         )
 
     def compute_loss(self, y, logits, ignore_index=None):
-        """Compute multi-task loss (Focal for classification + L1 for regression)."""
+        """Compute multi-task loss using homoscedastic uncertainty weighting.
+
+        Uses learnable task weights based on homoscedastic uncertainty to balance
+        segmentation and regression losses dynamically during training.
+
+        Optionally applies running average normalization to handle highly different
+        loss scales between tasks.
+
+        Reference: Kendall et al., "Multi-Task Learning Using Uncertainty to Weigh
+        Losses for Scene Geometry and Semantics", CVPR 2018.
+        """
         # Use hparams ignore_index if not provided
         if ignore_index is None:
             ignore_index = self.hparams.get("ignore_index")
@@ -845,15 +881,14 @@ class MultiTaskUNet(BaseTask):
         seg_logits = logits[:, :num_seg]  # [B, num_seg, H, W]
         reg_logits = logits[:, num_seg : num_seg + num_reg]  # [B, num_reg, H, W]
 
-        # Classification loss
-        focal_loss = self.focal_loss(seg_logits, y[:, 0].long())
+        # Classification loss (FocalLoss returns scalar)
+        seg_loss = self.focal_loss(seg_logits, y[:, 0].long())
 
-        # Regression loss (vectorized)
-        if num_reg > 0:
+        if num_reg > 0 and self.loss_wrapper is not None:
+            # Regression loss with masking
             reg_target = y[:, 1 : num_reg + 1]  # [B, num_reg, H, W]
             reg_loss_all = self.mae_loss(reg_logits, reg_target)  # [B, num_reg, H, W]
 
-            # Use per-channel masking for regression targets to handle mismatched nodata
             reg_mask = reg_target == ignore_index
             reg_loss_valid = reg_loss_all[~reg_mask]
 
@@ -864,17 +899,46 @@ class MultiTaskUNet(BaseTask):
                 else torch.tensor(0.0, device=logits.device)
             )
 
-            # Combine losses using configurable weights
-            seg_w = self.hparams["seg_loss_weight"]
-            reg_w = 1 - seg_w  
-            total_loss = focal_loss * seg_w + reg_loss * reg_w
+            # Store raw losses for logging
+            raw_losses = [seg_loss.detach(), reg_loss.detach()]
+
+            # Apply running average normalization if enabled
+            if self.hparams.get("use_loss_normalization", False):
+                # Normalize by running average + epsilon for stability
+                seg_loss_norm = seg_loss / (self.seg_loss_ema + 1e-8)
+                reg_loss_norm = reg_loss / (self.reg_loss_ema + 1e-8)
+
+                # Update EMAs (in-place, no gradients)
+                momentum = self.hparams.get("loss_norm_momentum", 0.9)
+                self.seg_loss_ema = (
+                    momentum * self.seg_loss_ema + (1 - momentum) * seg_loss.detach()
+                )
+                self.reg_loss_ema = (
+                    momentum * self.reg_loss_ema + (1 - momentum) * reg_loss.detach()
+                )
+
+                task_losses = [seg_loss_norm, reg_loss_norm]
+            else:
+                task_losses = [seg_loss, reg_loss]
+
+            # Apply homoscedastic uncertainty-based weighting
+            total_loss, loss_logs = self.loss_wrapper(task_losses)
+
+            # Add raw losses and EMA values to logs
+            loss_logs["task_0_raw_loss"] = raw_losses[0]
+            loss_logs["task_1_raw_loss"] = raw_losses[1]
+            loss_logs["seg_loss_ema"] = self.seg_loss_ema.detach()
+            loss_logs["reg_loss_ema"] = self.reg_loss_ema.detach()
+
+            # Store logs for training_step to use
+            self._last_loss_logs = loss_logs
 
             return total_loss
 
-        return focal_loss
+        return seg_loss
 
     def configure_losses(self) -> None:
-        """Initialize the loss criterion."""
+        """Initialize the loss criterion and uncertainty weighting."""
         self.focal_loss = FocalLoss(
             mode="multiclass",
             alpha=self.hparams.get("focal_alpha"),
@@ -883,6 +947,16 @@ class MultiTaskUNet(BaseTask):
             ignore_index=self.hparams.get("ignore_index", -1),
         )
         self.mae_loss = nn.L1Loss(reduction="none")
+
+        # Initialize homoscedastic uncertainty-based loss weighting
+        if self.hparams.get("use_uncertainty_weighting", True):
+            num_tasks = 2 if self.hparams["num_reg_targets"] > 0 else 1
+            self.loss_wrapper = MultiTaskLossWrapper(
+                num_tasks=num_tasks,
+                init_log_vars=self.hparams.get("init_log_vars", 0.0),
+            )
+        else:
+            self.loss_wrapper = None
 
     def configure_metrics(self) -> None:
         """Initialize the performance metrics for classification."""
@@ -930,14 +1004,24 @@ class MultiTaskUNet(BaseTask):
         self.reg_test_metrics = reg_metrics.clone(prefix="reg_test_")
 
     def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler."""
+        """Configure optimizer including uncertainty weighting parameters."""
+        # Collect all parameters
+        params = list(self.model.parameters())
+
+        # Add loss wrapper parameters if using uncertainty weighting
+        if self.loss_wrapper is not None:
+            params.extend(list(self.loss_wrapper.parameters()))
+
         optimizer = torch.optim.Adam(
-            self.model.parameters(),
+            params,
             lr=self.hparams["lr"],
             weight_decay=self.hparams["weight_decay"],
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=self.hparams["scheduler_factor"], patience=self.hparams["scheduler_patience"]
+            optimizer,
+            mode="min",
+            factor=self.hparams["scheduler_factor"],
+            patience=self.hparams["scheduler_patience"],
         )
         return {
             "optimizer": optimizer,
@@ -948,18 +1032,23 @@ class MultiTaskUNet(BaseTask):
         }
 
     def training_step(self, batch, batch_idx):
-        """Training step for classification."""
+        """Training step with uncertainty weighting logging."""
         x, y = batch["image"], batch["mask"].long()
 
         ignore_idx = self.hparams.get("ignore_index")
 
-        y_logits = self(x)  
+        y_logits = self(x)
         # Crop target to match logits shape (avoids interpolation artifacts on predictions)
         if y.shape[2:] != y_logits.shape[2:]:
             y = self.crop_to_match(y, y_logits.shape[2:])
 
         loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
+
+        # Log uncertainty weights and raw losses
+        if hasattr(self, "_last_loss_logs") and self._last_loss_logs:
+            for key, value in self._last_loss_logs.items():
+                self.log(f"train_{key}", value, on_epoch=True, sync_dist=True)
 
         # Use explicit parameter for segmentation classes
         num_seg = self.hparams["num_seg_classes"]
@@ -1025,7 +1114,7 @@ class MultiTaskUNet(BaseTask):
             y_reg = y[:, 1:, :]
             y_hat_reg = fa_logits[:, :num_regression_targets, :]
             # Clamp predictions to target min and max range
-            y_hat_reg = torch.clamp(y_hat_reg, -5, 5) 
+            y_hat_reg = torch.clamp(y_hat_reg, -5, 5)
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_val_metrics(
@@ -1037,30 +1126,31 @@ class MultiTaskUNet(BaseTask):
         self.confusion_matrix.update(ft_pred, y[:, 0, :, :])
 
         # Ensure prediction concatenation matches available regression outputs
-        preds = torch.cat(
-            [ft_pred.unsqueeze(1), y_hat_reg], dim=1
-        )
-        
+        preds = torch.cat([ft_pred.unsqueeze(1), y_hat_reg], dim=1)
+
         # Sanitize batch predictions for plotting
         # if ignore_idx is not None:
         #     mask_data = (y[:, 0:1] == ignore_idx)
         #     preds[mask_data.expand_as(preds)] = float(ignore_idx)
-            
+
         batch["prediction"] = preds
         self.validation_step_outputs.append(batch)
 
         y_reg_float = y_reg.float()
-        print(f"y_reg min: {y_reg_float[~mask_reg].min()}, max: {y_reg_float[~mask_reg].max()}, mean: {y_reg_float[~mask_reg].mean()}")
-        print(f"y_hat_reg min: {y_hat_reg[~mask_reg].min().item()}, max: {y_hat_reg[~mask_reg].max().item()}, mean: {y_hat_reg[~mask_reg].mean().item()}")
-
+        print(
+            f"y_reg min: {y_reg_float[~mask_reg].min()}, max: {y_reg_float[~mask_reg].max()}, mean: {y_reg_float[~mask_reg].mean()}"
+        )
+        print(
+            f"y_hat_reg min: {y_hat_reg[~mask_reg].min().item()}, max: {y_hat_reg[~mask_reg].max().item()}, mean: {y_hat_reg[~mask_reg].mean().item()}"
+        )
 
     def test_step(self, batch, batch_idx):
         """Test step for multi-task."""
         x, y = batch["image"], batch["mask"].long()
-        
+
         # Sanitize target: remap all negative values to ignore_index
         ignore_idx = self.hparams.get("ignore_index", -1)
-            
+
         y_logits = self(x)  # Model outputs logits
         # Crop target to match logits shape (avoids interpolation artifacts on predictions)
         if y.shape[2:] != y_logits.shape[2:]:
@@ -1074,36 +1164,6 @@ class MultiTaskUNet(BaseTask):
         ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
         ft_probs = ft_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
-
-        # Resize predictions to match target spatial dimensions before metrics computation
-        # target_h, target_w = y[:, 0, :, :].shape[1:]
-        # if ft_pred.shape[1:] != (target_h, target_w):
-        #     ft_pred_resized = (
-        #         F.interpolate(
-        #             ft_pred.unsqueeze(1).float(),
-        #             size=(target_h, target_w),
-        #             mode="nearest",
-        #         )
-        #         .squeeze(1)
-        #         .long()
-        #     )
-        # else:
-        #     ft_pred_resized = ft_pred
-
-        # # Sanitize predictions at target resolution before metrics
-        # if ignore_idx is not None:
-        #     ft_pred_resized = ft_pred_resized.clone()
-        #     ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
-
-        # if fa_logits.shape[2:] != (target_h, target_w):
-        #     fa_logits_resized = F.interpolate(
-        #         fa_logits,
-        #         size=(target_h, target_w),
-        #         mode="bilinear",
-        #         align_corners=False,
-        #     )
-        # else:
-        #     fa_logits_resized = fa_logits
 
         seg_metrics = self.seg_test_metrics(ft_pred, y[:, 0, :, :])
         self.log_dict(seg_metrics, sync_dist=True)
@@ -1149,8 +1209,44 @@ class MultiTaskUNet(BaseTask):
 
         self.validation_step_outputs.clear()
 
-    def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0]):
-        """Plot a sample of n images from batch for classification."""
+    def forward(self, x):
+        """
+        Forward pass through the multi-task U-Net.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape [B, C, H, W].
+
+        Returns:
+            torch.Tensor: Output tensor of shape [B, num_seg_classes + num_reg_targets, H, W].
+                The segmentation channels (0 to num_seg_classes-1) contain raw logits.
+                The regression channels (num_seg_classes onwards) have Tanh activation
+                applied, binding outputs to normalized target range [-1, 1].
+        """
+        logits = self.model(x)
+
+        # Split into segmentation and regression channels
+        num_seg = self.hparams["num_seg_classes"]
+        seg_logits = logits[:, :num_seg]  # Raw logits for segmentation
+        reg_logits = logits[:, num_seg:]  # Raw logits for regression
+
+        # Apply Tanh to regression outputs to bind to normalized target range.
+        # This acts as a regularizer for the shared backbone and ensures
+        # regression outputs are in the [-1, 1] range suitable for normalized targets.
+        # Tanh also helps align edge features, benefiting the segmentation branch.
+        reg_out = torch.tanh(reg_logits)
+
+        # Concatenate segmentation logits and regression outputs
+        return torch.cat([seg_logits, reg_out], dim=1)
+
+    def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0], max_null_ratio=0.7):
+        """Plot a sample of n images from batch for classification.
+
+        Args:
+            batch: Batch dictionary containing images, masks, and predictions
+            n: Maximum number of samples to plot
+            rgb_bands: Bands to use for RGB visualization
+            max_null_ratio: Maximum ratio of null pixels to allow in a sample (0.0-1.0)
+        """
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")
 
@@ -1159,25 +1255,33 @@ class MultiTaskUNet(BaseTask):
         target_stats = self.hparams.get("target_stats")
 
         if input_stats is None:
-            input_stats = getattr(self.trainer.datamodule, "input_stats", None) if hasattr(self, "trainer") else None
+            input_stats = (
+                getattr(self.trainer.datamodule, "input_stats", None)
+                if hasattr(self, "trainer")
+                else None
+            )
         if input_stats is None:
             input_stats = getattr(self, "input_stats", None)
 
         if target_stats is None:
-            target_stats = getattr(self.trainer.datamodule, "target_stats", None) if hasattr(self, "trainer") else None
+            target_stats = (
+                getattr(self.trainer.datamodule, "target_stats", None)
+                if hasattr(self, "trainer")
+                else None
+            )
         if target_stats is None:
             target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats, is_target=False):
             if stats is not None:
                 m, s = stats["mean"], stats["std"]
-                
+
                 # Convert back to tensor if they were serialized to lists in hparams
                 if isinstance(m, list):
                     m = torch.tensor(m).clone()
                 if isinstance(s, list):
                     s = torch.tensor(s).clone()
-                
+
                 if isinstance(m, torch.Tensor):
                     m = m.clone()
                 if isinstance(s, torch.Tensor):
@@ -1189,10 +1293,12 @@ class MultiTaskUNet(BaseTask):
 
                 num_stats_channels = len(m)
                 num_tensor_channels = tensor.shape[-3]
-                
+
                 # STRICT CHECK: Stats must match tensor channels exactly
                 if num_stats_channels != num_tensor_channels:
-                    print(f"Warning: Stats channel mismatch in MultiTaskUNet.revert(): stats={num_stats_channels}, tensor={num_tensor_channels}. Slicing.")
+                    print(
+                        f"Warning: Stats channel mismatch in MultiTaskUNet.revert(): stats={num_stats_channels}, tensor={num_tensor_channels}. Slicing."
+                    )
                     m = m[:num_tensor_channels]
                     s = s[:num_tensor_channels]
 
@@ -1200,16 +1306,16 @@ class MultiTaskUNet(BaseTask):
                 if is_target and len(m) > 0:
                     m[0] = 0.0
                     s[0] = 1.0
-                    
+
                 return Denormalize(mean=m, std=s)(tensor.float())
             return tensor
 
         x, y, y_hat = batch["image"], batch["mask"], batch["prediction"]
-        
+
         # Sanitize y before revert to handle large negative NoData values
-        ignore_idx = self.hparams.get("ignore_index", -1)
+        ignore_idx = self.hparams.get("ignore_index")
         y = y.clone()
-        y[y < 0] = ignore_idx
+        # y[y < 0] = ignore_idx
 
         # Crop y to match y_hat shape if needed (handles shape mismatch from UNet output)
         if y_hat is not None and y.shape[2:] != y_hat.shape[2:]:
@@ -1218,6 +1324,33 @@ class MultiTaskUNet(BaseTask):
         # Create persistent boolean masks for visualization [B, C, H, W]
         # We track nodata per-channel to handle mismatched NoData patterns in MultiTask
         mask_nodata = (y == ignore_idx).detach().cpu().numpy()
+
+        # Filter samples based on null pixel ratio
+        # Calculate null ratio for each sample (considering all channels)
+        batch_size = x.shape[0]
+        valid_sample_indices = []
+
+        for i in range(batch_size):
+            # Calculate null ratio across all channels for this sample
+            sample_null_mask = mask_nodata[i]  # [C, H, W]
+            total_pixels = sample_null_mask.size  # C * H * W
+            null_pixels = np.sum(sample_null_mask)
+            null_ratio = null_pixels / total_pixels
+
+            # Keep samples with null ratio below threshold
+            if null_ratio <= max_null_ratio:
+                valid_sample_indices.append(i)
+
+        # If no samples meet the criteria, use the first 5
+        if not valid_sample_indices:
+            valid_sample_indices = list(range(min(5, batch_size)))
+            print(
+                f"Warning: No samples found with null ratio <= {max_null_ratio}. Using first 5 samples."
+            )
+
+        # Limit to n samples from valid indices
+        if len(valid_sample_indices) > n:
+            valid_sample_indices = valid_sample_indices[:n]
 
         # Sanitize y_hat for plotting if not already done
         if y_hat is not None:
@@ -1229,8 +1362,15 @@ class MultiTaskUNet(BaseTask):
         y = revert(y, target_stats, is_target=True)
         y_hat = revert(y_hat, target_stats, is_target=True)
 
-        # Determine actual number of samples to plot (min of n and available samples)
-        actual_n = min(n, len(x))
+        # Use only valid samples for plotting
+        x = x[valid_sample_indices]
+        y = y[valid_sample_indices]
+        if y_hat is not None:
+            y_hat = y_hat[valid_sample_indices]
+        mask_nodata = mask_nodata[valid_sample_indices]
+
+        # Determine actual number of samples to plot
+        actual_n = len(valid_sample_indices)
 
         sample_dict = {
             "input": x[:actual_n],
@@ -1294,7 +1434,7 @@ class MultiTaskUNet(BaseTask):
                 elif title.startswith("fortypba"):
                     # Show categorical mask
                     mask_data = item[col_idx].squeeze().clone().detach().cpu().numpy()
-                    
+
                     # fortypba is at channel 0
                     ch_idx = 0
                     current_mask = mask_nodata[col_idx, ch_idx]
@@ -1304,20 +1444,26 @@ class MultiTaskUNet(BaseTask):
 
                     # Create colored mask using colormap
                     colored_mask = np.zeros((*mask_data.shape, 3), dtype=np.uint8)
-                    
+
                     if not self.colormap:
                         # Default colormapping if empty
                         valid_mask = ~current_mask
                         if valid_mask.any():
-                            m_min, m_max = mask_data[valid_mask].min(), mask_data[valid_mask].max()
+                            m_min, m_max = (
+                                mask_data[valid_mask].min(),
+                                mask_data[valid_mask].max(),
+                            )
                             if m_max > m_min:
                                 norm_mask = (mask_data - m_min) / (m_max - m_min)
                             else:
                                 norm_mask = np.zeros_like(mask_data, dtype=float)
-                            
+
                             import matplotlib.cm as cm
-                            cmap = cm.get_cmap('tab20')
-                            colored_mask = (cmap(norm_mask)[..., :3] * 255).astype(np.uint8)
+
+                            cmap = cm.get_cmap("tab20")
+                            colored_mask = (cmap(norm_mask)[..., :3] * 255).astype(
+                                np.uint8
+                            )
                     else:
                         # Use provided colormap
                         for class_id, color in self.colormap.items():
@@ -1328,11 +1474,12 @@ class MultiTaskUNet(BaseTask):
 
                             if isinstance(color, str):
                                 color = tuple(
-                                    int(color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)
+                                    int(color.lstrip("#")[i : i + 2], 16)
+                                    for i in (0, 2, 4)
                                 )
                             mask_pixels = mask_data == cid
                             colored_mask[mask_pixels] = color
-                            
+
                         # Add fallback for classes not in colormap (red)
                         mapped_mask = np.zeros_like(mask_data, dtype=bool)
                         for class_id in self.colormap.keys():
@@ -1340,8 +1487,8 @@ class MultiTaskUNet(BaseTask):
                                 cid = int(class_id)
                             except (ValueError, TypeError):
                                 cid = class_id
-                            mapped_mask |= (mask_data == cid)
-                        
+                            mapped_mask |= mask_data == cid
+
                         unmapped_mask = (~mapped_mask) & (~current_mask)
                         colored_mask[unmapped_mask] = (255, 0, 0)
 
@@ -1354,39 +1501,39 @@ class MultiTaskUNet(BaseTask):
                     # Add stats to xlabel for debugging
                     unique_vals = np.unique(mask_data[~current_mask])
                     ax.set_xlabel(
-                        f"min:{mask_data.min()} max:{mask_data.max()} uniq:{len(unique_vals)}", 
-                        fontsize="xx-small"
+                        f"min:{mask_data.min()} max:{mask_data.max()} uniq:{len(unique_vals)}",
+                        fontsize="xx-small",
                     )
 
                 else:
                     # Show regression output
                     img = item[col_idx].squeeze().clone().detach().cpu().numpy()
-                    
+
                     # Calculate channel index to retrieve the correct NoData mask
                     reg_ch_offset = row_idx - 3
                     ch_idx = 1 + (reg_ch_offset // 2)
                     current_mask = mask_nodata[col_idx, ch_idx]
-                    
+
                     valid_mask = ~current_mask
                     valid_pixels = img[valid_mask]
                     if len(valid_pixels) > 0:
                         vmin, vmax = np.percentile(valid_pixels, [2, 98])
                         if vmin == vmax:
-                             vmin, vmax = valid_pixels.min(), valid_pixels.max()
+                            vmin, vmax = valid_pixels.min(), valid_pixels.max()
                     else:
                         vmin, vmax = None, None
-                    
+
                     img_masked = img.copy()
                     img_masked[current_mask] = np.nan
-                    
+
                     ax.imshow(img_masked, cmap=reg_cmap, vmin=vmin, vmax=vmax)
                     ax.set_title(f"{title}", fontsize="small")
-                    
+
                     if len(valid_pixels) > 0:
-                         ax.set_xlabel(
-                             f"min:{np.nanmin(img_masked):.1f} max:{np.nanmax(img_masked):.1f} mean:{np.nanmean(img_masked):.1f}", 
-                             fontsize="xx-small"
-                         )
+                        ax.set_xlabel(
+                            f"min:{np.nanmin(img_masked):.1f} max:{np.nanmax(img_masked):.1f} mean:{np.nanmean(img_masked):.1f}",
+                            fontsize="xx-small",
+                        )
 
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
@@ -1458,6 +1605,3 @@ class MultiTaskUNet(BaseTask):
         ax.set_title("Confusion Matrix")
         plt.tight_layout()
         return fig
-
-    def forward(self, x):
-        return self.model(x)
