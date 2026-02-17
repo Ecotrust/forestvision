@@ -813,13 +813,7 @@ class MultiTaskUNet(BaseTask):
         """Compute multi-task loss (Focal for classification + L1 for regression)."""
         # Use hparams ignore_index if not provided
         if ignore_index is None:
-            ignore_index = self.hparams.get("ignore_index", -1)
-
-        # Ensure logits and y have matching spatial dimensions
-        if logits.shape[2:] != y.shape[2:]:
-            logits = F.interpolate(
-                logits, size=y.shape[2:], mode="bilinear", align_corners=False
-            )
+            ignore_index = self.hparams.get("ignore_index")
 
         # Derive class counts from hparams
         num_seg = self.hparams["num_seg_classes"]  # Segmentation classes
@@ -935,13 +929,13 @@ class MultiTaskUNet(BaseTask):
         """Training step for classification."""
         x, y = batch["image"], batch["mask"].long()
 
-        # Sanitize target: remap all negative values to ignore_index
-        # This prevents large negative NoData values (e.g. -2147483648) from crashing torchmetrics
-        ignore_idx = self.hparams.get("ignore_index", -1)
-        if ignore_idx is not None:
-            y[y < 0] = ignore_idx
+        ignore_idx = self.hparams.get("ignore_index")
 
-        y_logits = self(x)  # Model outputs logits
+        y_logits = self(x)  
+        if y_logits.shape[2:] != y.shape[2:]:
+            y_logits = F.interpolate(
+                y_logits, size=y.shape[2:], mode="bilinear", align_corners=False
+            )
 
         loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
@@ -953,39 +947,7 @@ class MultiTaskUNet(BaseTask):
         ft_probs = ft_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
 
-        # Resize predictions to match target spatial dimensions before metrics computation
-        target_h, target_w = y[:, 0, :, :].shape[1:]
-
-        if ft_pred.shape[1:] != (target_h, target_w):
-            # Reshape for interpolation: [batch, 1, h, w]
-            ft_pred_resized = (
-                F.interpolate(
-                    ft_pred.unsqueeze(1).float(),
-                    size=(target_h, target_w),
-                    mode="nearest",
-                )
-                .squeeze(1)
-                .long()
-            )
-        else:
-            ft_pred_resized = ft_pred
-
-        # Sanitize predictions at target resolution before metrics
-        if ignore_idx is not None:
-            ft_pred_resized = ft_pred_resized.clone()
-            ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
-
-        if fa_logits.shape[2:] != (target_h, target_w):
-            fa_logits_resized = F.interpolate(
-                fa_logits,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            fa_logits_resized = fa_logits
-
-        seg_metrics = self.seg_train_metrics(ft_pred_resized, y[:, 0, :, :])
+        seg_metrics = self.seg_train_metrics(ft_pred, y[:, 0, :, :])
         self.log_dict(seg_metrics, on_epoch=True, sync_dist=True)
 
         # Handle variable regression targets for metrics
@@ -997,12 +959,12 @@ class MultiTaskUNet(BaseTask):
 
             # Only calculate regression metrics for available channels
             y_reg = y[:, 1:, :]
-            y_hat_reg = fa_logits_resized[:, :num_regression_targets, :]
+            y_hat_reg = fa_logits[:, :num_regression_targets, :]
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_train_metrics(
                 y_hat_reg[~mask_reg].flatten(),
-                y_reg[~mask_reg].flatten(),
+                y_reg[~mask_reg].float().flatten(),
             )
             self.log_dict(reg_metrics, on_epoch=True, sync_dist=True)
 
@@ -1012,12 +974,19 @@ class MultiTaskUNet(BaseTask):
         """Validation step for classification."""
         x, y = batch["image"], batch["mask"].long()
 
-        # Sanitize target: remap all negative values to ignore_index
-        ignore_idx = self.hparams.get("ignore_index", -1)
-        if ignore_idx is not None:
-            y[y < 0] = ignore_idx
+        # print channel-wise min/max for debugging
+        print(f"Validation Step - Target shape: {y.shape}")
+        for c in range(y.shape[1]):
+            print(f"Channel {c} - min: {y[:, c].min().item()} max: {y[:, c].max().item()}")
+
+        ignore_idx = self.hparams.get("ignore_index")
 
         y_logits = self(x)  # Model outputs logits
+        if y_logits.shape[2:] != y.shape[2:]:
+            y_logits = F.interpolate(
+                y_logits, size=y.shape[2:], mode="bilinear", align_corners=False
+            )
+
 
         loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("val_loss", loss, on_epoch=True, sync_dist=True)
@@ -1028,37 +997,7 @@ class MultiTaskUNet(BaseTask):
         ft_probs = ft_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
 
-        # Resize predictions to match target spatial dimensions before metrics computation
-        target_h, target_w = y[:, 0, :, :].shape[1:]
-        if ft_pred.shape[1:] != (target_h, target_w):
-            ft_pred_resized = (
-                F.interpolate(
-                    ft_pred.unsqueeze(1).float(),
-                    size=(target_h, target_w),
-                    mode="nearest",
-                )
-                .squeeze(1)
-                .long()
-            )
-        else:
-            ft_pred_resized = ft_pred
-
-        # Sanitize predictions at target resolution before metrics
-        if ignore_idx is not None:
-            ft_pred_resized = ft_pred_resized.clone()
-            ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
-
-        if fa_logits.shape[2:] != (target_h, target_w):
-            fa_logits_resized = F.interpolate(
-                fa_logits,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            fa_logits_resized = fa_logits
-
-        seg_metrics = self.seg_val_metrics(ft_pred_resized, y[:, 0, :, :])
+        seg_metrics = self.seg_val_metrics(ft_pred, y[:, 0, :, :])
         self.log_dict(seg_metrics, on_epoch=True, sync_dist=True)
 
         # Handle variable regression targets for metrics
@@ -1070,29 +1009,36 @@ class MultiTaskUNet(BaseTask):
 
             # Only calculate regression metrics for available channels
             y_reg = y[:, 1:, :]
-            y_hat_reg = fa_logits_resized[:, :num_regression_targets, :]
+            y_hat_reg = fa_logits[:, :num_regression_targets, :]
+            # Clamp predictions to target min and max range
+            y_hat_reg = torch.clamp(y_hat_reg, -5, 5) 
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_val_metrics(
                 y_hat_reg[~mask_reg].flatten(),
-                y_reg[~mask_reg].flatten(),
+                y_reg[~mask_reg].float().flatten(),
             )
             self.log_dict(reg_metrics, on_epoch=True, sync_dist=True)
 
-        self.confusion_matrix.update(ft_pred_resized, y[:, 0, :, :])
+        self.confusion_matrix.update(ft_pred, y[:, 0, :, :])
 
         # Ensure prediction concatenation matches available regression outputs
         preds = torch.cat(
-            [ft_pred_resized.unsqueeze(1), fa_logits_resized[:, :num_regression_targets, :]], dim=1
+            [ft_pred.unsqueeze(1), y_hat_reg], dim=1
         )
         
         # Sanitize batch predictions for plotting
-        if ignore_idx is not None:
-            mask_data = (y[:, 0:1] == ignore_idx)
-            preds[mask_data.expand_as(preds)] = float(ignore_idx)
+        # if ignore_idx is not None:
+        #     mask_data = (y[:, 0:1] == ignore_idx)
+        #     preds[mask_data.expand_as(preds)] = float(ignore_idx)
             
         batch["prediction"] = preds
         self.validation_step_outputs.append(batch)
+
+        y_reg_float = y_reg.float()
+        print(f"y_reg min: {y_reg_float[~mask_reg].min()}, max: {y_reg_float[~mask_reg].max()}, mean: {y_reg_float[~mask_reg].mean()}")
+        print(f"y_hat_reg min: {y_hat_reg[~mask_reg].min().item()}, max: {y_hat_reg[~mask_reg].max().item()}, mean: {y_hat_reg[~mask_reg].mean().item()}")
+
 
     def test_step(self, batch, batch_idx):
         """Test step for multi-task."""
@@ -1100,8 +1046,8 @@ class MultiTaskUNet(BaseTask):
         
         # Sanitize target: remap all negative values to ignore_index
         ignore_idx = self.hparams.get("ignore_index", -1)
-        if ignore_idx is not None:
-            y[y < 0] = ignore_idx
+        # if ignore_idx is not None:
+        #     y[y < 0] = ignore_idx
             
         y_logits = self(x)  # Model outputs logits
 
@@ -1115,36 +1061,36 @@ class MultiTaskUNet(BaseTask):
         ft_pred = torch.argmax(ft_probs, dim=1)
 
         # Resize predictions to match target spatial dimensions before metrics computation
-        target_h, target_w = y[:, 0, :, :].shape[1:]
-        if ft_pred.shape[1:] != (target_h, target_w):
-            ft_pred_resized = (
-                F.interpolate(
-                    ft_pred.unsqueeze(1).float(),
-                    size=(target_h, target_w),
-                    mode="nearest",
-                )
-                .squeeze(1)
-                .long()
-            )
-        else:
-            ft_pred_resized = ft_pred
+        # target_h, target_w = y[:, 0, :, :].shape[1:]
+        # if ft_pred.shape[1:] != (target_h, target_w):
+        #     ft_pred_resized = (
+        #         F.interpolate(
+        #             ft_pred.unsqueeze(1).float(),
+        #             size=(target_h, target_w),
+        #             mode="nearest",
+        #         )
+        #         .squeeze(1)
+        #         .long()
+        #     )
+        # else:
+        #     ft_pred_resized = ft_pred
 
-        # Sanitize predictions at target resolution before metrics
-        if ignore_idx is not None:
-            ft_pred_resized = ft_pred_resized.clone()
-            ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
+        # # Sanitize predictions at target resolution before metrics
+        # if ignore_idx is not None:
+        #     ft_pred_resized = ft_pred_resized.clone()
+        #     ft_pred_resized[y[:, 0] == ignore_idx] = ignore_idx
 
-        if fa_logits.shape[2:] != (target_h, target_w):
-            fa_logits_resized = F.interpolate(
-                fa_logits,
-                size=(target_h, target_w),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            fa_logits_resized = fa_logits
+        # if fa_logits.shape[2:] != (target_h, target_w):
+        #     fa_logits_resized = F.interpolate(
+        #         fa_logits,
+        #         size=(target_h, target_w),
+        #         mode="bilinear",
+        #         align_corners=False,
+        #     )
+        # else:
+        #     fa_logits_resized = fa_logits
 
-        seg_metrics = self.seg_test_metrics(ft_pred_resized, y[:, 0, :, :])
+        seg_metrics = self.seg_test_metrics(ft_pred, y[:, 0, :, :])
         self.log_dict(seg_metrics, sync_dist=True)
 
         # Handle variable regression targets for metrics
@@ -1156,12 +1102,12 @@ class MultiTaskUNet(BaseTask):
 
             # Only calculate regression metrics for available channels
             y_reg = y[:, 1:, :]
-            y_hat_reg = fa_logits_resized[:, :num_regression_targets, :]
+            y_hat_reg = fa_logits[:, :num_regression_targets, :]
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_test_metrics(
                 y_hat_reg[~mask_reg].flatten(),
-                y_reg[~mask_reg].flatten(),
+                y_reg[~mask_reg].float().flatten(),
             )
             self.log_dict(reg_metrics, sync_dist=True)
 
