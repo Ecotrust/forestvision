@@ -773,6 +773,28 @@ class MultiTaskUNet(BaseTask):
     input_stats: dict = None
     target_stats: dict = None
 
+    def crop_to_match(self, tensor: torch.Tensor, target_shape: tuple[int, int]) -> torch.Tensor:
+        """Center crop tensor to match target spatial dimensions.
+        
+        Args:
+            tensor: Input tensor of shape [B, C, H, W]
+            target_shape: Tuple of (target_h, target_w)
+        
+        Returns:
+            Cropped tensor of shape [B, C, target_h, target_w]
+        """
+        _, _, h, w = tensor.shape
+        target_h, target_w = target_shape
+        
+        if h == target_h and w == target_w:
+            return tensor
+        
+        # Calculate center crop positions
+        top = (h - target_h) // 2
+        left = (w - target_w) // 2
+        
+        return tvF.crop(tensor, top=top, left=left, height=target_h, width=target_w)
+
     def __init__(
         self,
         in_channels: int = 3,
@@ -932,10 +954,9 @@ class MultiTaskUNet(BaseTask):
         ignore_idx = self.hparams.get("ignore_index")
 
         y_logits = self(x)  
-        if y_logits.shape[2:] != y.shape[2:]:
-            y_logits = F.interpolate(
-                y_logits, size=y.shape[2:], mode="bilinear", align_corners=False
-            )
+        # Crop target to match logits shape (avoids interpolation artifacts on predictions)
+        if y.shape[2:] != y_logits.shape[2:]:
+            y = self.crop_to_match(y, y_logits.shape[2:])
 
         loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
@@ -974,19 +995,12 @@ class MultiTaskUNet(BaseTask):
         """Validation step for classification."""
         x, y = batch["image"], batch["mask"].long()
 
-        # print channel-wise min/max for debugging
-        print(f"Validation Step - Target shape: {y.shape}")
-        for c in range(y.shape[1]):
-            print(f"Channel {c} - min: {y[:, c].min().item()} max: {y[:, c].max().item()}")
-
         ignore_idx = self.hparams.get("ignore_index")
 
         y_logits = self(x)  # Model outputs logits
-        if y_logits.shape[2:] != y.shape[2:]:
-            y_logits = F.interpolate(
-                y_logits, size=y.shape[2:], mode="bilinear", align_corners=False
-            )
-
+        # Crop target to match logits shape (avoids interpolation artifacts on predictions)
+        if y.shape[2:] != y_logits.shape[2:]:
+            y = self.crop_to_match(y, y_logits.shape[2:])
 
         loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("val_loss", loss, on_epoch=True, sync_dist=True)
@@ -1046,10 +1060,11 @@ class MultiTaskUNet(BaseTask):
         
         # Sanitize target: remap all negative values to ignore_index
         ignore_idx = self.hparams.get("ignore_index", -1)
-        # if ignore_idx is not None:
-        #     y[y < 0] = ignore_idx
             
         y_logits = self(x)  # Model outputs logits
+        # Crop target to match logits shape (avoids interpolation artifacts on predictions)
+        if y.shape[2:] != y_logits.shape[2:]:
+            y = self.crop_to_match(y, y_logits.shape[2:])
 
         loss = self.compute_loss(y, y_logits, ignore_idx)
         self.log("test_loss", loss, on_epoch=True, sync_dist=True)
@@ -1195,7 +1210,11 @@ class MultiTaskUNet(BaseTask):
         ignore_idx = self.hparams.get("ignore_index", -1)
         y = y.clone()
         y[y < 0] = ignore_idx
-        
+
+        # Crop y to match y_hat shape if needed (handles shape mismatch from UNet output)
+        if y_hat is not None and y.shape[2:] != y_hat.shape[2:]:
+            y = self.crop_to_match(y, y_hat.shape[2:])
+
         # Create persistent boolean masks for visualization [B, C, H, W]
         # We track nodata per-channel to handle mismatched NoData patterns in MultiTask
         mask_nodata = (y == ignore_idx).detach().cpu().numpy()
@@ -1203,7 +1222,7 @@ class MultiTaskUNet(BaseTask):
         # Sanitize y_hat for plotting if not already done
         if y_hat is not None:
             y_hat = y_hat.clone()
-            # Mask y_hat using y's NoData mask (expanded to match y_hat channels if needed)
+            # Mask y_hat using y's NoData mask (now shapes match)
             y_hat[y == ignore_idx] = float(ignore_idx)
 
         x = revert(x, input_stats)
