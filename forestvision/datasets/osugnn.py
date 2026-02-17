@@ -61,7 +61,7 @@ class GNNForestAttr(RasterDataset):
     filename_glob = "*.tif"
     filename_regex = r"^(?P<band>\w+)_2021.tif$"
     separate_files = True
-    nodata = -2147483648 # if remapping, this will be updated to -1 in __getitem__
+    nodata = -2147483648 # if remapping, this will be updated to -999 in __getitem__
     all_bands = [
         "fortypba",
         "cancov",
@@ -227,13 +227,13 @@ class GNNForestAttr(RasterDataset):
 
             # Apply remapping FIRST (before transforms)
             if self.remap and "fortypba" in self.bands:
-                true_nodata = self.nodata
-                self.nodata = -1
+                # true_nodata = self.nodata
+                # mask_nodata = sample["mask"] == true_nodata
+                mask_negative = sample["mask"] < 0 
+                # self.nodata = nodata
                 fortypba_idx = self.bands.index("fortypba")
-                mask_nodata = sample["mask"] == true_nodata
-                mask_negative = (sample["mask"] < 0) 
-                sample["mask"][mask_negative] = 0
-                sample["mask"][mask_nodata] = self.nodata
+                sample["mask"][mask_negative] = self.nodata
+                # sample["mask"][mask_nodata] = self.nodata
 
                 if sample["mask"].ndim == 2:
                     # Single band case: shape is (H, W)

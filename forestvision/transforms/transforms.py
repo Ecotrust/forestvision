@@ -956,51 +956,38 @@ class CombineGNNDWMask:
             Modified sample with refined fortypba (band 0) based on DW labels,
             while preserving bands 1-3 unchanged.
         """
+        nodata = -2147483648.0
         # GNN mask: (4, H, W) - bands: fortypba, cancov, qmd_dom, ba_ge_3
-        gnn_mask = sample["mask"].clone() 
-        dim = gnn_mask.dim()
-        if dim == 2:
-            # If mask is (H, W), add channel dimension: (H, W) -> (1, H, W)
+        gnn_mask = sample["mask"]
+        # Ensure channel dimension exists: (H, W) -> (1, H, W)
+        if gnn_mask.dim() == 2:
             gnn_mask = gnn_mask.unsqueeze(0)
-   
-        # Fetch corresponding DW data using bbox from GNN sample
-        bbox = sample["bounds"]
-        dw_sample = self.dw[bbox]
-        dw_mask = dw_sample["mask"].squeeze(0) 
 
-        # Extract fortypba (band 0) for masking logic
+        # Fetch DW data and extract fortypba for classification
+        dw_mask = self.dw[sample["bounds"]]["mask"].squeeze(0)
         fortypba = gnn_mask[0].clone()
 
-        # Apply masking logic based on DW labels
-        # Non-forest from DW classes 4, 6, 7, 8
-        nf_msk = (dw_mask == 2) | (dw_mask == 7) | (dw_mask == 8)
-        urb_msk = dw_mask == 6
-        # Shrub and grass from DW classes 2, 5
-        shr_msk = (dw_mask == 5) 
-        # Water from DW class 0
-        wt = dw_mask == 0
-        # Nullify areas of disagreement between GNN and DW
-        # - GNN says shrub (1) but DW doesn't say shrub (5)
-        # - GNN says forest (>1) but DW doesn't say forest (1)
-        null_msk = ((fortypba == 1) & (dw_mask != 5)) | ((fortypba > 1) & (dw_mask != 1))
-
-        # Apply classifications
-        fortypba[wt] = 14
-        fortypba[nf_msk] = 0
-        fortypba[shr_msk] = 1
-        fortypba[null_msk] = -1 # nodata
-        fortypba[urb_msk] = -1 
+        # DW class definitions
+        DW_WATER, DW_FOREST, DW_SHRUB = 0, 1, 5
+        DW_NONFOREST = torch.isin(dw_mask, torch.tensor([7, 8]))
         
+        # Disagreement masks
+        # nullify = (fortypba > 1) & (~torch.isin(dw_mask, torch.tensor([DW_FOREST, DW_SHRUB])))
 
-        # Update band 0 in the GNN mask, preserve bands 1-3
-        if dim == 2:
-            sample["mask"] = fortypba.unsqueeze(0)  # Restore (1, H, W)
+        # Apply classifications (order matters)
+        # fortypba[nullify] = nodata
+        fortypba[dw_mask == 6] = nodata  # Urban
+        # fortypba[dw_mask == DW_SHRUB] = 1
+        fortypba[DW_NONFOREST] = 0
+        fortypba[dw_mask == DW_WATER] = 14
+
+        # Update output
+        if sample["mask"].dim() == 2:
+            sample["mask"] = fortypba.unsqueeze(0)
         else:
             gnn_mask[0] = fortypba
-            null_all = fortypba == -1
-            gnn_mask[:, null_all] = -1
-            gnn_mask[1:, nf_msk] = 0
-            gnn_mask[1:, wt] = 0
+            gnn_mask[1:, dw_mask == DW_WATER] = 0
+            gnn_mask[1:, DW_NONFOREST] = 0
             sample["mask"] = gnn_mask
 
         return sample
