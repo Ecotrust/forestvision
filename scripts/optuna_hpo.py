@@ -72,15 +72,7 @@ def get_search_space(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[s
         0.1, 
         0.7
     )
-    
-    search_space["seg_loss_weight"] = trial.suggest_float(
-        "seg_loss_weight", 
-        0.3, 
-        0.8
-    )
-    # Regression weight is complementary
-    search_space["reg_loss_weight"] = 1.0 - search_space["seg_loss_weight"]
-    
+   
     search_space["weight_decay"] = trial.suggest_float(
         "weight_decay", 
         1e-6, 
@@ -112,11 +104,45 @@ def get_search_space(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[s
         1.0,
         5.0
     )
-    
+
+    # Regression loss and uncertainty weighting hyperparameters
+    search_space["reg_loss"] = trial.suggest_categorical(
+        "reg_loss",
+        ["mae", "sharploss"]
+    )
+
+    search_space["sharploss_alpha"] = trial.suggest_float(
+        "sharploss_alpha",
+        0.0,
+        1.0
+    )
+
+    search_space["use_reg_tanh"] = trial.suggest_categorical(
+        "use_reg_tanh",
+        [True, False]
+    )
+
+    search_space["init_log_vars"] = trial.suggest_float(
+        "init_log_vars",
+        -1.0,
+        1.0
+    )
+
+    search_space["use_loss_normalization"] = trial.suggest_categorical(
+        "use_loss_normalization",
+        [True, False]
+    )
+
+    search_space["loss_norm_momentum"] = trial.suggest_float(
+        "loss_norm_momentum",
+        0.5,
+        0.99
+    )
+
     # Data hyperparameters
     search_space["batch_size"] = trial.suggest_categorical(
         "batch_size", 
-        [16, 24, 32, 36, 48, 64]
+        [24, 32, 36, 48]
     )
     
     # Architecture parameters (optional - more expensive to search)
@@ -142,13 +168,17 @@ def create_model_config(
     init_args.update({
         "lr": search_space["lr"],
         "dropout": search_space["dropout"],
-        "seg_loss_weight": search_space["seg_loss_weight"],
-        "reg_loss_weight": search_space["reg_loss_weight"],
         "weight_decay": search_space["weight_decay"],
         "scheduler_patience": search_space["scheduler_patience"],
         "scheduler_factor": search_space["scheduler_factor"],
         "focal_alpha": search_space["focal_alpha"],
         "focal_gamma": search_space["focal_gamma"],
+        "reg_loss": search_space["reg_loss"],
+        "sharploss_alpha": search_space["sharploss_alpha"],
+        # "use_uncertainty_weighting": search_space["use_uncertainty_weighting"],
+        "init_log_vars": search_space["init_log_vars"],
+        "use_loss_normalization": search_space["use_loss_normalization"],
+        "loss_norm_momentum": search_space["loss_norm_momentum"],
     })
     
     model_config["init_args"] = init_args
@@ -381,7 +411,6 @@ def save_best_config(study: optuna.Study, output_path: str, base_config: Dict[st
     
     # Get best hyperparameters
     best_params = study.best_params.copy()
-    best_params["reg_loss_weight"] = 1.0 - best_params["seg_loss_weight"]
     
     # Create complete config
     model_config = create_model_config(base_config, best_params)
