@@ -20,9 +20,11 @@ from torchgeo.trainers import BaseTask
 from kornia.enhance import Denormalize
 from segmentation_models_pytorch.losses import FocalLoss
 
+from forestvision.models.unet import MTUNet
+
 from ..models import UNet
 from ..datasets import minmax_scaling
-from ..losses import L1SSIMComboLoss, MultiTaskLossWrapper
+from ..losses import L1SSIMComboLoss, MultiTaskLossWrapper, SharpLoss
 
 
 class RegressionUNet(BaseTask):
@@ -833,7 +835,35 @@ class MultiTaskUNet(BaseTask):
         init_log_vars: float = 0.0,
         use_loss_normalization: bool = True,
         loss_norm_momentum: float = 0.9,
+        reg_loss: str = "mae",
+        sharploss_alpha: float = 0.5,
+        use_reg_tanh: bool = False,
     ):
+        """Multi-task UNet for simultaneous segmentation and regression.
+
+        Args:
+            in_channels: Number of input channels.
+            num_seg_classes: Number of segmentation classes (excluding ignore_index).
+            num_reg_targets: Number of regression targets (e.g. 1 for single continuous variable).
+            loss: Loss type for segmentation ("ce" or "focal").
+            lr: Learning rate for optimizer.
+            weight_decay: Weight decay for optimizer.
+            ignore_index: Index to ignore in loss and metrics.
+            dropout: Dropout rate for UNet.
+            scheduler_patience: Patience for ReduceLROnPlateau scheduler.
+            scheduler_factor: Factor for ReduceLROnPlateau scheduler.
+            focal_alpha: Alpha parameter for focal loss (if used).
+            focal_gamma: Gamma parameter for focal loss (if used).
+            labels: Optional dict mapping class indices to human-readable labels for visualization.
+            colormap: Optional dict mapping class indices to RGB color tuples for visualization. 
+            use_uncertainty_weighting: Whether to use homoscedastic uncertainty-based weighting of losses.
+            init_log_vars: Initial log variances for uncertainty weighting (if used).
+            use_loss_normalization: Whether to apply running average normalization to losses before weighting.
+            loss_norm_momentum: Momentum for updating running average of losses if normalization is used.
+            reg_loss: Loss type for regression ("mae", "mse", or "l1ssim").
+            sharploss_alpha: Alpha parameter for L1SSIMComboLoss if used for regression loss.  
+            use_reg_tanh: Whether to apply a tanh activation to the regression output.
+        """
         super().__init__()
         # Save hyperparameters, excluding visualization-only params
         self.save_hyperparameters(ignore=["labels", "colormap"])
@@ -850,14 +880,17 @@ class MultiTaskUNet(BaseTask):
     def configure_models(self):
         """Initialize the UNet model for classification."""
         # Compute total output channels from explicit parameters
-        num_classes = self.hparams["num_seg_classes"] + self.hparams["num_reg_targets"]
-        self.model = UNet(
+        num_seg_classes = self.hparams["num_seg_classes"]
+        num_reg_targets = self.hparams["num_reg_targets"]
+        self.model = MTUNet(
             in_channels=self.hparams["in_channels"],
-            out_channels=num_classes,
+            seg_channels=num_seg_classes,
+            reg_channels=num_reg_targets,
             dropout=self.hparams["dropout"],
+            use_tanh=self.hparams.get("use_reg_tanh", False),
         )
 
-    def compute_loss(self, y, logits, ignore_index=None):
+    def compute_loss(self, y, seg_logits, reg_out, ignore_index=None):
         """Compute multi-task loss using homoscedastic uncertainty weighting.
 
         Uses learnable task weights based on homoscedastic uncertainty to balance
@@ -865,6 +898,12 @@ class MultiTaskUNet(BaseTask):
 
         Optionally applies running average normalization to handle highly different
         loss scales between tasks.
+
+        Args:
+            y: Target tensor of shape [B, C, H, W] where C includes seg + reg channels.
+            seg_logits: Segmentation logits tensor of shape [B, num_seg_classes, H, W].
+            reg_out: Regression output tensor of shape [B, num_reg_targets, H, W].
+            ignore_index: Index to ignore in loss computation.
 
         Reference: Kendall et al., "Multi-Task Learning Using Uncertainty to Weigh
         Losses for Scene Geometry and Semantics", CVPR 2018.
@@ -874,12 +913,7 @@ class MultiTaskUNet(BaseTask):
             ignore_index = self.hparams.get("ignore_index")
 
         # Derive class counts from hparams
-        num_seg = self.hparams["num_seg_classes"]  # Segmentation classes
         num_reg = self.hparams["num_reg_targets"]  # Regression targets
-
-        # Split outputs: [B, num_seg + num_reg, H, W]
-        seg_logits = logits[:, :num_seg]  # [B, num_seg, H, W]
-        reg_logits = logits[:, num_seg : num_seg + num_reg]  # [B, num_reg, H, W]
 
         # Classification loss (FocalLoss returns scalar)
         seg_loss = self.focal_loss(seg_logits, y[:, 0].long())
@@ -887,17 +921,26 @@ class MultiTaskUNet(BaseTask):
         if num_reg > 0 and self.loss_wrapper is not None:
             # Regression loss with masking
             reg_target = y[:, 1 : num_reg + 1]  # [B, num_reg, H, W]
-            reg_loss_all = self.mae_loss(reg_logits, reg_target)  # [B, num_reg, H, W]
 
-            reg_mask = reg_target == ignore_index
-            reg_loss_valid = reg_loss_all[~reg_mask]
+            # Handle different regression loss types
+            if isinstance(self.reg_loss_fn, SharpLoss):
+                # SharpLoss handles masking internally and returns scalar
+                reg_mask = reg_target == ignore_index
+                reg_loss = self.reg_loss_fn(reg_out, reg_target, reg_mask)
+            else:
+                # MAE loss returns per-element losses, needs manual masking
+                reg_loss_all = self.reg_loss_fn(
+                    reg_out, reg_target
+                )  # [B, num_reg, H, W]
+                reg_mask = reg_target == ignore_index
+                reg_loss_valid = reg_loss_all[~reg_mask]
 
-            # Guard against fully masked batch
-            reg_loss = (
-                reg_loss_valid.mean()
-                if reg_loss_valid.numel() > 0
-                else torch.tensor(0.0, device=logits.device)
-            )
+                # Guard against fully masked batch
+                reg_loss = (
+                    reg_loss_valid.mean()
+                    if reg_loss_valid.numel() > 0
+                    else torch.tensor(0.0, device=reg_out.device)
+                )
 
             # Store raw losses for logging
             raw_losses = [seg_loss.detach(), reg_loss.detach()]
@@ -946,7 +989,18 @@ class MultiTaskUNet(BaseTask):
             reduction="mean",
             ignore_index=self.hparams.get("ignore_index", -1),
         )
-        self.mae_loss = nn.L1Loss(reduction="none")
+
+        # Regression loss selection
+        reg_loss_type = self.hparams.get("reg_loss", "mae")
+        if reg_loss_type == "mae":
+            self.reg_loss_fn = nn.L1Loss(reduction="none")
+        elif reg_loss_type == "sharploss":
+            self.reg_loss_fn = SharpLoss(alpha=self.hparams.get("sharploss_alpha", 0.5))
+        else:
+            raise ValueError(
+                f"Regression loss type '{reg_loss_type}' is not valid. "
+                "Currently, supports 'mae' or 'sharploss'."
+            )
 
         # Initialize homoscedastic uncertainty-based loss weighting
         if self.hparams.get("use_uncertainty_weighting", True):
@@ -1037,12 +1091,12 @@ class MultiTaskUNet(BaseTask):
 
         ignore_idx = self.hparams.get("ignore_index")
 
-        y_logits = self(x)
+        seg_logits, reg_out = self(x)
         # Crop target to match logits shape (avoids interpolation artifacts on predictions)
-        if y.shape[2:] != y_logits.shape[2:]:
-            y = self.crop_to_match(y, y_logits.shape[2:])
+        if y.shape[2:] != seg_logits.shape[2:]:
+            y = self.crop_to_match(y, seg_logits.shape[2:])
 
-        loss = self.compute_loss(y, y_logits, ignore_idx)
+        loss = self.compute_loss(y, seg_logits, reg_out, ignore_idx)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
 
         # Log uncertainty weights and raw losses
@@ -1050,11 +1104,7 @@ class MultiTaskUNet(BaseTask):
             for key, value in self._last_loss_logs.items():
                 self.log(f"train_{key}", value, on_epoch=True, sync_dist=True)
 
-        # Use explicit parameter for segmentation classes
-        num_seg = self.hparams["num_seg_classes"]
-        ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
-
-        ft_probs = ft_logits.softmax(dim=1)
+        ft_probs = seg_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
 
         seg_metrics = self.seg_train_metrics(ft_pred, y[:, 0, :, :])
@@ -1069,7 +1119,7 @@ class MultiTaskUNet(BaseTask):
 
             # Only calculate regression metrics for available channels
             y_reg = y[:, 1:, :]
-            y_hat_reg = fa_logits[:, :num_regression_targets, :]
+            y_hat_reg = reg_out[:, :num_regression_targets, :]
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_train_metrics(
@@ -1081,23 +1131,20 @@ class MultiTaskUNet(BaseTask):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step for classification."""
+        """Validation step for multi-task classification and regression."""
         x, y = batch["image"], batch["mask"].long()
 
         ignore_idx = self.hparams.get("ignore_index")
 
-        y_logits = self(x)  # Model outputs logits
+        seg_logits, reg_out = self(x)  # Model outputs tuple
         # Crop target to match logits shape (avoids interpolation artifacts on predictions)
-        if y.shape[2:] != y_logits.shape[2:]:
-            y = self.crop_to_match(y, y_logits.shape[2:])
+        if y.shape[2:] != seg_logits.shape[2:]:
+            y = self.crop_to_match(y, seg_logits.shape[2:])
 
-        loss = self.compute_loss(y, y_logits, ignore_idx)
+        loss = self.compute_loss(y, seg_logits, reg_out, ignore_idx)
         self.log("val_loss", loss, on_epoch=True, sync_dist=True)
 
-        # Use explicit parameter for segmentation classes
-        num_seg = self.hparams["num_seg_classes"]
-        ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
-        ft_probs = ft_logits.softmax(dim=1)
+        ft_probs = seg_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
 
         seg_metrics = self.seg_val_metrics(ft_pred, y[:, 0, :, :])
@@ -1112,7 +1159,7 @@ class MultiTaskUNet(BaseTask):
 
             # Only calculate regression metrics for available channels
             y_reg = y[:, 1:, :]
-            y_hat_reg = fa_logits[:, :num_regression_targets, :]
+            y_hat_reg = reg_out[:, :num_regression_targets, :]
             # Clamp predictions to target min and max range
             y_hat_reg = torch.clamp(y_hat_reg, -5, 5)
             mask_reg = mask[:, 1:, :]
@@ -1128,41 +1175,25 @@ class MultiTaskUNet(BaseTask):
         # Ensure prediction concatenation matches available regression outputs
         preds = torch.cat([ft_pred.unsqueeze(1), y_hat_reg], dim=1)
 
-        # Sanitize batch predictions for plotting
-        # if ignore_idx is not None:
-        #     mask_data = (y[:, 0:1] == ignore_idx)
-        #     preds[mask_data.expand_as(preds)] = float(ignore_idx)
-
         batch["prediction"] = preds
         self.validation_step_outputs.append(batch)
 
-        y_reg_float = y_reg.float()
-        print(
-            f"y_reg min: {y_reg_float[~mask_reg].min()}, max: {y_reg_float[~mask_reg].max()}, mean: {y_reg_float[~mask_reg].mean()}"
-        )
-        print(
-            f"y_hat_reg min: {y_hat_reg[~mask_reg].min().item()}, max: {y_hat_reg[~mask_reg].max().item()}, mean: {y_hat_reg[~mask_reg].mean().item()}"
-        )
-
     def test_step(self, batch, batch_idx):
-        """Test step for multi-task."""
+        """Test step for multi-task classification and regression."""
         x, y = batch["image"], batch["mask"].long()
 
         # Sanitize target: remap all negative values to ignore_index
         ignore_idx = self.hparams.get("ignore_index", -1)
 
-        y_logits = self(x)  # Model outputs logits
+        seg_logits, reg_out = self(x)  # Model outputs tuple
         # Crop target to match logits shape (avoids interpolation artifacts on predictions)
-        if y.shape[2:] != y_logits.shape[2:]:
-            y = self.crop_to_match(y, y_logits.shape[2:])
+        if y.shape[2:] != seg_logits.shape[2:]:
+            y = self.crop_to_match(y, seg_logits.shape[2:])
 
-        loss = self.compute_loss(y, y_logits, ignore_idx)
+        loss = self.compute_loss(y, seg_logits, reg_out, ignore_idx)
         self.log("test_loss", loss, on_epoch=True, sync_dist=True)
 
-        # Use explicit parameter for segmentation classes
-        num_seg = self.hparams["num_seg_classes"]
-        ft_logits, fa_logits = (y_logits[:, :num_seg], y_logits[:, num_seg:])
-        ft_probs = ft_logits.softmax(dim=1)
+        ft_probs = seg_logits.softmax(dim=1)
         ft_pred = torch.argmax(ft_probs, dim=1)
 
         seg_metrics = self.seg_test_metrics(ft_pred, y[:, 0, :, :])
@@ -1177,7 +1208,7 @@ class MultiTaskUNet(BaseTask):
 
             # Only calculate regression metrics for available channels
             y_reg = y[:, 1:, :]
-            y_hat_reg = fa_logits[:, :num_regression_targets, :]
+            y_hat_reg = reg_out[:, :num_regression_targets, :]
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_test_metrics(
@@ -1217,26 +1248,12 @@ class MultiTaskUNet(BaseTask):
             x (torch.Tensor): Input tensor of shape [B, C, H, W].
 
         Returns:
-            torch.Tensor: Output tensor of shape [B, num_seg_classes + num_reg_targets, H, W].
-                The segmentation channels (0 to num_seg_classes-1) contain raw logits.
-                The regression channels (num_seg_classes onwards) have Tanh activation
-                applied, binding outputs to normalized target range [-1, 1].
+            tuple[torch.Tensor, torch.Tensor]: Tuple of (seg_logits, reg_out).
+                - seg_logits: Segmentation logits of shape [B, num_seg_classes, H, W].
+                - reg_out: Regression outputs of shape [B, num_reg_targets, H, W]
+                  with Tanh activation applied (range [-1, 1]).
         """
-        logits = self.model(x)
-
-        # Split into segmentation and regression channels
-        num_seg = self.hparams["num_seg_classes"]
-        seg_logits = logits[:, :num_seg]  # Raw logits for segmentation
-        reg_logits = logits[:, num_seg:]  # Raw logits for regression
-
-        # Apply Tanh to regression outputs to bind to normalized target range.
-        # This acts as a regularizer for the shared backbone and ensures
-        # regression outputs are in the [-1, 1] range suitable for normalized targets.
-        # Tanh also helps align edge features, benefiting the segmentation branch.
-        reg_out = torch.tanh(reg_logits)
-
-        # Concatenate segmentation logits and regression outputs
-        return torch.cat([seg_logits, reg_out], dim=1)
+        return self.model(x)
 
     def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0], max_null_ratio=0.7):
         """Plot a sample of n images from batch for classification.
