@@ -128,6 +128,91 @@ class L1SSIMComboLoss(nn.Module):
         return l1_loss * self.w[0] + ssim_loss * self.w[1]
 
 
+class SharpLoss(nn.Module):
+    """
+    Sharpness-aware regression loss combining MAE with gradient-based edge loss.
+
+    This loss is particularly valuable for geospatial regression tasks where
+    boundary sharpness and edge preservation matter. The gradient component
+    encourages the model to match edge transitions in the target, while the
+    MAE component ensures overall intensity accuracy.
+
+    The gradient is computed using finite differences along spatial dimensions:
+    - dy: vertical gradients (height-1 comparisons)
+    - dx: horizontal gradients (width-1 comparisons)
+
+    Args:
+        alpha: Balance between MAE (1-alpha) and Gradient Loss (alpha).
+               Default: 0.5 (equal weighting)
+
+    Example:
+        >>> loss_fn = SharpLoss(alpha=0.6)
+        >>> pred = torch.randn(2, 1, 64, 64)
+        >>> target = torch.randn(2, 1, 64, 64)
+        >>> loss = loss_fn(pred, target)
+        >>> loss.backward()
+    """
+
+    def __init__(self, alpha: float = 0.5):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Compute sharpness-aware loss.
+
+        Args:
+            pred: Predicted tensor of shape [B, C, H, W]
+            target: Target tensor of shape [B, C, H, W]
+            mask: Optional boolean mask of shape [B, C, H, W] where True
+                  indicates pixels to ignore (e.g., nodata regions).
+                  Default: None
+
+        Returns:
+            torch.Tensor: Scalar loss value combining MAE and gradient loss
+        """
+        # 1. MAE Loss with optional masking
+        if mask is not None:
+            mae_all = F.l1_loss(pred, target, reduction="none")
+            mae_valid = mae_all[~mask]
+            mae_loss = (
+                mae_valid.mean()
+                if mae_valid.numel() > 0
+                else torch.tensor(0.0, device=pred.device)
+            )
+        else:
+            mae_loss = F.l1_loss(pred, target)
+
+        # 2. Gradient Loss (Edge Loss)
+        # Apply mask before gradient computation if provided by filling
+        # masked regions with target values to neutralize gradients
+        if mask is not None:
+            pred_clean = pred.clone()
+            # Ensure target is float for gradient computation
+            target_clean = target.float().clone()
+            pred_clean[mask] = target_clean[mask]
+        else:
+            # Ensure target is float for gradient computation
+            pred_clean = pred
+            target_clean = target.float()
+
+        # Calculate horizontal and vertical differences
+        # dy: vertical gradients [B, C, H-1, W]
+        dy_pred = torch.abs(pred_clean[:, :, 1:, :] - pred_clean[:, :, :-1, :])
+        dy_target = torch.abs(target_clean[:, :, 1:, :] - target_clean[:, :, :-1, :])
+
+        # dx: horizontal gradients [B, C, H, W-1]
+        dx_pred = torch.abs(pred_clean[:, :, :, 1:] - pred_clean[:, :, :, :-1])
+        dx_target = torch.abs(target_clean[:, :, :, 1:] - target_clean[:, :, :, :-1])
+
+        # Match the "sharpness" of the gradients
+        grad_loss = F.l1_loss(dy_pred, dy_target) + F.l1_loss(dx_pred, dx_target)
+
+        return (1 - self.alpha) * mae_loss + self.alpha * grad_loss
+
+
 if __name__ == "__main__":
 
     # Create dummy input and target tensors
