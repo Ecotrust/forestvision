@@ -8,17 +8,12 @@ import ee
 from dotenv import load_dotenv
 
 import torch
-from torchvision.transforms import v2
 
-from forestvision.datamodules.base import BaseGeoDataModule, DatasetConfig
+from forestvision.datamodules.base import BaseGeoDataModule
 from forestvision.datasets import (
     GNNForestAttr,
     GEESentinel2,
     GEE3Dep,
-)
-from forestvision.transforms import (
-    Normalize,
-    ReplaceNodataVal,
 )
 from forestvision.deploy import AnyRasterDataset
 
@@ -111,7 +106,7 @@ class ForTypesDataModule(BaseGeoDataModule):
     ) -> None:
         # Store download flag for use in prepare_data
         self.download = download
-        
+
         # Initialize Earth Engine
         ee_project = ee_project or GEE_PROJECT_NAME
         try:
@@ -127,20 +122,25 @@ class ForTypesDataModule(BaseGeoDataModule):
                     "dataset_class": GEESentinel2,
                     "path_template": "{stage}/geesentinel2/{year}",
                     "bands": GEESentinel2.all_bands,
-                    "kwargs": {"download": True}
+                    "kwargs": {"download": True},
                 },
                 {
                     "dataset_class": GEE3Dep,
                     "path_template": "{stage}/gee3dep/{year}",
                     "bands": ["elevation"],
-                    "kwargs": {"download": True, "res": 10}
+                    "kwargs": {"download": True, "res": 10},
                 },
                 {
                     "dataset_class": ClimateNA,
                     "path_template": "training/climatena",
                     "bands": ClimateNA.all_bands,
-                    "kwargs": {"glob": "*.tif", "res": 10, "is_image": True, "nodata": -9999}
-                }
+                    "kwargs": {
+                        "glob": "*.tif",
+                        "res": 10,
+                        "is_image": True,
+                        "nodata": -9999,
+                    },
+                },
             ]
 
         if target_datasets is None:
@@ -150,7 +150,7 @@ class ForTypesDataModule(BaseGeoDataModule):
                     "dataset_class": GNNForestAttr,
                     "path_template": target_path,
                     "bands": ["fortypba", "cancov", "qmd_dom", "ba_ge_3"],
-                    "kwargs": {"res": 10}
+                    "kwargs": {"res": 10},
                 }
             ]
 
@@ -182,9 +182,11 @@ class ForTypesDataModule(BaseGeoDataModule):
         if self.stats_path and os.path.exists(self.stats_path):
             self._load_stats_from_file()
         else:
-            logging.warning(f"Stats file not found at {self.stats_path}. Using identity normalization (mean=0, std=1).")
+            logging.warning(
+                f"Stats file not found at {self.stats_path}. Using identity normalization (mean=0, std=1)."
+            )
             self._set_identity_stats()
-        
+
         super().setup(stage, year)
 
     def _set_identity_stats(self):
@@ -195,10 +197,152 @@ class ForTypesDataModule(BaseGeoDataModule):
             # Use placeholder identity stats - actual channel count determined during data loading
             cfg.mean = [0.0]  # Will be expanded to match actual channels
             cfg.std = [1.0]
-        
+
         for cfg in self.target_configs:
             cfg.mean = [0.0]
             cfg.std = [1.0]
+
+    def _extract_selectbands_indices(self, transforms_config) -> Optional[List[int]]:
+        """Extract SelectBands indices from transform config (dict or object).
+
+        Args:
+            transforms_config: Transform configuration (dict with class_path or instantiated object)
+
+        Returns:
+            List of selected band indices, or None if no SelectBands found
+        """
+        from forestvision.transforms import SelectBands
+
+        # Handle dict config from YAML
+        if isinstance(transforms_config, dict):
+            class_path = transforms_config.get("class_path", "")
+            if "SelectBands" in class_path:
+                return transforms_config.get("init_args", {}).get("indices")
+            # Recurse into nested structures
+            for v in transforms_config.values():
+                if isinstance(v, (dict, list)):
+                    result = self._extract_selectbands_indices(v)
+                    if result is not None:
+                        return result
+
+        # Handle lists (e.g., Compose transforms)
+        if isinstance(transforms_config, list):
+            for item in transforms_config:
+                result = self._extract_selectbands_indices(item)
+                if result is not None:
+                    return result
+
+        # Handle instantiated objects
+        if hasattr(transforms_config, "transforms"):
+            for t in transforms_config.transforms:
+                if isinstance(t, SelectBands):
+                    return t.indices
+
+        return None
+
+    def _get_appended_bands(self, transforms_config) -> List[str]:
+        """Get names of bands appended by transforms like AppendNDVI.
+
+        Args:
+            transforms_config: Transform configuration dict or list
+
+        Returns:
+            List of appended band names
+        """
+        appended = []
+
+        # Map of transform class names to their band names
+        APPEND_BANDS = {
+            "AppendNDVI": "NDVI",
+            "AppendSAVI": "SAVI",
+            "AppendEVI": "EVI",
+            "AppendNBR": "NBR",
+            "AppendNIRv": "NIRv",
+            "AppendMSAVI": "MSAVI",
+        }
+
+        if isinstance(transforms_config, dict):
+            class_path = transforms_config.get("class_path", "")
+            for append_class, band_name in APPEND_BANDS.items():
+                if append_class in class_path:
+                    appended.append(band_name)
+            # Recurse into nested structures
+            for v in transforms_config.values():
+                if isinstance(v, (dict, list)):
+                    appended.extend(self._get_appended_bands(v))
+
+        elif isinstance(transforms_config, list):
+            for item in transforms_config:
+                appended.extend(self._get_appended_bands(item))
+
+        return appended
+
+    def _log_actual_bands(self):
+        """Log the actual bands that will be used after SelectBands transform.
+
+        This builds a cumulative band list accounting for per-dataset transforms
+        that append bands, then maps SelectBands indices back to their source datasets.
+        """
+        # Step 1: Extract SelectBands indices from input_transforms
+        select_indices = self._extract_selectbands_indices(self.input_transforms)
+
+        # Step 2: Build cumulative band list across all input datasets
+        cumulative_bands = []
+        dataset_ranges = (
+            []
+        )  # Track (start_idx, end_idx, dataset_name, bands) for each dataset
+
+        for cfg in self.input_configs:
+            start_idx = len(cumulative_bands)
+
+            # Get base bands from config
+            bands = list(cfg.bands) if cfg.bands else []
+
+            # Check for band-appending transforms in cfg._original_transforms
+            # These add bands AFTER the base bands (e.g., AppendNDVI adds 1 band)
+            if hasattr(cfg, "_original_transforms") and cfg._original_transforms:
+                bands.extend(self._get_appended_bands(cfg._original_transforms))
+
+            cumulative_bands.extend(bands)
+
+            end_idx = len(cumulative_bands)
+            dataset_ranges.append(
+                {
+                    "name": cfg.dataset_class.__name__,
+                    "start": start_idx,
+                    "end": end_idx,
+                    "bands": bands,
+                }
+            )
+
+        # Step 3: Map selected indices back to datasets and log
+        if select_indices is not None:
+            # Group selected bands by source dataset
+            selected_by_dataset = {ds["name"]: [] for ds in dataset_ranges}
+
+            for idx in select_indices:
+                for ds_range in dataset_ranges:
+                    if ds_range["start"] <= idx < ds_range["end"]:
+                        band_name = ds_range["bands"][idx - ds_range["start"]]
+                        selected_by_dataset[ds_range["name"]].append(band_name)
+                        break
+
+            # Log the results
+            total_channels = 0
+            for ds_range in dataset_ranges:
+                ds_name = ds_range["name"]
+                selected = selected_by_dataset[ds_name]
+                total_channels += len(selected)
+                logging.info(f"  - {ds_name}: {len(selected)} bands {selected}")
+
+            logging.info(f"Total input channels after SelectBands: {total_channels}")
+        else:
+            # No SelectBands - log all bands
+            for ds_range in dataset_ranges:
+                logging.info(
+                    f"  - {ds_range['name']}: {len(ds_range['bands'])} bands {ds_range['bands']}"
+                )
+            logging.info(f"Total input channels: {len(cumulative_bands)}")
 
     def _load_stats_from_file(self):
         """Load JSON stats and populate transforms."""
@@ -235,7 +379,7 @@ class ForTypesDataModule(BaseGeoDataModule):
                 self.input_transforms = self._populate_normalize_stats(
                     self.input_transforms, all_means, all_stds
                 )
-                
+
                 # Update aggregated stats to match final selected bands for model hparams
                 # Search for Normalize transform in the chain (handles both dict and objects)
                 def get_norm_stats(obj):
@@ -245,19 +389,22 @@ class ForTypesDataModule(BaseGeoDataModule):
                             return ia.get("mean"), ia.get("std")
                         for v in obj.values():
                             res = get_norm_stats(v)
-                            if res: return res
+                            if res:
+                                return res
                     elif isinstance(obj, list):
                         for item in obj:
                             res = get_norm_stats(item)
-                            if res: return res
+                            if res:
+                                return res
                     elif hasattr(obj, "mean") and hasattr(obj, "std"):
                         return obj.mean, obj.std
                     elif hasattr(obj, "transforms"):
                         for t in obj.transforms:
                             res = get_norm_stats(t)
-                            if res: return res
+                            if res:
+                                return res
                     return None
-                
+
                 stats_pair = get_norm_stats(self.input_transforms)
                 if stats_pair and stats_pair[0] is not None:
                     self.input_stats["mean"] = torch.tensor(stats_pair[0])
@@ -265,9 +412,11 @@ class ForTypesDataModule(BaseGeoDataModule):
 
             if self.target_transforms:
                 self.target_transforms = self._populate_normalize_stats(
-                    self.target_transforms, target_json.get("mean"), target_json.get("std")
+                    self.target_transforms,
+                    target_json.get("mean"),
+                    target_json.get("std"),
                 )
-                
+
                 # Same for target stats
                 stats_pair = get_norm_stats(self.target_transforms)
                 if stats_pair and stats_pair[0] is not None:
@@ -277,8 +426,19 @@ class ForTypesDataModule(BaseGeoDataModule):
             self.hparams["input_stats"] = self._serialize_stats(self.input_stats)
             self.hparams["target_stats"] = self._serialize_stats(self.target_stats)
 
-            logging.info(f"Successfully loaded statistics: {len(all_means)} input channels")
-            
+            logging.info(
+                f"Successfully loaded statistics: {len(all_means)} input channels"
+            )
+
+            # Log actual bands after SelectBands transform
+            self._log_actual_bands()
+
+            # Log target bands (no SelectBands for targets typically)
+            for cfg in self.target_configs:
+                logging.info(
+                    f"  - {cfg.dataset_class.__name__}: {len(cfg.bands)} bands {cfg.bands}"
+                )
+
         except Exception as e:
             logging.error(f"Failed to load statistics: {e}")
             raise
