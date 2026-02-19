@@ -24,7 +24,7 @@ from forestvision.models.unet import MTUNet
 
 from ..models import UNet
 from ..datasets import minmax_scaling
-from ..losses import L1SSIMComboLoss, MultiTaskLossWrapper, SharpLoss, HomoscedasticUncertaintyLoss
+from ..losses import L1SSIMComboLoss, SharpLoss, HomoscedasticUncertaintyLoss
 
 
 class RegressionUNet(BaseTask):
@@ -74,7 +74,7 @@ class RegressionUNet(BaseTask):
         elif loss == "mae":
             self.criterion: nn.Module = nn.L1Loss(reduction="none")
         elif loss == "l1ssim":
-            self.criterion: nn.Module = L1SSIMComboLoss()
+            self.criterion: nn.Module = L1SSIMComboLoss(w=self.hparams.get("l1ssim_w", [1, 1]))
         else:
             raise ValueError(
                 f"Loss type '{loss}' is not valid. "
@@ -836,6 +836,7 @@ class MultiTaskUNet(BaseTask):
         use_loss_normalization: bool = True,
         loss_norm_momentum: float = 0.9,
         reg_loss: str = "mae",
+        ssim_w: float = None,
         sharploss_alpha: float = 0.5,
         use_reg_tanh: bool = False,
     ):
@@ -861,6 +862,7 @@ class MultiTaskUNet(BaseTask):
             use_loss_normalization: Whether to apply running average normalization to losses before weighting.
             loss_norm_momentum: Momentum for updating running average of losses if normalization is used.
             reg_loss: Loss type for regression ("mae", "mse", or "l1ssim").
+            ssim_w: Weight for SSIM component in L1SSIMComboLoss if used for regression loss.
             sharploss_alpha: Alpha parameter for L1SSIMComboLoss if used for regression loss.  
             use_reg_tanh: Whether to apply a tanh activation to the regression output.
         """
@@ -936,6 +938,10 @@ class MultiTaskUNet(BaseTask):
                 # Handle different regression loss types
                 if isinstance(self.reg_loss_fn, SharpLoss):
                     # SharpLoss handles masking internally and returns scalar
+                    reg_mask = reg_target_i == ignore_index
+                    reg_loss_i = self.reg_loss_fn(reg_out_i, reg_target_i, reg_mask)
+                elif isinstance(self.reg_loss_fn, L1SSIMComboLoss):
+                    # L1SSIMComboLoss handles masking internally and returns scalar
                     reg_mask = reg_target_i == ignore_index
                     reg_loss_i = self.reg_loss_fn(reg_out_i, reg_target_i, reg_mask)
                 else:
@@ -1018,10 +1024,14 @@ class MultiTaskUNet(BaseTask):
             self.reg_loss_fn = nn.L1Loss(reduction="none")
         elif reg_loss_type == "sharploss":
             self.reg_loss_fn = SharpLoss(alpha=self.hparams.get("sharploss_alpha", 0.5))
+        elif reg_loss_type == "l1ssim":
+            ssim_w = self.hparams.get('ssim_w', 0.5)
+            l1_w = 1 - ssim_w
+            self.reg_loss_fn = L1SSIMComboLoss(w=[l1_w, ssim_w])
         else:
             raise ValueError(
                 f"Regression loss type '{reg_loss_type}' is not valid. "
-                "Currently, supports 'mae' or 'sharploss'."
+                "Currently, supports 'mae', 'sharploss', or 'ssim'."
             )
 
         # Initialize homoscedastic uncertainty-based loss weighting
