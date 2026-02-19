@@ -13,22 +13,33 @@ model:
     num_seg_classes: 15  # Segmentation classes (NF + Water + 13 forest types)
     num_reg_targets: 3   # Regression targets (0 - 3)
     loss: "focal"
-    ignore_index: -2147483648
-    lr: 0.0001
-    dropout: 0.5
-    # seg_loss_weight: 0.6
-    weight_decay: 0.0001
+    # lr: 0.004600216969734407
+    # dropout: 0.21625512195259877
+    # weight_decay: 2.2988074881141243e-05
+    # scheduler_patience: 4
+    # scheduler_factor: 0.11788464636738039
+    # focal_alpha: 0.9274758030302558
+    # focal_gamma: 3.609833765630662
+    # reg_loss: sharploss
+    # sharploss_alpha: 0.661701233740305
+    # use_reg_tanh: False
+    # init_log_vars: 0.5319290553835152
+    # use_loss_normalization: True
+    # loss_norm_momentum: 0.8717541653445785
+    lr: 0.001980377349249981
+    dropout: 0.500347366287181
+    weight_decay: 5.656146765126758e-05
     scheduler_patience: 3
-    scheduler_factor: 0.5
-    focal_alpha: 1
-    focal_gamma: 2
-    init_log_vars: 0.0
-    loss_norm_momentum: 0.9
-    use_uncertainty_weighting: true
-    # Regression loss selection: "mae" or "sharploss"
-    reg_loss: "sharploss"
-    sharploss_alpha: 0.5
+    scheduler_factor: 0.6059236710555266
+    focal_alpha: 0.9903905684609642
+    focal_gamma: 3.1543006944754373
+    reg_loss: mae
+    sharploss_alpha: 0.3309128418068148
+    init_log_vars: 0.2010758351200626
+    use_loss_normalization: True
+    loss_norm_momentum: 0.989119701229876
     use_reg_tanh: false # Whether to apply tanh activation to regression outputs (to bound them within a range, e.g., for TD which is typically between 0 and 30)
+    ignore_index: -2147483648
     labels:
       0: NF       # Non-forest
       1: shr      # Shrub
@@ -67,7 +78,7 @@ data:
   init_args:
     root: data/
     year: 2021
-    batch_size: 36
+    batch_size: 48
     patch_size: 120
     stats_path: dev/configs/gnn_v1/osugnn_v1_stats.json
     train_tiles_path: dev/tiles/train_test_120p10m.geojson
