@@ -24,7 +24,7 @@ from forestvision.models.unet import MTUNet
 
 from ..models import UNet
 from ..datasets import minmax_scaling
-from ..losses import L1SSIMComboLoss, MultiTaskLossWrapper, SharpLoss
+from ..losses import L1SSIMComboLoss, MultiTaskLossWrapper, SharpLoss, HomoscedasticUncertaintyLoss
 
 
 class RegressionUNet(BaseTask):
@@ -875,7 +875,9 @@ class MultiTaskUNet(BaseTask):
         self._last_loss_logs = {}
         # Running average normalization buffers (initialized to 1.0)
         self.register_buffer("seg_loss_ema", torch.tensor(1.0))
-        self.register_buffer("reg_loss_ema", torch.tensor(1.0))
+        # Register EMA buffers for each regression channel
+        for i in range(self.hparams["num_reg_targets"]):
+            self.register_buffer(f"reg_loss_ema_{i}", torch.tensor(1.0))
 
     def configure_models(self):
         """Initialize the UNet model for classification."""
@@ -892,6 +894,9 @@ class MultiTaskUNet(BaseTask):
 
     def compute_loss(self, y, seg_logits, reg_out, ignore_index=None):
         """Compute multi-task loss using homoscedastic uncertainty weighting.
+
+        Calculates loss for each regression channel separately, then passes all
+        task losses to the loss wrapper for uncertainty-based weighting.
 
         Uses learnable task weights based on homoscedastic uncertainty to balance
         segmentation and regression losses dynamically during training.
@@ -919,59 +924,76 @@ class MultiTaskUNet(BaseTask):
         seg_loss = self.focal_loss(seg_logits, y[:, 0].long())
 
         if num_reg > 0 and self.loss_wrapper is not None:
-            # Regression loss with masking
+            # Regression loss with masking - calculate per-channel losses
             reg_target = y[:, 1 : num_reg + 1]  # [B, num_reg, H, W]
+            reg_losses = []  # List to hold individual channel losses
 
-            # Handle different regression loss types
-            if isinstance(self.reg_loss_fn, SharpLoss):
-                # SharpLoss handles masking internally and returns scalar
-                reg_mask = reg_target == ignore_index
-                reg_loss = self.reg_loss_fn(reg_out, reg_target, reg_mask)
-            else:
-                # MAE loss returns per-element losses, needs manual masking
-                reg_loss_all = self.reg_loss_fn(
-                    reg_out, reg_target
-                )  # [B, num_reg, H, W]
-                reg_mask = reg_target == ignore_index
-                reg_loss_valid = reg_loss_all[~reg_mask]
+            for i in range(num_reg):
+                # Extract single channel
+                reg_out_i = reg_out[:, i : i + 1]  # [B, 1, H, W]
+                reg_target_i = reg_target[:, i : i + 1]  # [B, 1, H, W]
 
-                # Guard against fully masked batch
-                reg_loss = (
-                    reg_loss_valid.mean()
-                    if reg_loss_valid.numel() > 0
-                    else torch.tensor(0.0, device=reg_out.device)
-                )
+                # Handle different regression loss types
+                if isinstance(self.reg_loss_fn, SharpLoss):
+                    # SharpLoss handles masking internally and returns scalar
+                    reg_mask = reg_target_i == ignore_index
+                    reg_loss_i = self.reg_loss_fn(reg_out_i, reg_target_i, reg_mask)
+                else:
+                    # MAE loss returns per-element losses, needs manual masking
+                    reg_loss_all = self.reg_loss_fn(
+                        reg_out_i, reg_target_i
+                    )  # [B, 1, H, W]
+                    reg_mask = reg_target_i == ignore_index
+                    reg_loss_valid = reg_loss_all[~reg_mask]
+
+                    # Guard against fully masked batch
+                    reg_loss_i = (
+                        reg_loss_valid.mean()
+                        if reg_loss_valid.numel() > 0
+                        else torch.tensor(0.0, device=reg_out.device)
+                    )
+
+                reg_losses.append(reg_loss_i)
 
             # Store raw losses for logging
-            raw_losses = [seg_loss.detach(), reg_loss.detach()]
+            raw_losses = [seg_loss.detach()] + [rl.detach() for rl in reg_losses]
 
             # Apply running average normalization if enabled
             if self.hparams.get("use_loss_normalization", False):
-                # Normalize by running average + epsilon for stability
+                # Normalize segmentation loss
                 seg_loss_norm = seg_loss / (self.seg_loss_ema + 1e-8)
-                reg_loss_norm = reg_loss / (self.reg_loss_ema + 1e-8)
+
+                # Normalize each regression channel loss
+                reg_losses_norm = []
+                for i, reg_loss_i in enumerate(reg_losses):
+                    ema_buffer = getattr(self, f"reg_loss_ema_{i}")
+                    reg_loss_norm = reg_loss_i / (ema_buffer + 1e-8)
+                    reg_losses_norm.append(reg_loss_norm)
 
                 # Update EMAs (in-place, no gradients)
                 momentum = self.hparams.get("loss_norm_momentum", 0.9)
                 self.seg_loss_ema = (
                     momentum * self.seg_loss_ema + (1 - momentum) * seg_loss.detach()
                 )
-                self.reg_loss_ema = (
-                    momentum * self.reg_loss_ema + (1 - momentum) * reg_loss.detach()
-                )
+                for i, reg_loss_i in enumerate(reg_losses):
+                    ema_buffer = getattr(self, f"reg_loss_ema_{i}")
+                    new_ema = momentum * ema_buffer + (1 - momentum) * reg_loss_i.detach()
+                    setattr(self, f"reg_loss_ema_{i}", new_ema)
 
-                task_losses = [seg_loss_norm, reg_loss_norm]
+                task_losses = [seg_loss_norm] + reg_losses_norm
             else:
-                task_losses = [seg_loss, reg_loss]
+                task_losses = [seg_loss] + reg_losses
 
             # Apply homoscedastic uncertainty-based weighting
             total_loss, loss_logs = self.loss_wrapper(task_losses)
 
             # Add raw losses and EMA values to logs
             loss_logs["task_0_raw_loss"] = raw_losses[0]
-            loss_logs["task_1_raw_loss"] = raw_losses[1]
+            for i, raw_loss in enumerate(raw_losses[1:], start=1):
+                loss_logs[f"task_{i}_raw_loss"] = raw_loss
             loss_logs["seg_loss_ema"] = self.seg_loss_ema.detach()
-            loss_logs["reg_loss_ema"] = self.reg_loss_ema.detach()
+            for i in range(num_reg):
+                loss_logs[f"reg_loss_ema_{i}"] = getattr(self, f"reg_loss_ema_{i}").detach()
 
             # Store logs for training_step to use
             self._last_loss_logs = loss_logs
@@ -1004,9 +1026,10 @@ class MultiTaskUNet(BaseTask):
 
         # Initialize homoscedastic uncertainty-based loss weighting
         if self.hparams.get("use_uncertainty_weighting", True):
-            num_tasks = 2 if self.hparams["num_reg_targets"] > 0 else 1
-            self.loss_wrapper = MultiTaskLossWrapper(
-                num_tasks=num_tasks,
+            num_reg = self.hparams["num_reg_targets"]
+            task_types = ['classification'] + ['regression'] * num_reg
+            self.loss_wrapper = HomoscedasticUncertaintyLoss(
+                task_types=task_types,
                 init_log_vars=self.hparams.get("init_log_vars", 0.0),
             )
         else:
@@ -1161,7 +1184,7 @@ class MultiTaskUNet(BaseTask):
             y_reg = y[:, 1:, :]
             y_hat_reg = reg_out[:, :num_regression_targets, :]
             # Clamp predictions to target min and max range
-            y_hat_reg = torch.clamp(y_hat_reg, -5, 5)
+            # y_hat_reg = torch.clamp(y_hat_reg, -5, 5)
             mask_reg = mask[:, 1:, :]
 
             reg_metrics = self.reg_val_metrics(
@@ -1403,6 +1426,32 @@ class MultiTaskUNet(BaseTask):
             sample_dict[name] = y[:actual_n, i + 1]
             sample_dict[f"{name}_pred"] = y_hat[:actual_n, i + 1]
 
+        # Pre-calculate vmin/vmax for each regression target from target data
+        # This ensures predictions use the same colormap range as targets
+        reg_range = {}
+        for i in range(num_reg_available):
+            name = reg_names[i] if i < len(reg_names) else f"reg_{i}"
+            target_data = y[:actual_n, i + 1]  # [actual_n, H, W]
+
+            # Collect valid pixels across all samples for this target
+            valid_pixels_list = []
+            for col_idx in range(actual_n):
+                ch_idx = 1 + i  # Regression channel index
+                current_mask = mask_nodata[col_idx, ch_idx]
+                img = target_data[col_idx].squeeze().cpu().numpy()
+                valid_pixels = img[~current_mask]
+                if len(valid_pixels) > 0:
+                    valid_pixels_list.append(valid_pixels)
+
+            if valid_pixels_list:
+                all_valid = np.concatenate(valid_pixels_list)
+                vmin, vmax = np.percentile(all_valid, [2, 98])
+                if vmin == vmax:
+                    vmin, vmax = all_valid.min(), all_valid.max()
+                reg_range[name] = (vmin, vmax)
+            else:
+                reg_range[name] = (None, None)
+
         num_rows = len(sample_dict)
         num_cols = actual_n
         fig, axs = plt.subplots(
@@ -1531,14 +1580,10 @@ class MultiTaskUNet(BaseTask):
                     ch_idx = 1 + (reg_ch_offset // 2)
                     current_mask = mask_nodata[col_idx, ch_idx]
 
-                    valid_mask = ~current_mask
-                    valid_pixels = img[valid_mask]
-                    if len(valid_pixels) > 0:
-                        vmin, vmax = np.percentile(valid_pixels, [2, 98])
-                        if vmin == vmax:
-                            vmin, vmax = valid_pixels.min(), valid_pixels.max()
-                    else:
-                        vmin, vmax = None, None
+                    # Get the regression variable name (remove "_pred" suffix if present)
+                    reg_name = title.replace("_pred", "")
+                    # Use pre-computed vmin/vmax from target data for consistent colormap
+                    vmin, vmax = reg_range.get(reg_name, (None, None))
 
                     img_masked = img.copy()
                     img_masked[current_mask] = np.nan
@@ -1546,7 +1591,8 @@ class MultiTaskUNet(BaseTask):
                     ax.imshow(img_masked, cmap=reg_cmap, vmin=vmin, vmax=vmax)
                     ax.set_title(f"{title}", fontsize="small")
 
-                    if len(valid_pixels) > 0:
+                    valid_mask = ~current_mask
+                    if valid_mask.any():
                         ax.set_xlabel(
                             f"min:{np.nanmin(img_masked):.1f} max:{np.nanmax(img_masked):.1f} mean:{np.nanmean(img_masked):.1f}",
                             fontsize="xx-small",
