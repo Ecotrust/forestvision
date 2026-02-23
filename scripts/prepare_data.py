@@ -19,6 +19,19 @@ Usage:
 
     # Skip download (data already exists)
     python scripts/prepare_data.py --config data/fortypba/conf/fortypes.yaml --skip-download
+
+    # Set identity channels per dataset using semicolon separator
+    # Format: "dataset1_ch1 dataset1_ch2; dataset2_ch1; dataset3_ch1 dataset3_ch2"
+    python scripts/prepare_data.py --config data/fortypba/conf/fortypes.yaml \
+        --input-identity-channels "10 11; 0; 1 2 3" \
+        --target-identity-channels "0"
+
+    # Example with 3 input datasets:
+    # - Dataset 1 (GEESentinel2): identity channels 10, 11 (e.g., NDVI, NDWI)
+    # - Dataset 2 (GEE3Dep): identity channel 0
+    # - Dataset 3 (ClimateNA): identity channels 1, 2, 3
+    python scripts/prepare_data.py --config config.yaml \
+        --input-identity-channels "10 11; 0; 1 2 3"
     
 """
 
@@ -27,7 +40,6 @@ import argparse
 import logging
 import pydoc
 import inspect
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import yaml
@@ -200,12 +212,44 @@ def instantiate_dataset(
     return ds
 
 
+def parse_per_dataset_identity(identity_str: Optional[str]) -> List[List[int]]:
+    """
+    Parse per-dataset identity channels from semicolon-separated string.
+    
+    Format: "10 11; 0; 1 2 3" means:
+        - Dataset 1: channels 10, 11
+        - Dataset 2: channel 0
+        - Dataset 3: channels 1, 2, 3
+    
+    Args:
+        identity_str: Semicolon-separated string of space-separated channel indices
+        
+    Returns:
+        List of lists, where each inner list contains channel indices for a dataset
+    """
+    if not identity_str:
+        return []
+    
+    result = []
+    # Split by semicolon to get per-dataset groups
+    groups = identity_str.split(";")
+    
+    for group in groups:
+        # Strip whitespace and split by spaces to get individual indices
+        indices = [int(x) for x in group.strip().split() if x.strip()]
+        result.append(indices)
+    
+    return result
+
+
 def prepare_data(
     config_path: str,
     on_keys: List[str] = None,
     skip_download: bool = False,
     overwrite: bool = False,
     download_all_bands: bool = False,
+    input_identity_channels: Optional[str] = None,
+    target_identity_channels: Optional[str] = None,
 ) -> None:
     """Prepare data by downloading and computing statistics using DatasetStats."""
     tqdm_handler = TqdmLoggingHandler()
@@ -283,14 +327,24 @@ def prepare_data(
                 for _ in tqdm(loader, desc=f"Downloading val {ds.__class__.__name__}", leave=False):
                     pass
 
-    # Extract identity channels from global transforms
-    input_identity = get_identity_channels(data_args.get("input_transforms"), "image")
-    target_identity = get_identity_channels(data_args.get("target_transforms"), "mask")
+    # Parse per-dataset identity channels from CLI arguments
+    input_identity_per_dataset = parse_per_dataset_identity(input_identity_channels)
+    target_identity_per_dataset = parse_per_dataset_identity(target_identity_channels)
     
-    if input_identity:
-        logging.info(f"Identity channels detected for input: {input_identity}")
-    if target_identity:
-        logging.info(f"Identity channels detected for target: {target_identity}")
+    # Validate number of datasets matches
+    if input_identity_per_dataset and len(input_identity_per_dataset) != len(input_datasets_cfg):
+        logging.warning(
+            f"Number of input identity groups ({len(input_identity_per_dataset)}) "
+            f"does not match number of input datasets ({len(input_datasets_cfg)}). "
+            f"Using per-dataset mapping where available."
+        )
+    
+    if target_identity_per_dataset and len(target_identity_per_dataset) != len(target_datasets_cfg):
+        logging.warning(
+            f"Number of target identity groups ({len(target_identity_per_dataset)}) "
+            f"does not match number of target datasets ({len(target_datasets_cfg)}). "
+            f"Using per-dataset mapping where available."
+        )
 
     # Process Input Datasets
     if "image" in on_keys:
@@ -298,9 +352,19 @@ def prepare_data(
         for i, cfg in enumerate(input_datasets_cfg):
             ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
             
+            # Get dataset name for logging
+            ds_name = ds.__class__.__name__
+            
+            # Get identity channels for this specific dataset
+            ds_identity = []
+            if input_identity_per_dataset and i < len(input_identity_per_dataset):
+                ds_identity = input_identity_per_dataset[i]
+                if ds_identity:
+                    logging.info(f"Identity channels for input dataset {ds_name}: {ds_identity}")
+            
             # Download if requested
             if not skip_download and hasattr(ds, "download"):
-                logging.info(f"Downloading {ds.__class__.__name__}...")
+                logging.info(f"Downloading {ds_name}...")
                 sampler = TileGeoSampler(ds, train_tiles.data)
                 loader = torch.utils.data.DataLoader(
                     ds, 
@@ -309,7 +373,7 @@ def prepare_data(
                     num_workers=5, 
                     collate_fn=lambda x: x
                 )
-                for _ in tqdm(loader, desc=f"Downloading {ds.__class__.__name__}", leave=False):
+                for _ in tqdm(loader, desc=f"Downloading {ds_name}", leave=False):
                     pass
 
             # Compute stats
@@ -331,21 +395,18 @@ def prepare_data(
             )
             ds_stats = stats_calculator.compute()
 
-            # Force identity stats if requested
+            # Force identity stats if requested for this dataset
             mean_list = ds_stats["mean"].tolist()
             std_list = ds_stats["std"].tolist()
             
-            # Note: For input datasets, identity_channels are currently global indices
-            # in the full stack. This check assumes we only have one input dataset or
-            # that indices align. 
-            # BUT: We only force identity if the index is within range of this dataset's stats.
-            for idx in input_identity:
+            for idx in ds_identity:
                 if 0 <= idx < len(mean_list):
+                    logging.info(f"Forcing identity stats for channel {idx} in {ds_name}")
                     mean_list[idx] = 0.0
                     std_list[idx] = 1.0
 
             formatted_stats = {
-                "dataset_class": ds.__name__ if hasattr(ds, "__name__") else ds.__class__.__name__,
+                "dataset_class": ds_name,
                 "mean": mean_list,
                 "std": std_list,
                 "min": ds_stats["min"].tolist(),
@@ -364,48 +425,121 @@ def prepare_data(
     # Process Target Datasets
     if "mask" in on_keys:
         logging.info("Computing statistics for target datasets...")
+        
+        # Instantiate all target datasets
+        target_datasets = []
         for i, cfg in enumerate(target_datasets_cfg):
             ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
-
-            sampler = TileGeoSampler(ds, train_tiles.data)
-            
-            # Determine actual channel count
-            sample = ds[next(iter(sampler))]
-            actual_channels = sample["mask"].shape[0]
-            
-            stats_calculator = DatasetStats(
-                dataset=ds,
-                sampler=sampler,
-                batch_size=15,
-                num_workers=5,
-                channels=actual_channels,
+            target_datasets.append(ds)
+        
+        # Combine target datasets via IntersectionDataset (like datamodule does)
+        if len(target_datasets) == 1:
+            combined_target_ds = target_datasets[0]
+        else:
+            combined_target_ds = target_datasets[0]
+            for ds in target_datasets[1:]:
+                combined_target_ds &= ds
+        
+        # Apply target transforms (including CombineGNNDWMask) to get final channel count
+        # BUT skip Normalize since stats haven't been computed yet
+        target_transforms_cfg = data_args.get("target_transforms")
+        if target_transforms_cfg:
+            from forestvision.datamodules.base import BaseGeoDataModule
+            # Create a temporary datamodule instance to instantiate transforms
+            temp_dm = BaseGeoDataModule(
+                root=root,
+                year=year,
+                input_configs=[],
+                target_configs=[],
             )
-            ds_stats = stats_calculator.compute()
-
-            if i == 0:
-                mean_list = ds_stats["mean"].tolist()
-                std_list = ds_stats["std"].tolist()
+            # Instantiate transforms but skip Normalize
+            instantiated_transforms = temp_dm._instantiate_transforms(
+                target_transforms_cfg, combined_target_ds
+            )
+            
+            # Filter out Normalize transforms for stats computation
+            def filter_normalize(transform):
+                """Recursively filter out Normalize transforms."""
+                from forestvision.transforms import Normalize
                 
-                # Force identity for categorical target channels
-                for idx in target_identity:
-                    if 0 <= idx < len(mean_list):
-                        logging.info(f"Forcing identity stats for target channel {idx}")
-                        mean_list[idx] = 0.0
-                        std_list[idx] = 1.0
+                if isinstance(transform, Normalize):
+                    return None
+                elif hasattr(transform, 'transforms'):  # Compose or similar
+                    filtered = []
+                    for t in transform.transforms:
+                        ft = filter_normalize(t)
+                        if ft is not None:
+                            filtered.append(ft)
+                    if not filtered:
+                        return None
+                    transform.transforms = filtered
+                    return transform
+                elif isinstance(transform, list):
+                    filtered = [filter_normalize(t) for t in transform]
+                    return [t for t in filtered if t is not None]
+                return transform
+            
+            combined_target_ds.transforms = filter_normalize(instantiated_transforms)
+        
+        # Get combined dataset name for logging
+        ds_name = "CombinedTarget"
+        
+        # Get identity channels - flatten all target identity channels
+        ds_identity = []
+        if target_identity_per_dataset:
+            # Flatten all identity channel lists
+            for identity_list in target_identity_per_dataset:
+                ds_identity.extend(identity_list)
+            if ds_identity:
+                logging.info(f"Identity channels for combined target: {ds_identity}")
 
-                target_stats = {
-                    "mean": mean_list,
-                    "std": std_list,
-                    "min": ds_stats["min"].tolist(),
-                    "max": ds_stats["max"].tolist(),
-                }
-                all_stats["target_stats"] = target_stats
+        sampler = TileGeoSampler(combined_target_ds, train_tiles.data)
+        
+        # Determine actual channel count after transforms
+        sample = combined_target_ds[next(iter(sampler))]
+        actual_channels = sample["mask"].shape[0]
+        logging.info(f"Target channels after transforms: {actual_channels}")
+        
+        # Set is_image attribute for IntersectionDataset compatibility
+        if not hasattr(combined_target_ds, 'is_image'):
+            combined_target_ds.is_image = False
+        
+        # Set nodata attribute so DatasetStats can exclude nodata values
+        # Use the nodata value from config (default to -2147483648)
+        combined_target_ds.nodata = -2147483648
+        
+        stats_calculator = DatasetStats(
+            dataset=combined_target_ds,
+            sampler=sampler,
+            batch_size=15,
+            num_workers=5,
+            channels=actual_channels,
+        )
+        ds_stats = stats_calculator.compute()
 
-                if ds_stats.get("nodata") is not None:
-                    all_stats["target_nodata_info"] = {
-                        "value": ds_stats["nodata"],
-                        "pixels": ds_stats["nodata_pixels"],
-                    }
+        # Force identity stats if requested
+        mean_list = ds_stats["mean"].tolist()
+        std_list = ds_stats["std"].tolist()
+        
+        for idx in ds_identity:
+            if 0 <= idx < len(mean_list):
+                logging.info(f"Forcing identity stats for channel {idx}")
+                mean_list[idx] = 0.0
+                std_list[idx] = 1.0
+
+        target_stats = {
+            "mean": mean_list,
+            "std": std_list,
+            "min": ds_stats["min"].tolist(),
+            "max": ds_stats["max"].tolist(),
+        }
+        all_stats["target_stats"] = target_stats
+
+        if ds_stats.get("nodata") is not None:
+            all_stats["target_nodata_info"] = {
+                "value": ds_stats["nodata"],
+                "pixels": ds_stats["nodata_pixels"],
+            }
 
     # Save to JSON
     output_dir = os.path.dirname(stats_path)
@@ -425,13 +559,14 @@ def prepare_data(
     print(f"Year:       {year}")
     
     if all_stats.get("input_stats"):
-        print(f"\nInput Datasets:")
+        print("\nInput Datasets:")
         for entry in all_stats["input_stats"]:
             name = entry["dataset_class"]
             channels = len(entry["mean"])
             print(f"  - {name:<15} | Channels: {channels}")
             mean_str = ", ".join([f"{m:.2f}" for m in entry["mean"][:5]])
-            if channels > 5: mean_str += " ..."
+            if channels > 5:
+                mean_str += " ..."
             print(f"    Mean: [{mean_str}]")
             
             if "nodata_info" in entry:
@@ -441,10 +576,11 @@ def prepare_data(
     if all_stats.get("target_stats"):
         target = all_stats["target_stats"]
         channels = len(target["mean"])
-        print(f"\nTarget Dataset:")
+        print("\nTarget Dataset:")
         print(f"  - Combined        | Channels: {channels}")
         mean_str = ", ".join([f"{m:.2f}" for m in target["mean"][:5]])
-        if channels > 5: mean_str += " ..."
+        if channels > 5:
+            mean_str += " ..."
         print(f"    Mean: [{mean_str}]")
             
     print(f"{'='*60}\n")
@@ -477,7 +613,34 @@ def main():
         action="store_true",
         help="Download all available bands instead of just the selected bands from config",
     )
+    parser.add_argument(
+        "--input-identity-channels", "-iic",
+        type=str,
+        default=None,
+        help="Per-dataset identity channels for input data (mean=0, std=1). "
+             "Format: 'dataset1_ch1 ch2; dataset2_ch1; dataset3_ch1 ch2'. "
+             "E.g., --input-identity-channels '10 11; 0; 1 2 3' "
+             "sets identity for channels 10,11 in dataset1, channel 0 in dataset2, "
+             "and channels 1,2,3 in dataset3.",
+    )
+    parser.add_argument(
+        "--target-identity-channels", "-tic",
+        type=str,
+        default=None,
+        help="Per-dataset identity channels for target data (mean=0, std=1). "
+             "Format: 'dataset1_ch1; dataset2_ch1 ch2'. "
+             "E.g., --target-identity-channels '0' sets identity for channel 0 in the first target dataset.",
+    )
     args = parser.parse_args()
+
+    # Join list to string if multiple arguments were passed (for backward compatibility)
+    input_identity_str = args.input_identity_channels
+    if isinstance(input_identity_str, list):
+        input_identity_str = " ".join(map(str, input_identity_str))
+    
+    target_identity_str = args.target_identity_channels
+    if isinstance(target_identity_str, list):
+        target_identity_str = " ".join(map(str, target_identity_str))
 
     prepare_data(
         config_path=args.config,
@@ -485,6 +648,8 @@ def main():
         skip_download=args.skip_download,
         overwrite=args.overwrite,
         download_all_bands=args.download_all_bands,
+        input_identity_channels=input_identity_str,
+        target_identity_channels=target_identity_str,
     )
 
 
