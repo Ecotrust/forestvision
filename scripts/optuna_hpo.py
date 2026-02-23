@@ -70,7 +70,7 @@ def get_search_space(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[s
     search_space["dropout"] = trial.suggest_float(
         "dropout", 
         0.1, 
-        0.7
+        0.8
     )
    
     search_space["weight_decay"] = trial.suggest_float(
@@ -106,31 +106,10 @@ def get_search_space(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[s
     )
 
     # Regression loss and uncertainty weighting hyperparameters
-    search_space["reg_loss"] = trial.suggest_categorical(
-        "reg_loss",
-        ["mae", "sharploss"]
-    )
-
     search_space["sharploss_alpha"] = trial.suggest_float(
         "sharploss_alpha",
         0.0,
         1.0
-    )
-
-    search_space["use_reg_tanh"] = trial.suggest_categorical(
-        "use_reg_tanh",
-        [True, False]
-    )
-
-    search_space["init_log_vars"] = trial.suggest_float(
-        "init_log_vars",
-        -1.0,
-        1.0
-    )
-
-    search_space["use_loss_normalization"] = trial.suggest_categorical(
-        "use_loss_normalization",
-        [True, False]
     )
 
     search_space["loss_norm_momentum"] = trial.suggest_float(
@@ -142,12 +121,29 @@ def get_search_space(trial: optuna.Trial, base_config: Dict[str, Any]) -> Dict[s
     # Data hyperparameters
     search_space["batch_size"] = trial.suggest_categorical(
         "batch_size", 
-        [24, 32, 36, 48]
+        [16, 32, 48]
     )
+
+    # Constrained loss weighting: seg_loss_weight + sum(reg_loss_weights) = 1.0
+    # Sample segmentation weight, then distribute remaining equally among regression channels
+    seg_weight = trial.suggest_float("seg_loss_weight", 0.3, 0.9)
     
-    # Architecture parameters (optional - more expensive to search)
-    # Uncomment if you want to search architecture
-    # search_space["encoder_depth"] = trial.suggest_int("encoder_depth", 4, 6)
+    # Get number of regression targets from num_classes_per_task
+    # First task is classification, rest are regression
+    num_classes_per_task = base_config.get("model", {}).get("init_args", {}).get("num_classes_per_task", [15, 1, 1, 1])
+    num_reg_targets = sum(1 for nc in num_classes_per_task[1:] if nc == 1)  # Count regression tasks
+    
+    # Compute remaining weight for regression and distribute equally
+    remaining_weight = 1.0 - seg_weight
+    reg_weight_per_channel = remaining_weight / num_reg_targets if num_reg_targets > 0 else 0
+    reg_weights = [reg_weight_per_channel] * num_reg_targets
+    
+    search_space["seg_loss_weight"] = seg_weight
+    search_space["reg_loss_weights"] = reg_weights
+    
+    # Log the constraint for debugging
+    total_weight = seg_weight + sum(reg_weights)
+    trial.set_user_attr("total_loss_weight", total_weight)
     
     return search_space
 
@@ -173,12 +169,10 @@ def create_model_config(
         "scheduler_factor": search_space["scheduler_factor"],
         "focal_alpha": search_space["focal_alpha"],
         "focal_gamma": search_space["focal_gamma"],
-        "reg_loss": search_space["reg_loss"],
         "sharploss_alpha": search_space["sharploss_alpha"],
-        # "use_uncertainty_weighting": search_space["use_uncertainty_weighting"],
-        "init_log_vars": search_space["init_log_vars"],
-        "use_loss_normalization": search_space["use_loss_normalization"],
         "loss_norm_momentum": search_space["loss_norm_momentum"],
+        "seg_loss_weight": search_space["seg_loss_weight"],
+        "reg_loss_weights": search_space["reg_loss_weights"],
     })
     
     model_config["init_args"] = init_args
@@ -191,12 +185,21 @@ def create_datamodule_config(
 ) -> Dict[str, Any]:
     """
     Merge base config with suggested data hyperparameters.
+    Preserves all dataset and transform configurations.
     """
     data_config = base_config.get("data", {}).copy()
     init_args = data_config.get("init_args", {}).copy()
     
     # Update batch size
     init_args["batch_size"] = search_space["batch_size"]
+    
+    # Ensure all dataset and transform configs are preserved
+    # These are required for the new ForTypesDataModule
+    init_args["input_datasets"] = init_args.get("input_datasets", [])
+    init_args["target_datasets"] = init_args.get("target_datasets", [])
+    init_args["input_transforms"] = init_args.get("input_transforms")
+    init_args["target_transforms"] = init_args.get("target_transforms")
+    init_args["train_transforms"] = init_args.get("train_transforms")
     
     data_config["init_args"] = init_args
     return data_config
@@ -411,6 +414,16 @@ def save_best_config(study: optuna.Study, output_path: str, base_config: Dict[st
     
     # Get best hyperparameters
     best_params = study.best_params.copy()
+    
+    # Reconstruct reg_loss_weights from seg_loss_weight if needed
+    if "seg_loss_weight" in best_params and "reg_loss_weights" not in best_params:
+        seg_weight = best_params["seg_loss_weight"]
+        # Use num_classes_per_task to determine number of regression targets
+        num_classes_per_task = base_config.get("model", {}).get("init_args", {}).get("num_classes_per_task", [15, 1, 1, 1])
+        num_reg_targets = sum(1 for nc in num_classes_per_task[1:] if nc == 1)
+        remaining_weight = 1.0 - seg_weight
+        reg_weight_per_channel = remaining_weight / num_reg_targets if num_reg_targets > 0 else 0
+        best_params["reg_loss_weights"] = [reg_weight_per_channel] * num_reg_targets
     
     # Create complete config
     model_config = create_model_config(base_config, best_params)
