@@ -1,6 +1,5 @@
 import os
 import logging
-import time
 from typing import Any, Dict, List, Optional, Union
 import warnings
 
@@ -25,54 +24,6 @@ warnings.filterwarnings("ignore")
 load_dotenv()
 GEE_PROJECT_NAME = os.getenv("GEE_PROJECT_NAME")
 TARGET_PATH = os.getenv("TARGET_PATH")
-
-# fmt: off
-REMAP = {
-    # Forest type 9
-    966: 9,   968: 9,   969: 9,   975: 9,
-    
-    # Forest type 10
-    125: 10,  129: 10,  134: 10,  136: 10,  170: 10,  188: 10,  189: 10,
-    190: 10,  191: 10,  192: 10,  193: 10,  196: 10,  197: 10,  200: 10,
-    202: 10,  204: 10,  206: 10,  210: 10,  211: 10,  215: 10,  218: 10,
-    219: 10,  220: 10,  221: 10,  231: 10,  234: 10,  238: 10,  254: 10,
-    256: 10,  259: 10,  260: 10,  261: 10,  262: 10,  263: 10,  265: 10,
-    266: 10,  269: 10,  270: 10,  271: 10,  272: 10,  282: 10,  284: 10,
-    286: 10,  293: 10,  306: 10,  319: 10,  322: 10,  368: 10,  426: 10,
-    427: 10,  488: 10,  498: 10,  518: 10,  535: 10,  545: 10,  546: 10,
-    581: 10,  598: 10,  601: 10,  607: 10,  614: 10,  619: 10,  645: 10,
-    654: 10,  717: 10,  815: 10,  818: 10,  855: 10,  886: 10,  890: 10,
-    891: 10,  893: 10,  896: 10,  897: 10,  898: 10,  899: 10,  900: 10,
-    902: 10,  906: 10,
-    
-    # Forest type 11
-    33: 11,   112: 11,  113: 11,  115: 11,  123: 11,  124: 11,  126: 11,
-    127: 11,  128: 11,  130: 11,  131: 11,  132: 11,  133: 11,  135: 11,
-    148: 11,  165: 11,  177: 11,  182: 11,  184: 11,  186: 11,  199: 11,
-    346: 11,  425: 11,  543: 11,  565: 11,  568: 11,  569: 11,  571: 11,
-    580: 11,  597: 11,  599: 11,  600: 11,  602: 11,  603: 11,  604: 11,
-    605: 11,  606: 11,  608: 11,  610: 11,  621: 11,  622: 11,  624: 11,
-    625: 11,  634: 11,  647: 11,  653: 11,  667: 11,  668: 11,  669: 11,
-    670: 11,  672: 11,  673: 11,  674: 11,  676: 11,  677: 11,  679: 11,
-    681: 11,  683: 11,  684: 11,  685: 11,  689: 11,  690: 11,  698: 11,
-    701: 11,  702: 11,  703: 11,  704: 11,  705: 11,  706: 11,  708: 11,
-    714: 11,  718: 11,  719: 11,  720: 11,  721: 11,  723: 11,  726: 11,
-    728: 11,  743: 11,  748: 11,  752: 11,  767: 11,  776: 11,  791: 11,
-    794: 11,  836: 11,  838: 11,  839: 11,  840: 11,  841: 11,  844: 11,
-    852: 11,  887: 11,  888: 11,  889: 11,  892: 11,  894: 11,  895: 11,
-    901: 11,  907: 11,  908: 11,  909: 11,  910: 11,  911: 11,  915: 11,
-    916: 11,  917: 11,  918: 11,  919: 11,  921: 11,  926: 11,  930: 11,
-    931: 11,  932: 11,  935: 11,  942: 11,  943: 11,  944: 11,  945: 11,
-    946: 11,  947: 11,  948: 11,
-
-    # Set NF to nodata
-    # 0: -2147483648
-
-}
-# fmt: on
-
-# GNNForestAttr.remap_dict.update(REMAP)
-
 
 class ClimateNA(AnyRasterDataset):
     all_bands = ["AHM", "MAP", "TD"]
@@ -99,6 +50,11 @@ class ForTypesDataModule(BaseGeoDataModule):
         predict_tiles_path: Optional[str] = None,
         input_datasets: Optional[List[Dict[str, Any]]] = None,
         target_datasets: Optional[List[Dict[str, Any]]] = None,
+        input_transforms: Optional[Any] = None,
+        target_transforms: Optional[Any] = None,
+        train_transforms: Optional[Any] = None,
+        post_aug_input_transforms: Optional[Any] = None,
+        post_aug_target_transforms: Optional[Any] = None,
         ee_project: Optional[str] = None,
         hparams: Optional[Dict[str, Any]] = None,
         download: bool = True,
@@ -168,6 +124,11 @@ class ForTypesDataModule(BaseGeoDataModule):
             predict_tiles_path=predict_tiles_path,
             stats_path=stats_path,
             hparams=hparams,
+            input_transforms=input_transforms,
+            target_transforms=target_transforms,
+            train_transforms=train_transforms,
+            post_aug_input_transforms=post_aug_input_transforms,
+            post_aug_target_transforms=post_aug_target_transforms,
             **kwargs,
         )
 
@@ -361,10 +322,24 @@ class ForTypesDataModule(BaseGeoDataModule):
                 all_means.extend(entry.get("mean", []))
                 all_stds.extend(entry.get("std", []))
 
-            self.input_stats = {
-                "mean": torch.tensor(all_means),
-                "std": torch.tensor(all_stds),
-            }
+            # Extract SelectBands indices for subsetting stats
+            select_indices = None
+            if self.input_transforms:
+                select_indices = self._extract_selectbands_indices(self.input_transforms)
+            
+            # Subset stats if SelectBands is present
+            if select_indices is not None:
+                subset_means = [all_means[i] for i in select_indices if i < len(all_means)]
+                subset_stds = [all_stds[i] for i in select_indices if i < len(all_stds)]
+                self.input_stats = {
+                    "mean": torch.tensor(subset_means),
+                    "std": torch.tensor(subset_stds),
+                }
+            else:
+                self.input_stats = {
+                    "mean": torch.tensor(all_means),
+                    "std": torch.tensor(all_stds),
+                }
 
             # 2. Aggregated Target Stats
             target_json = stats.get("target_stats", {})
@@ -373,43 +348,72 @@ class ForTypesDataModule(BaseGeoDataModule):
                 "std": torch.tensor(target_json.get("std", [1.0])),
             }
 
+            # Helper to extract stats from Normalize transforms
+            def get_norm_stats(obj):
+                if isinstance(obj, dict):
+                    if "Normalize" in obj.get("class_path", ""):
+                        ia = obj.get("init_args", {})
+                        return ia.get("mean"), ia.get("std")
+                    for v in obj.values():
+                        res = get_norm_stats(v)
+                        if res:
+                            return res
+                elif isinstance(obj, list):
+                    for item in obj:
+                        res = get_norm_stats(item)
+                        if res:
+                            return res
+                elif hasattr(obj, "mean") and hasattr(obj, "std"):
+                    return obj.mean, obj.std
+                elif hasattr(obj, "transforms"):
+                    for t in obj.transforms:
+                        res = get_norm_stats(t)
+                        if res:
+                            return res
+                return None
+
             # 3. Populate top-level combined transforms with these stats
             # This also handles subsetting if SelectBands is present
+            
+            # Extract SelectBands indices from input_transforms (for use in post_aug transforms)
+            select_indices = None
+            if self.input_transforms:
+                select_indices = self._extract_selectbands_indices(self.input_transforms)
+            
+            # Input transforms (legacy or pre-aug)
             if self.input_transforms:
                 self.input_transforms = self._populate_normalize_stats(
                     self.input_transforms, all_means, all_stds
                 )
 
                 # Update aggregated stats to match final selected bands for model hparams
-                # Search for Normalize transform in the chain (handles both dict and objects)
-                def get_norm_stats(obj):
-                    if isinstance(obj, dict):
-                        if "Normalize" in obj.get("class_path", ""):
-                            ia = obj.get("init_args", {})
-                            return ia.get("mean"), ia.get("std")
-                        for v in obj.values():
-                            res = get_norm_stats(v)
-                            if res:
-                                return res
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            res = get_norm_stats(item)
-                            if res:
-                                return res
-                    elif hasattr(obj, "mean") and hasattr(obj, "std"):
-                        return obj.mean, obj.std
-                    elif hasattr(obj, "transforms"):
-                        for t in obj.transforms:
-                            res = get_norm_stats(t)
-                            if res:
-                                return res
-                    return None
-
                 stats_pair = get_norm_stats(self.input_transforms)
                 if stats_pair and stats_pair[0] is not None:
                     self.input_stats["mean"] = torch.tensor(stats_pair[0])
                     self.input_stats["std"] = torch.tensor(stats_pair[1])
+            
+            # Post-aug input transforms (NEW)
+            # If SelectBands was in input_transforms, we need to subset stats for post-aug transforms
+            if self.post_aug_input_transforms:
+                # Subset stats if SelectBands was applied before
+                if select_indices is not None:
+                    subset_means = [all_means[i] for i in select_indices if i < len(all_means)]
+                    subset_stds = [all_stds[i] for i in select_indices if i < len(all_stds)]
+                else:
+                    subset_means, subset_stds = all_means, all_stds
+                
+                self.post_aug_input_transforms = self._populate_normalize_stats(
+                    self.post_aug_input_transforms, subset_means, subset_stds
+                )
+                
+                # Update stats if not already set
+                if self.input_stats["mean"] is None:
+                    stats_pair = get_norm_stats(self.post_aug_input_transforms)
+                    if stats_pair and stats_pair[0] is not None:
+                        self.input_stats["mean"] = torch.tensor(stats_pair[0])
+                        self.input_stats["std"] = torch.tensor(stats_pair[1])
 
+            # Target transforms (legacy or pre-aug)
             if self.target_transforms:
                 self.target_transforms = self._populate_normalize_stats(
                     self.target_transforms,
@@ -422,6 +426,21 @@ class ForTypesDataModule(BaseGeoDataModule):
                 if stats_pair and stats_pair[0] is not None:
                     self.target_stats["mean"] = torch.tensor(stats_pair[0])
                     self.target_stats["std"] = torch.tensor(stats_pair[1])
+            
+            # Post-aug target transforms (NEW)
+            if self.post_aug_target_transforms:
+                self.post_aug_target_transforms = self._populate_normalize_stats(
+                    self.post_aug_target_transforms,
+                    target_json.get("mean"),
+                    target_json.get("std"),
+                )
+                
+                # Update stats if not already set
+                if self.target_stats["mean"] is None:
+                    stats_pair = get_norm_stats(self.post_aug_target_transforms)
+                    if stats_pair and stats_pair[0] is not None:
+                        self.target_stats["mean"] = torch.tensor(stats_pair[0])
+                        self.target_stats["std"] = torch.tensor(stats_pair[1])
 
             self.hparams["input_stats"] = self._serialize_stats(self.input_stats)
             self.hparams["target_stats"] = self._serialize_stats(self.target_stats)

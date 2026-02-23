@@ -75,10 +75,18 @@ class Normalize:
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
         data = sample[self.on_key].float()
 
+        # DEBUG: Print input stats
+        # print(f"\n[DEBUG Normalize] on_key={self.on_key}")
+        # print(f"[DEBUG Normalize] Input shape: {data.shape}, dtype: {data.dtype}")
+        # print(f"[DEBUG Normalize] Input stats: min={data.min().item():.2f}, max={data.max().item():.2f}, mean={data.mean().item():.2f}")
+        # print(f"[DEBUG Normalize] nodata_configured: {self.nodata is not None}, nodata_value: {self.nodata}")
+        # print(f"[DEBUG Normalize] mean: {self.mean}")
+        # print(f"[DEBUG Normalize] std: {self.std}")
+
         # Convert mean/std to tensors and apply identity channels
         mean = self._ensure_tensor(self.mean, "mean").clone()
         std = self._ensure_tensor(self.std, "std").clone()
-        
+
         # Apply identity channels (mean=0, std=1)
         for idx in self.identity_channels:
             if 0 <= idx < len(mean):
@@ -89,7 +97,19 @@ class Normalize:
         original_shape = data.shape
 
         # Create nodata mask before any shape modifications
-        nodata_mask = data == self.nodata if self.nodata is not None else None
+        # Use a small epsilon for float comparison if nodata is very large negative
+        if self.nodata is not None:
+            if self.nodata < -1e9:
+                nodata_mask = data < -1e9
+            else:
+                nodata_mask = data == self.nodata
+        else:
+            nodata_mask = None
+        
+        # DEBUG: Print nodata detection
+        if nodata_mask is not None:
+            num_nodata = nodata_mask.sum().item()
+            # print(f"[DEBUG Normalize] NoData pixels detected: {num_nodata}")
 
         # Ensure data is 4D (B, C, H, W) for tvF.normalize
         if data.ndim == 2:
@@ -511,7 +531,9 @@ class AppendSAVI:
         dataset (Any): Optional dataset instance to sync band metadata.
     """
 
-    def __init__(self, index_nir: int, index_red: int, L: float = 0.5, dataset: Any = None):
+    def __init__(
+        self, index_nir: int, index_red: int, L: float = 0.5, dataset: Any = None
+    ):
         self.index_nir = index_nir
         self.index_red = index_red
         self.L = L
@@ -853,148 +875,157 @@ class InverseMinMaxScaler:
 
 
 class CombineGNNDWMask:
-    """Combine GNN forest types with Dynamic World labels to create a refined mask.
+    """Combine GNN forest types with Dynamic World labels from combined target dataset.
 
-    This transform is applied to GNNForestAttr samples. It fetches corresponding
-    Dynamic World land cover data and refines the GNN forest type classification
-    (fortypba) based on DW labels, while preserving other GNN attributes
-    (cancov, qmd_dom, ba_ge_3) unchanged.
+    This transform is applied to a combined target dataset (via IntersectionDataset)
+    containing both GNN forest attributes and Dynamic World land cover data.
 
-    Output mask classes (band 0 - fortypba):
-        - 0: Non-forest (from DW classes 4, 6, 7, 8)
-        - 1: Shrub/grass (from DW classes 2, 5)
-        - 14: Water (from DW class 0)
-        - nodata: Areas of disagreement between GNN and DW classifications
-        - >1: Forest types (preserved from GNN)
+    Expected input mask (5 channels from combined targets):
+        - Channel 0: fortypba (forest type from GNN)
+        - Channel 1: cancov (canopy cover from GNN)
+        - Channel 2: qmd_dom (dominant QMD from GNN)
+        - Channel 3: ba_ge_3 (basal area >= 3 from GNN)
+        - Channel 4: dw (Dynamic World land cover label)
 
-    The output preserves all GNN bands, with only band 0 (fortypba) modified.
+    The DW channel (4) is used to refine the GNN forest type classification:
+        - DW classes 7, 8 (snow/ice, barren) -> fortypba = 0 (non-forest)
+        - DW class 0 (water) -> fortypba = 14, regression channels zeroed
+        - DW class 6 (urban) -> fortypba = nodata (-2147483648)
+        - Forest types (>1) preserved where DW indicates forest
 
-    This transform should be applied to a GNNForestAttr dataset via the
-    `transforms` parameter.
+    Output mask (4 channels, DW channel consumed and removed):
+        - Channel 0: refined_fortypba (remapped using DW)
+        - Channel 1: cancov (zeroed where DW=water/non-forest)
+        - Channel 2: qmd_dom (zeroed where DW=water/non-forest)
+        - Channel 3: ba_ge_3 (zeroed where DW=water/non-forest)
 
-    Args:
-        dw_class: Dynamic World dataset class (e.g., GEEDynamicWorld)
-        dw_path: Path to the DW dataset directory
-        date_start: Start date for DW image collection (e.g., "2021-06-01")
-        date_end: End date for DW image collection (e.g., "2021-08-31")
-        **dw_kwargs: Additional keyword arguments passed to dw_class constructor
-            (e.g., res, roi, download, etc.)
+    This transform should be applied as a target_transform on the combined
+    target_datasets in the DataModule configuration.
 
     Example:
-        >>> from forestvision.datasets import GNNForestAttr
-        >>> from forestvision.datasets.geedw import GEEDynamicWorld
-        >>> from forestvision.transforms import CombineGNNDWMask
-        >>> gnn = GNNForestAttr(
-        ...     paths="data/datasets/gnn/2021",
-        ...     bands=["fortypba", "cancov", "qmd_dom", "ba_ge_3"],
-        ...     res=10
-        ... )
-        >>> gnn.transforms = CombineGNNDWMask(
-        ...     dw_class=GEEDynamicWorld,
-        ...     dw_path="data/datasets/geedw/2021",
-        ...     date_start="2021-06-01",
-        ...     date_end="2021-08-31",
-        ...     res=10
-        ... )
-        >>> sample = gnn[tile]  # Returns GNN mask with DW-refined fortypba
+        >>> # YAML Configuration
+        >>> target_datasets:
+        >>>   - dataset_class: forestvision.datasets.GNNForestAttr
+        >>>     bands: [fortypba, cancov, qmd_dom, ba_ge_3]
+        >>>   - dataset_class: forestvision.datasets.GEEDynamicWorld
+        >>>     bands: [label]
+        >>> target_transforms:
+        >>>   - class_path: forestvision.transforms.CombineGNNDWMask
     """
 
-    def __init__(
-        self,
-        dw_class: Union[type, str],
-        dw_path: str,
-        date_start: str,
-        date_end: str,
-        roi: Optional[List[float]] = None,
-    ):
+    def __init__(self):
         """Initialize CombineGNNDWMask transform.
 
-        Args:
-            dw_class: Dynamic World dataset class to instantiate, or string class path
-                (e.g., "forestvision.datasets.GEEDynamicWorld")
-            dw_path: Path to DW dataset files
-            date_start: Start date for DW collection
-            date_end: End date for DW collection
-            **dw_kwargs: Additional arguments for DW class (res, roi, download, etc.)
+        No arguments required - DW data comes from the combined target dataset.
         """
-        import pydoc
-        from torchgeo.datasets import BoundingBox
-
-        # Resolve class path string to actual class if needed
-        if isinstance(dw_class, str):
-            resolved_class = pydoc.locate(dw_class)
-            if resolved_class is None:
-                raise ImportError(f"Could not locate DW dataset class: {dw_class}")
-            dw_class = resolved_class
-
-        # Convert list [minx, maxx, miny, maxy] to BoundingBox
-        if roi is not None:
-            bbox = BoundingBox(minx=roi[0], maxx=roi[1], miny=roi[2], maxy=roi[3], mint=0, maxt=1e12)
-        else:
-            bbox = None
-
-        self.dw = dw_class(
-            date_start=date_start,
-            date_end=date_end,
-            path=dw_path,
-            roi=bbox,
-            res=10,
-            download=True
-        )
+        pass
 
     def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
-        """Apply DW-GNN mask combination to a GNN sample.
+        """Apply DW-GNN mask combination to combined target sample.
 
         Args:
-            sample: Dictionary containing GNN data with keys:
-                - "mask": GNN mask with 4 bands (C, H, W) - fortypba, cancov,
-                  qmd_dom, ba_ge_3
+            sample: Dictionary containing combined target data with keys:
+                - "mask": Combined mask with 5 bands (C, H, W) or (B, C, H, W):
+                    [fortypba, cancov, qmd_dom, ba_ge_3, dw]
                 - "bbox": BoundingBox for spatial reference
                 - "crs": Coordinate reference system
 
         Returns:
-            Modified sample with refined fortypba (band 0) based on DW labels,
-            while preserving bands 1-3 unchanged.
+            Modified sample with refined mask (4 bands):
+                [refined_fortypba, cancov, qmd_dom, ba_ge_3]
+            The DW channel is consumed and removed.
         """
         nodata = -2147483648.0
-        # GNN mask: (4, H, W) - bands: fortypba, cancov, qmd_dom, ba_ge_3
-        gnn_mask = sample["mask"]
-        # Ensure channel dimension exists: (H, W) -> (1, H, W)
-        if gnn_mask.dim() == 2:
-            gnn_mask = gnn_mask.unsqueeze(0)
 
-        # Fetch DW data and extract fortypba for classification
-        dw_mask = self.dw[sample["bounds"]]["mask"].squeeze(0)
-        fortypba = gnn_mask[0].clone()
+        # Combined mask: (5, H, W) or (B, 5, H, W) - bands: fortypba, cancov, qmd_dom, ba_ge_3, dw
+        combined_mask = sample["mask"]
+        original_ndim = combined_mask.ndim
+
+        # Handle different input dimensions
+        if combined_mask.dim() == 2:
+            # (H, W) -> (1, 1, H, W) - single sample, add batch and channel dims
+            combined_mask = combined_mask.unsqueeze(0).unsqueeze(0)
+            channel_dim = 1
+        elif combined_mask.dim() == 3:
+            # (C, H, W) -> (1, C, H, W) - single sample, add batch dim
+            combined_mask = combined_mask.unsqueeze(0)
+            channel_dim = 1
+        elif combined_mask.dim() == 4:
+            # (B, C, H, W) - batch of samples
+            channel_dim = 1
+        else:
+            raise ValueError(
+                f"CombineGNNDWMask expects 2D, 3D, or 4D input tensor, "
+                f"got {combined_mask.ndim}D tensor with shape {combined_mask.shape}"
+            )
+
+        # Validate expected number of channels
+        if combined_mask.shape[channel_dim] != 5:
+            raise ValueError(
+                f"CombineGNNDWMask expects 5 input channels (fortypba, cancov, "
+                f"qmd_dom, ba_ge_3, dw), got {combined_mask.shape[channel_dim]}. "
+                f"Ensure target_datasets includes both GNNForestAttr and "
+                f"GEEDynamicWorld datasets."
+            )
+
+        # Extract individual channels (from channel_dim)
+        fortypba = (
+            combined_mask[:, 0].clone()
+            if channel_dim == 1
+            else combined_mask[0].clone()
+        )
+        cancov = (
+            combined_mask[:, 1].clone()
+            if channel_dim == 1
+            else combined_mask[1].clone()
+        )
+        qmd_dom = (
+            combined_mask[:, 2].clone()
+            if channel_dim == 1
+            else combined_mask[2].clone()
+        )
+        ba_ge_3 = (
+            combined_mask[:, 3].clone()
+            if channel_dim == 1
+            else combined_mask[3].clone()
+        )
+        dw_mask = (combined_mask[:, 4] if channel_dim == 1 else combined_mask[4]).long()
 
         # DW class definitions
-        DW_WATER, DW_FOREST, DW_SHRUB = 0, 1, 5
-        DW_NONFOREST = torch.isin(dw_mask, torch.tensor([7, 8]))
-        
-        # Disagreement masks
-        # nullify = (fortypba > 1) & (~torch.isin(dw_mask, torch.tensor([DW_FOREST, DW_SHRUB])))
+        DW_WATER = 0
+        DW_NONFOREST = 7
 
         # Apply classifications (order matters)
-        # fortypba[nullify] = nodata
-        fortypba[dw_mask == 6] = nodata  # Urban
-        # fortypba[dw_mask == DW_SHRUB] = 1
-        fortypba[DW_NONFOREST] = 0
-        fortypba[dw_mask == DW_WATER] = 14
+        # Urban areas -> nodata
+        fortypba[dw_mask == 6] = nodata
+        # fortypba[(dw_mask != 1) & (fortypba > 1)] = nodata
+        # Barren -> non-forest
+        # fortypba[dw_mask == DW_NONFOREST] = 0
+        # Water -> class 0 (water)
+        fortypba[dw_mask == DW_WATER] = 0
 
-        # Update output
-        if sample["mask"].dim() == 2:
-            sample["mask"] = fortypba.unsqueeze(0)
+        # Zero out regression channels where DW indicates water or non-forest
+        water_mask = dw_mask == DW_WATER
+        # nonforest_mask = dw_mask == DW_NONFOREST
+        cancov[water_mask] = 0.0
+        qmd_dom[water_mask] = 0.0
+        ba_ge_3[water_mask] = 0.0
+
+        # Reconstruct output mask with 4 channels (DW channel consumed)
+        if channel_dim == 1:
+            # Stack along channel dimension for batched data
+            output_mask = torch.stack([fortypba, cancov, qmd_dom, ba_ge_3], dim=1)
         else:
-            gnn_mask[0] = fortypba
-            gnn_mask[1:, dw_mask == DW_WATER] = 0
-            gnn_mask[1:, DW_NONFOREST] = 0
-            sample["mask"] = gnn_mask
+            output_mask = torch.stack([fortypba, cancov, qmd_dom, ba_ge_3], dim=0)
 
+        # Restore original dimensionality
+        if original_ndim == 2:
+            output_mask = output_mask.squeeze(0).squeeze(0)
+        elif original_ndim == 3:
+            output_mask = output_mask.squeeze(0)
+
+        sample["mask"] = output_mask
         return sample
 
     def __repr__(self):
-        return (
-            f"{self.__class__.__name__}("
-            f"dw_class={self.dw.__class__.__name__}, "
-            f"dw_path={getattr(self.dw, 'path', None)})"
-        )
+        return f"{self.__class__.__name__}()"

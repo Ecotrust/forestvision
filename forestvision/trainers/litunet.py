@@ -20,7 +20,7 @@ from torchgeo.trainers import BaseTask
 from kornia.enhance import Denormalize
 from segmentation_models_pytorch.losses import FocalLoss
 
-from forestvision.models.unet import MTUNet
+from forestvision.models.unet import MTUNet, ResMTUNet, OptimizedMTUNet
 
 from ..models import UNet
 from ..datasets import minmax_scaling
@@ -74,7 +74,9 @@ class RegressionUNet(BaseTask):
         elif loss == "mae":
             self.criterion: nn.Module = nn.L1Loss(reduction="none")
         elif loss == "l1ssim":
-            self.criterion: nn.Module = L1SSIMComboLoss(w=self.hparams.get("l1ssim_w", [1, 1]))
+            self.criterion: nn.Module = L1SSIMComboLoss(
+                w=self.hparams.get("l1ssim_w", [1, 1])
+            )
         else:
             raise ValueError(
                 f"Loss type '{loss}' is not valid. "
@@ -114,10 +116,15 @@ class RegressionUNet(BaseTask):
     def training_step(self, batch, batch_idx):
         x, y = batch["image"], batch["mask"].float()
 
-        # Sanitize target: remap all negative values to ignore_index
+        # DEBUG: Print batch stats
+        print(f"\n[DEBUG training_step] Batch {batch_idx}")
+        print(f"[DEBUG training_step] x shape: {x.shape}, dtype: {x.dtype}")
+        print(f"[DEBUG training_step] x stats: min={x.min().item():.2f}, max={x.max().item():.2f}, mean={x.mean().item():.2f}")
+        print(f"[DEBUG training_step] y shape: {y.shape}, dtype: {y.dtype}")
+        print(f"[DEBUG training_step] y stats: min={y.min().item():.2f}, max={y.max().item():.2f}, mean={y.mean().item():.2f}")
+
         ignore_idx = self.hparams.get("ignore_index", -1)
-        if ignore_idx is not None:
-            y[y < 0] = ignore_idx
+        print(f"[DEBUG training_step] ignore_index: {ignore_idx}")
 
         y_hat = self(x)
 
@@ -126,7 +133,8 @@ class RegressionUNet(BaseTask):
 
         mask = torch.zeros_like(y, dtype=torch.bool)
         if ignore_idx is not None:
-            mask = y == ignore_idx
+            # Robust mask: exact match OR large negative value
+            mask = (y == ignore_idx) | (y < -1e9)
 
         loss = self.compute_loss(y_hat, y, mask)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
@@ -147,11 +155,7 @@ class RegressionUNet(BaseTask):
     def validation_step(self, batch, batch_idx):
         x, y = batch["image"], batch["mask"].float()
 
-        # Sanitize target: remap all negative values to ignore_index
         ignore_idx = self.hparams.get("ignore_index", -1)
-        if ignore_idx is not None:
-            y[y < 0] = ignore_idx
-
         y_hat = self(x)
 
         if y_hat.ndim != y.ndim:
@@ -159,7 +163,7 @@ class RegressionUNet(BaseTask):
 
         mask = torch.zeros_like(y, dtype=torch.bool)
         if ignore_idx is not None:
-            mask = y == ignore_idx
+            mask = (y == ignore_idx) | (y < -1e9)
 
         loss = self.compute_loss(y_hat, y, mask)
         self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
@@ -179,11 +183,7 @@ class RegressionUNet(BaseTask):
     def test_step(self, batch, batch_idx):
         x, y = batch["image"], batch["mask"].float()
 
-        # Sanitize target: remap all negative values to ignore_index
         ignore_idx = self.hparams.get("ignore_index", -1)
-        if ignore_idx is not None:
-            y[y < 0] = ignore_idx
-
         y_hat = self(x)
 
         if y_hat.ndim != y.ndim:
@@ -191,7 +191,7 @@ class RegressionUNet(BaseTask):
 
         mask = torch.zeros_like(y, dtype=torch.bool)
         if ignore_idx is not None:
-            mask = y == ignore_idx
+            mask = (y == ignore_idx) | (y < -1e9)
             # Sanitize predictions
             y_hat = y_hat.clone()
             y_hat[mask] = ignore_idx
@@ -213,9 +213,10 @@ class RegressionUNet(BaseTask):
         if y_hat.ndim != y.ndim:
             y = y.unsqueeze(dim=1)
 
-        if self.hparams["ignore_index"] is not None:
-            mask = y == self.hparams["ignore_index"]
-            y_hat[mask] = self.hparams["ignore_index"]
+        ignore_idx = self.hparams.get("ignore_index")
+        if ignore_idx is not None:
+            mask = (y == ignore_idx) | (y < -1e9)
+            y_hat[mask] = ignore_idx
 
         return y_hat
 
@@ -308,11 +309,10 @@ class RegressionUNet(BaseTask):
 
         # Sanitize y and y_hat before revert to handle large negative NoData values
         ignore_idx = self.hparams.get("ignore_index", -1)
-        y = y.clone()
-        y[y < 0] = ignore_idx
 
         # Create persistent boolean mask for visualization (before denormalization)
-        mask_nodata = (y == ignore_idx).detach().cpu()  # [B, C, H, W]
+        # Use robust check for NoData
+        mask_nodata = ((y == ignore_idx) | (y < -1e9)).detach().cpu()  # [B, C, H, W]
 
         if y_hat is not None:
             y_hat = y_hat.clone()
@@ -556,16 +556,19 @@ class SegmentationUNet(BaseTask):
 
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch."""
-        # Compute confusion matrix
-        confmat = self.confusion_matrix.compute()
-        self.confusion_matrix.reset()
+        # Only compute confusion matrix if there are classification tasks
+        has_classification = any(t == "classification" for t in self.task_types)
+        if has_classification and hasattr(self, "confusion_matrix"):
+            # Compute confusion matrix
+            confmat = self.confusion_matrix.compute()
+            self.confusion_matrix.reset()
 
-        # Create and log confusion matrix plot
-        confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
-        if self.logger is not None:
-            self.logger.experiment.add_figure(
-                "confusion_matrix", confmat_fig, self.current_epoch
-            )
+            # Create and log confusion matrix plot
+            confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    "confusion_matrix", confmat_fig, self.current_epoch
+                )
 
         # Create and log sample batch plot
         if self.validation_step_outputs:
@@ -818,8 +821,11 @@ class MultiTaskUNet(BaseTask):
     def __init__(
         self,
         in_channels: int = 3,
-        num_seg_classes: int = 14,
-        num_reg_targets: int = 1,
+        task_types: list[str] = None,
+        num_classes_per_task: list[int] = None,
+        # Deprecated: kept for backward compatibility
+        num_seg_classes: int = None,
+        num_reg_targets: int = None,
         loss: str = "ce",
         lr: float = 1e-4,
         weight_decay: float = 1e-4,
@@ -831,21 +837,35 @@ class MultiTaskUNet(BaseTask):
         focal_gamma: float = 2.0,
         labels: dict = None,
         colormap: dict = None,
-        use_uncertainty_weighting: bool = True,
+        loss_weighting: str = "uncertainty",
+        seg_loss_weight: float = 0.5,
+        reg_loss_weights: list = None,
         init_log_vars: float = 0.0,
-        use_loss_normalization: bool = True,
+        use_loss_normalization: bool = False,
         loss_norm_momentum: float = 0.9,
         reg_loss: str = "mae",
         ssim_w: float = None,
         sharploss_alpha: float = 0.5,
         use_reg_tanh: bool = False,
+        model: str = "MTUNet",
+        backbone: str = "resnet50",
+        pretrained: bool = True,
+        freeze_backbone: bool = False,
+        task_band_names: list[str] = None,
     ):
-        """Multi-task UNet for simultaneous segmentation and regression.
+        """Multi-task UNet for flexible task combinations.
+
+        Supports any mix of classification and regression tasks.
 
         Args:
             in_channels: Number of input channels.
-            num_seg_classes: Number of segmentation classes (excluding ignore_index).
-            num_reg_targets: Number of regression targets (e.g. 1 for single continuous variable).
+            task_types: List of task types, e.g., ["classification", "regression"].
+                If None, inferred from num_seg_classes/num_reg_targets (deprecated).
+            num_classes_per_task: List of class counts per task. For classification,
+                this is the number of classes. For regression, this should be 1.
+                If None, inferred from num_seg_classes/num_reg_targets (deprecated).
+            num_seg_classes: (Deprecated) Number of segmentation classes.
+            num_reg_targets: (Deprecated) Number of regression targets.
             loss: Loss type for segmentation ("ce" or "focal").
             lr: Learning rate for optimizer.
             weight_decay: Weight decay for optimizer.
@@ -856,160 +876,393 @@ class MultiTaskUNet(BaseTask):
             focal_alpha: Alpha parameter for focal loss (if used).
             focal_gamma: Gamma parameter for focal loss (if used).
             labels: Optional dict mapping class indices to human-readable labels for visualization.
-            colormap: Optional dict mapping class indices to RGB color tuples for visualization. 
-            use_uncertainty_weighting: Whether to use homoscedastic uncertainty-based weighting of losses.
+            colormap: Optional dict mapping class indices to RGB color tuples for visualization.
+            loss_weighting: Loss weighting strategy ("uncertainty", "fixed", or "equal").
+            seg_loss_weight: Weight for segmentation loss when using "fixed" weighting.
+            reg_loss_weights: List of weights for each regression channel when using "fixed" weighting.
             init_log_vars: Initial log variances for uncertainty weighting (if used).
             use_loss_normalization: Whether to apply running average normalization to losses before weighting.
             loss_norm_momentum: Momentum for updating running average of losses if normalization is used.
-            reg_loss: Loss type for regression ("mae", "mse", or "l1ssim").
+            reg_loss: Loss type for regression ("mae", "sharploss", or "l1ssim").
             ssim_w: Weight for SSIM component in L1SSIMComboLoss if used for regression loss.
-            sharploss_alpha: Alpha parameter for L1SSIMComboLoss if used for regression loss.  
+            sharploss_alpha: Alpha parameter for SharpLoss if used for regression loss.
             use_reg_tanh: Whether to apply a tanh activation to the regression output.
+            model: Model architecture to use ("MTUNet", "ResMTUNet", or "OptimizedMTUNet").
+            backbone: ResNet backbone variant for ResMTUNet ("resnet18", "resnet34", "resnet50", "resnet101").
+            pretrained: Whether to use ImageNet pretrained weights for ResMTUNet.
+            freeze_backbone: Whether to freeze the backbone parameters for transfer learning.
         """
+        # Handle backward compatibility: convert deprecated params to new format first
+        task_types, num_classes_per_task = self._normalize_task_config(
+            task_types, num_classes_per_task, num_seg_classes, num_reg_targets
+        )
+
+        # Store the normalized values as the primary parameters
+        self.task_types = task_types
+        self.num_classes_per_task = num_classes_per_task
+
         super().__init__()
-        # Save hyperparameters, excluding visualization-only params
-        self.save_hyperparameters(ignore=["labels", "colormap"])
+
+        # Save hyperparameters, excluding visualization-only params and deprecated ones
+        # Note: task_types and num_classes_per_task are now instance attributes
+        self.save_hyperparameters(
+            ignore=[
+                "labels",
+                "colormap",
+                "num_seg_classes",
+                "num_reg_targets",
+                "task_types",
+                "num_classes_per_task",
+                "task_band_names",
+            ]
+        )
+
         # Store as instance attributes (not hyperparameters)
         self.labels = labels or {}
         self.colormap = colormap or {}
+        self.task_band_names = task_band_names or [f"task_{i}" for i in range(len(task_types))]
         self.validation_step_outputs = []
         # Store for loss logging
         self._last_loss_logs = {}
+
         # Running average normalization buffers (initialized to 1.0)
-        self.register_buffer("seg_loss_ema", torch.tensor(1.0))
-        # Register EMA buffers for each regression channel
-        for i in range(self.hparams["num_reg_targets"]):
-            self.register_buffer(f"reg_loss_ema_{i}", torch.tensor(1.0))
+        num_tasks = len(task_types)
+        for i in range(num_tasks):
+            self.register_buffer(f"loss_ema_{i}", torch.tensor(1.0))
 
-    def configure_models(self):
-        """Initialize the UNet model for classification."""
-        # Compute total output channels from explicit parameters
-        num_seg_classes = self.hparams["num_seg_classes"]
-        num_reg_targets = self.hparams["num_reg_targets"]
-        self.model = MTUNet(
-            in_channels=self.hparams["in_channels"],
-            seg_channels=num_seg_classes,
-            reg_channels=num_reg_targets,
-            dropout=self.hparams["dropout"],
-            use_tanh=self.hparams.get("use_reg_tanh", False),
-        )
-
-    def compute_loss(self, y, seg_logits, reg_out, ignore_index=None):
-        """Compute multi-task loss using homoscedastic uncertainty weighting.
-
-        Calculates loss for each regression channel separately, then passes all
-        task losses to the loss wrapper for uncertainty-based weighting.
-
-        Uses learnable task weights based on homoscedastic uncertainty to balance
-        segmentation and regression losses dynamically during training.
-
-        Optionally applies running average normalization to handle highly different
-        loss scales between tasks.
+    @staticmethod
+    def _normalize_task_config(
+        task_types, num_classes_per_task, num_seg_classes, num_reg_targets
+    ):
+        """Normalize task configuration from new or deprecated parameters.
 
         Args:
-            y: Target tensor of shape [B, C, H, W] where C includes seg + reg channels.
-            seg_logits: Segmentation logits tensor of shape [B, num_seg_classes, H, W].
-            reg_out: Regression output tensor of shape [B, num_reg_targets, H, W].
+            task_types: New parameter - list of task type strings.
+            num_classes_per_task: New parameter - list of class counts.
+            num_seg_classes: Deprecated parameter.
+            num_reg_targets: Deprecated parameter.
+
+        Returns:
+            Tuple of (task_types, num_classes_per_task).
+        """
+        # If new format provided, use it
+        if task_types is not None and num_classes_per_task is not None:
+            if len(task_types) != len(num_classes_per_task):
+                raise ValueError(
+                    f"task_types ({len(task_types)} items) and num_classes_per_task "
+                    f"({len(num_classes_per_task)} items) must have the same length"
+                )
+            return task_types, num_classes_per_task
+
+        # If neither format provided, use defaults
+        if task_types is None and num_classes_per_task is None:
+            if num_seg_classes is None and num_reg_targets is None:
+                # Default: single classification task with 14 classes
+                return ["classification"], [14]
+            # Convert deprecated format
+            task_types = []
+            num_classes_per_task = []
+            if num_seg_classes is not None and num_seg_classes > 0:
+                task_types.append("classification")
+                num_classes_per_task.append(num_seg_classes)
+            if num_reg_targets is not None and num_reg_targets > 0:
+                task_types.extend(["regression"] * num_reg_targets)
+                num_classes_per_task.extend([1] * num_reg_targets)
+            if not task_types:
+                raise ValueError("At least one task must be specified")
+            return task_types, num_classes_per_task
+
+        # Partial new format - error
+        raise ValueError(
+            "Must provide both task_types and num_classes_per_task, or use "
+            "deprecated num_seg_classes/num_reg_targets (but not both)"
+        )
+
+    def _get_total_output_channels(self) -> int:
+        """Calculate total number of output channels needed."""
+        return sum(self.num_classes_per_task)
+
+    def _get_classification_task_indices(self) -> list[int]:
+        """Get indices of classification tasks."""
+        return [i for i, t in enumerate(self.task_types) if t == "classification"]
+
+    def _get_regression_task_indices(self) -> list[int]:
+        """Get indices of regression tasks."""
+        return [i for i, t in enumerate(self.task_types) if t == "regression"]
+
+    def configure_models(self):
+        """Initialize the model for multi-task learning.
+
+        Supports MTUNet (standard U-Net), ResMTUNet (ResNet backbone), and
+        OptimizedMTUNet (with bottleneck skip connections).
+        """
+        model_type = self.hparams.get("model", "MTUNet")
+
+        # Calculate total channels needed for each head type
+        # seg_channels = sum of all classification task classes
+        # reg_channels = number of regression tasks (each has 1 channel)
+        seg_channels = sum(
+            num_classes
+            for task_type, num_classes in zip(
+                self.task_types, self.num_classes_per_task
+            )
+            if task_type == "classification"
+        )
+        reg_channels = sum(
+            1 for task_type in self.task_types if task_type == "regression"
+        )
+
+        # MTUNet requires at least 1 seg_channel, even if we only have regression tasks
+        # We'll allocate a dummy channel that won't be used
+        if seg_channels == 0:
+            seg_channels = 1
+
+        if model_type == "MTUNet":
+            self.model = MTUNet(
+                in_channels=self.hparams["in_channels"],
+                seg_channels=seg_channels,
+                reg_channels=reg_channels,
+                dropout=self.hparams["dropout"],
+                use_tanh=False,  # Handle activation in forward
+            )
+        elif model_type == "ResMTUNet":
+            self.model = ResMTUNet(
+                in_channels=self.hparams["in_channels"],
+                seg_channels=seg_channels,
+                reg_channels=reg_channels,
+                backbone=self.hparams.get("backbone", "resnet50"),
+                pretrained=self.hparams.get("pretrained", True),
+                freeze_backbone=self.hparams.get("freeze_backbone", False),
+                dropout=self.hparams["dropout"],
+                use_tanh=False,
+            )
+        elif model_type == "OptimizedMTUNet":
+            self.model = OptimizedMTUNet(
+                in_channels=self.hparams["in_channels"],
+                seg_channels=seg_channels,
+                reg_channels=reg_channels,
+                dropout=self.hparams["dropout"],
+                use_tanh=False,
+                bottleneck_ratio=self.hparams.get("bottleneck_ratio", 0.5),
+            )
+        else:
+            raise ValueError(
+                f"Unknown model type: {model_type}. "
+                "Supported models: 'MTUNet', 'ResMTUNet', 'OptimizedMTUNet'"
+            )
+
+    def compute_loss(self, y_hat, y, ignore_index=None):
+        """Compute multi-task loss with flexible task handling.
+
+        Supports three weighting strategies:
+        - "uncertainty": Homoscedastic uncertainty-based learnable weighting
+        - "fixed": Fixed manual weights for each task
+        - "equal": Equal weighting for all tasks
+
+        Args:
+            y_hat: Model predictions tensor of shape [B, total_channels, H, W].
+            y: Target tensor of shape [B, num_tasks, H, W].
             ignore_index: Index to ignore in loss computation.
 
-        Reference: Kendall et al., "Multi-Task Learning Using Uncertainty to Weigh
-        Losses for Scene Geometry and Semantics", CVPR 2018.
+        Returns:
+            Total loss tensor.
         """
-        # Use hparams ignore_index if not provided
         if ignore_index is None:
             ignore_index = self.hparams.get("ignore_index")
 
-        # Derive class counts from hparams
-        num_reg = self.hparams["num_reg_targets"]  # Regression targets
+        task_losses = []
+        channel_offset = 0
 
-        # Classification loss (FocalLoss returns scalar)
-        seg_loss = self.focal_loss(seg_logits, y[:, 0].long())
+        # Compute loss for each task
+        for task_idx, (task_type, num_classes) in enumerate(
+            zip(self.task_types, self.num_classes_per_task)
+        ):
+            task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
+            task_target = y[:, task_idx]
 
-        if num_reg > 0 and self.loss_wrapper is not None:
-            # Regression loss with masking - calculate per-channel losses
-            reg_target = y[:, 1 : num_reg + 1]  # [B, num_reg, H, W]
-            reg_losses = []  # List to hold individual channel losses
+            if task_type == "classification":
+                # Classification loss using FocalLoss
+                # For classification, we still use exact match for ignore_index as it's usually small positive or -1
+                loss = self.focal_loss(task_pred, task_target.long())
+            else:  # regression
+                # Regression loss - handle single channel
+                task_pred = task_pred[:, 0:1]  # [B, 1, H, W]
+                task_target = task_target.unsqueeze(1).float()  # [B, 1, H, W]
 
-            for i in range(num_reg):
-                # Extract single channel
-                reg_out_i = reg_out[:, i : i + 1]  # [B, 1, H, W]
-                reg_target_i = reg_target[:, i : i + 1]  # [B, 1, H, W]
+                # Robust mask for regression
+                reg_mask = (task_target == ignore_index) | (task_target < -1e9)
 
-                # Handle different regression loss types
-                if isinstance(self.reg_loss_fn, SharpLoss):
-                    # SharpLoss handles masking internally and returns scalar
-                    reg_mask = reg_target_i == ignore_index
-                    reg_loss_i = self.reg_loss_fn(reg_out_i, reg_target_i, reg_mask)
-                elif isinstance(self.reg_loss_fn, L1SSIMComboLoss):
-                    # L1SSIMComboLoss handles masking internally and returns scalar
-                    reg_mask = reg_target_i == ignore_index
-                    reg_loss_i = self.reg_loss_fn(reg_out_i, reg_target_i, reg_mask)
+                if isinstance(self.reg_loss_fn, (SharpLoss, L1SSIMComboLoss)):
+                    loss = self.reg_loss_fn(task_pred, task_target, reg_mask)
                 else:
-                    # MAE loss returns per-element losses, needs manual masking
-                    reg_loss_all = self.reg_loss_fn(
-                        reg_out_i, reg_target_i
-                    )  # [B, 1, H, W]
-                    reg_mask = reg_target_i == ignore_index
-                    reg_loss_valid = reg_loss_all[~reg_mask]
-
-                    # Guard against fully masked batch
-                    reg_loss_i = (
-                        reg_loss_valid.mean()
-                        if reg_loss_valid.numel() > 0
-                        else torch.tensor(0.0, device=reg_out.device)
+                    loss_all = self.reg_loss_fn(task_pred, task_target)
+                    loss_valid = loss_all[~reg_mask]
+                    loss = (
+                        loss_valid.mean()
+                        if loss_valid.numel() > 0
+                        else torch.tensor(0.0, device=y_hat.device)
                     )
 
-                reg_losses.append(reg_loss_i)
+            task_losses.append(loss)
+            channel_offset += num_classes
 
-            # Store raw losses for logging
-            raw_losses = [seg_loss.detach()] + [rl.detach() for rl in reg_losses]
+        # Store raw losses for logging
+        raw_losses = [l.detach() for l in task_losses]
 
-            # Apply running average normalization if enabled
-            if self.hparams.get("use_loss_normalization", False):
-                # Normalize segmentation loss
-                seg_loss_norm = seg_loss / (self.seg_loss_ema + 1e-8)
+        # Apply running average normalization if enabled
+        if self.hparams.get("use_loss_normalization", False):
+            task_losses_norm = []
+            for i, loss in enumerate(task_losses):
+                ema_buffer = getattr(self, f"loss_ema_{i}")
+                loss_norm = loss / (ema_buffer + 1e-8)
+                task_losses_norm.append(loss_norm)
 
-                # Normalize each regression channel loss
-                reg_losses_norm = []
-                for i, reg_loss_i in enumerate(reg_losses):
-                    ema_buffer = getattr(self, f"reg_loss_ema_{i}")
-                    reg_loss_norm = reg_loss_i / (ema_buffer + 1e-8)
-                    reg_losses_norm.append(reg_loss_norm)
-
-                # Update EMAs (in-place, no gradients)
+                # Update EMA
                 momentum = self.hparams.get("loss_norm_momentum", 0.9)
-                self.seg_loss_ema = (
-                    momentum * self.seg_loss_ema + (1 - momentum) * seg_loss.detach()
-                )
-                for i, reg_loss_i in enumerate(reg_losses):
-                    ema_buffer = getattr(self, f"reg_loss_ema_{i}")
-                    new_ema = momentum * ema_buffer + (1 - momentum) * reg_loss_i.detach()
-                    setattr(self, f"reg_loss_ema_{i}", new_ema)
+                new_ema = momentum * ema_buffer + (1 - momentum) * loss.detach()
+                setattr(self, f"loss_ema_{i}", new_ema)
 
-                task_losses = [seg_loss_norm] + reg_losses_norm
-            else:
-                task_losses = [seg_loss] + reg_losses
+            task_losses = task_losses_norm
 
-            # Apply homoscedastic uncertainty-based weighting
+        # Apply selected weighting strategy
+        loss_weighting = self.hparams.get("loss_weighting", "uncertainty")
+
+        if loss_weighting == "uncertainty":
             total_loss, loss_logs = self.loss_wrapper(task_losses)
+        elif loss_weighting == "fixed":
+            total_loss, loss_logs = self._compute_fixed_weighted_loss(task_losses)
+        elif loss_weighting == "equal":
+            total_loss, loss_logs = self._compute_equal_weighted_loss(task_losses)
+        elif loss_weighting == "realtime":
+            total_loss, loss_logs = self._compute_realtime_weighted_loss(task_losses)
+        else:
+            raise ValueError(f"Unknown loss_weighting strategy: {loss_weighting}")
 
-            # Add raw losses and EMA values to logs
-            loss_logs["task_0_raw_loss"] = raw_losses[0]
-            for i, raw_loss in enumerate(raw_losses[1:], start=1):
-                loss_logs[f"task_{i}_raw_loss"] = raw_loss
-            loss_logs["seg_loss_ema"] = self.seg_loss_ema.detach()
-            for i in range(num_reg):
-                loss_logs[f"reg_loss_ema_{i}"] = getattr(self, f"reg_loss_ema_{i}").detach()
+        # Add raw losses and EMA values to logs
+        for i, raw_loss in enumerate(raw_losses):
+            loss_logs[f"task_{i}_raw_loss"] = raw_loss
+            loss_logs[f"loss_ema_{i}"] = getattr(self, f"loss_ema_{i}").detach()
 
-            # Store logs for training_step to use
-            self._last_loss_logs = loss_logs
+        self._last_loss_logs = loss_logs
+        return total_loss
 
-            return total_loss
+    def _compute_fixed_weighted_loss(self, task_losses):
+        """Compute weighted loss using fixed manual weights.
 
-        return seg_loss
+        Args:
+            task_losses: List of scalar loss tensors, one per task
+
+        Returns:
+            tuple containing:
+                - total_loss: Weighted sum of all task losses
+                - log_dict: Dictionary with individual losses and weights
+        """
+        num_tasks = len(task_losses)
+
+        # Get fixed weights - if not provided, use equal weights
+        fixed_weights = self.hparams.get("fixed_loss_weights", None)
+
+        if fixed_weights is None:
+            # Default to equal weighting
+            weights = [1.0 / num_tasks] * num_tasks
+        else:
+            # Use provided weights
+            if len(fixed_weights) != num_tasks:
+                raise ValueError(
+                    f"Number of fixed_loss_weights ({len(fixed_weights)}) must match "
+                    f"number of tasks ({num_tasks})"
+                )
+            # Normalize weights to sum to 1
+            total_weight = sum(fixed_weights)
+            weights = [w / total_weight for w in fixed_weights]
+
+        # Compute weighted loss
+        weighted_losses = []
+        log_dict = {}
+
+        for i, (loss, weight) in enumerate(zip(task_losses, weights)):
+            weighted_loss = weight * loss
+            weighted_losses.append(weighted_loss)
+
+            # Logging
+            log_dict[f"task_{i}_raw_loss"] = loss.detach()
+            log_dict[f"task_{i}_weight"] = weight
+
+        total_loss = torch.stack(weighted_losses).sum()
+        log_dict["total_loss"] = total_loss.detach()
+
+        return total_loss, log_dict
+
+    def _compute_equal_weighted_loss(self, task_losses):
+        """Compute weighted loss using equal weights for all tasks.
+
+        Args:
+            task_losses: List of scalar loss tensors [seg_loss, reg_loss_0, ...]
+
+        Returns:
+            tuple containing:
+                - total_loss: Equal-weighted sum of all task losses
+                - log_dict: Dictionary with individual losses and weights
+        """
+        num_tasks = len(task_losses)
+        weight = 1.0 / num_tasks
+
+        weighted_losses = []
+        log_dict = {}
+
+        for i, loss in enumerate(task_losses):
+            weighted_loss = weight * loss
+            weighted_losses.append(weighted_loss)
+
+            # Logging
+            log_dict[f"task_{i}_raw_loss"] = loss.detach()
+            log_dict[f"task_{i}_weight"] = weight
+
+        total_loss = torch.stack(weighted_losses).sum()
+        log_dict["total_loss"] = total_loss.detach()
+
+        return total_loss, log_dict
+
+    def _compute_realtime_weighted_loss(self, task_losses):
+        """Compute loss using real-time reciprocal normalization.
+
+        Each loss is divided by its own detached value, making the normalized
+        loss equal to 1 while preserving gradients scaled by 1/loss_value.
+        This provides dynamic gradient balancing without learnable parameters
+        or running averages.
+
+        Formula: combined_loss = sum(loss_i / loss_i.detach())
+
+        Args:
+            task_losses: List of scalar loss tensors, one per task
+
+        Returns:
+            tuple containing:
+                - total_loss: Sum of normalized losses
+                - log_dict: Dictionary with raw losses and effective weights
+        """
+        log_dict = {}
+        normalized_losses = []
+
+        for i, loss in enumerate(task_losses):
+            # Compute effective weight (reciprocal of detached loss)
+            effective_weight = 1.0 / (loss.detach() + 1e-8)
+
+            # Normalize: loss / loss.detach() gives normalized loss ~1.0
+            normalized_loss = loss / (loss.detach() + 1e-8)
+            normalized_losses.append(normalized_loss)
+
+            # Logging
+            log_dict[f"task_{i}_raw_loss"] = loss.detach()
+            log_dict[f"task_{i}_effective_weight"] = effective_weight
+
+        total_loss = torch.stack(normalized_losses).sum()
+        log_dict["total_loss"] = total_loss.detach()
+
+        return total_loss, log_dict
 
     def configure_losses(self) -> None:
-        """Initialize the loss criterion and uncertainty weighting."""
+        """Initialize the loss criterion and weighting strategy."""
         self.focal_loss = FocalLoss(
             mode="multiclass",
             alpha=self.hparams.get("focal_alpha"),
@@ -1025,7 +1278,7 @@ class MultiTaskUNet(BaseTask):
         elif reg_loss_type == "sharploss":
             self.reg_loss_fn = SharpLoss(alpha=self.hparams.get("sharploss_alpha", 0.5))
         elif reg_loss_type == "l1ssim":
-            ssim_w = self.hparams.get('ssim_w', 0.5)
+            ssim_w = self.hparams.get("ssim_w", 0.5)
             l1_w = 1 - ssim_w
             self.reg_loss_fn = L1SSIMComboLoss(w=[l1_w, ssim_w])
         else:
@@ -1034,50 +1287,67 @@ class MultiTaskUNet(BaseTask):
                 "Currently, supports 'mae', 'sharploss', or 'ssim'."
             )
 
-        # Initialize homoscedastic uncertainty-based loss weighting
-        if self.hparams.get("use_uncertainty_weighting", True):
-            num_reg = self.hparams["num_reg_targets"]
-            task_types = ['classification'] + ['regression'] * num_reg
+        # Initialize loss weighting strategy
+        loss_weighting = self.hparams.get("loss_weighting", "uncertainty")
+
+        if loss_weighting == "uncertainty":
+            # Homoscedastic uncertainty-based learnable weighting
+            # Use actual task_types from config
             self.loss_wrapper = HomoscedasticUncertaintyLoss(
-                task_types=task_types,
+                task_types=self.task_types,
                 init_log_vars=self.hparams.get("init_log_vars", 0.0),
             )
-        else:
+        elif loss_weighting in ["fixed", "equal", "realtime"]:
+            # Simple weighted loss (fixed, equal, or realtime) - no learnable wrapper needed
             self.loss_wrapper = None
+        else:
+            raise ValueError(
+                f"Unknown loss_weighting strategy: {loss_weighting}. "
+                "Supported: 'uncertainty', 'fixed', 'equal', 'realtime'."
+            )
 
     def configure_metrics(self) -> None:
-        """Initialize the performance metrics for classification."""
-        seg_metrics = MetricCollection(
-            {
-                "accuracy": Accuracy(
-                    task="multiclass",
-                    num_classes=self.hparams["num_seg_classes"],
-                    ignore_index=self.hparams["ignore_index"],
-                ),
-                "kappa": CohenKappa(
-                    task="multiclass",
-                    num_classes=self.hparams["num_seg_classes"],
-                    weights="quadratic",
-                    ignore_index=self.hparams["ignore_index"],
-                ),
-                "jaccard": JaccardIndex(
-                    task="multiclass",
-                    num_classes=self.hparams["num_seg_classes"],
-                    ignore_index=self.hparams["ignore_index"],
-                ),
-            }
-        )
-        self.seg_train_metrics = seg_metrics.clone(prefix="seg_train_")
-        self.seg_val_metrics = seg_metrics.clone(prefix="seg_val_")
-        self.seg_test_metrics = seg_metrics.clone(prefix="seg_test_")
+        """Initialize metrics for all tasks dynamically."""
+        # Get the maximum number of classes for any classification task
+        max_num_classes = 0
+        for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            if task_type == "classification" and num_classes > max_num_classes:
+                max_num_classes = num_classes
 
-        # Confusion matrix for validation epoch end
-        self.confusion_matrix = ConfusionMatrix(
-            task="multiclass",
-            num_classes=self.hparams["num_seg_classes"],
-            ignore_index=self.hparams["ignore_index"],
-        )
+        # Classification metrics (shared across all classification tasks)
+        if max_num_classes > 0:
+            seg_metrics = MetricCollection(
+                {
+                    "accuracy": Accuracy(
+                        task="multiclass",
+                        num_classes=max_num_classes,
+                        ignore_index=self.hparams["ignore_index"],
+                    ),
+                    "kappa": CohenKappa(
+                        task="multiclass",
+                        num_classes=max_num_classes,
+                        weights="quadratic",
+                        ignore_index=self.hparams["ignore_index"],
+                    ),
+                    "jaccard": JaccardIndex(
+                        task="multiclass",
+                        num_classes=max_num_classes,
+                        ignore_index=self.hparams["ignore_index"],
+                    ),
+                }
+            )
+            self.seg_train_metrics = seg_metrics.clone(prefix="seg_train_")
+            self.seg_val_metrics = seg_metrics.clone(prefix="seg_val_")
+            self.seg_test_metrics = seg_metrics.clone(prefix="seg_test_")
 
+            # Confusion matrix for validation epoch end (use first classification task)
+            self.confusion_matrix = ConfusionMatrix(
+                task="multiclass",
+                num_classes=max_num_classes,
+                ignore_index=self.hparams["ignore_index"],
+            )
+
+        # Regression metrics
         reg_metrics = MetricCollection(
             {
                 "rmse": MeanSquaredError(squared=False),
@@ -1099,16 +1369,17 @@ class MultiTaskUNet(BaseTask):
         if self.loss_wrapper is not None:
             params.extend(list(self.loss_wrapper.parameters()))
 
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             params,
             lr=self.hparams["lr"],
             weight_decay=self.hparams["weight_decay"],
         )
+        # Use ReduceLROnPlateau scheduler (doesn't require steps_per_epoch)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=self.hparams["scheduler_factor"],
-            patience=self.hparams["scheduler_patience"],
+            factor=self.hparams.get("scheduler_factor", 0.5),
+            patience=self.hparams.get("scheduler_patience", 10),
         )
         return {
             "optimizer": optimizer,
@@ -1120,16 +1391,18 @@ class MultiTaskUNet(BaseTask):
 
     def training_step(self, batch, batch_idx):
         """Training step with uncertainty weighting logging."""
-        x, y = batch["image"], batch["mask"].long()
-
+        x, y = batch["image"], batch["mask"]
         ignore_idx = self.hparams.get("ignore_index")
 
-        seg_logits, reg_out = self(x)
-        # Crop target to match logits shape (avoids interpolation artifacts on predictions)
-        if y.shape[2:] != seg_logits.shape[2:]:
-            y = self.crop_to_match(y, seg_logits.shape[2:])
+        # Forward pass
+        y_hat = self(x)
 
-        loss = self.compute_loss(y, seg_logits, reg_out, ignore_idx)
+        # Crop target to match output shape
+        if y.shape[2:] != y_hat.shape[2:]:
+            y = self.crop_to_match(y, y_hat.shape[2:])
+
+        # Compute loss
+        loss = self.compute_loss(y_hat, y, ignore_idx)
         self.log("train_loss", loss, on_epoch=True, sync_dist=True)
 
         # Log uncertainty weights and raw losses
@@ -1137,131 +1410,149 @@ class MultiTaskUNet(BaseTask):
             for key, value in self._last_loss_logs.items():
                 self.log(f"train_{key}", value, on_epoch=True, sync_dist=True)
 
-        ft_probs = seg_logits.softmax(dim=1)
-        ft_pred = torch.argmax(ft_probs, dim=1)
-
-        seg_metrics = self.seg_train_metrics(ft_pred, y[:, 0, :, :])
-        self.log_dict(seg_metrics, on_epoch=True, sync_dist=True)
-
-        # Handle variable regression targets for metrics
-        num_regression_targets = y.shape[1] - 1
-        if num_regression_targets > 0:
-            mask = torch.zeros_like(y, dtype=torch.bool)
-            if self.hparams["ignore_index"] is not None:
-                mask = y == self.hparams["ignore_index"]
-
-            # Only calculate regression metrics for available channels
-            y_reg = y[:, 1:, :]
-            y_hat_reg = reg_out[:, :num_regression_targets, :]
-            mask_reg = mask[:, 1:, :]
-
-            reg_metrics = self.reg_train_metrics(
-                y_hat_reg[~mask_reg].flatten(),
-                y_reg[~mask_reg].float().flatten(),
-            )
-            self.log_dict(reg_metrics, on_epoch=True, sync_dist=True)
+        # Compute metrics for each task
+        self._compute_and_log_metrics(y_hat, y, "train")
 
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        """Validation step for multi-task classification and regression."""
-        x, y = batch["image"], batch["mask"].long()
+    def _compute_and_log_metrics(self, y_hat, y, stage):
+        """Compute and log metrics for all tasks.
 
+        Args:
+            y_hat: Model predictions
+            y: Ground truth targets
+            stage: One of 'train', 'val', 'test'
+        """
         ignore_idx = self.hparams.get("ignore_index")
 
-        seg_logits, reg_out = self(x)  # Model outputs tuple
-        # Crop target to match logits shape (avoids interpolation artifacts on predictions)
-        if y.shape[2:] != seg_logits.shape[2:]:
-            y = self.crop_to_match(y, seg_logits.shape[2:])
+        # Get metric collections based on stage
+        # Segmentation metrics only exist if there are classification tasks
+        has_classification = any(t == "classification" for t in self.task_types)
+        if stage == "train":
+            seg_metrics = getattr(self, "seg_train_metrics", None)
+            reg_metrics = self.reg_train_metrics
+        elif stage == "val":
+            seg_metrics = getattr(self, "seg_val_metrics", None)
+            reg_metrics = self.reg_val_metrics
+        else:  # test
+            seg_metrics = getattr(self, "seg_test_metrics", None)
+            reg_metrics = self.reg_test_metrics
 
-        loss = self.compute_loss(y, seg_logits, reg_out, ignore_idx)
+        # Process each task
+        channel_offset = 0
+        for task_idx, (task_type, num_classes) in enumerate(
+            zip(self.task_types, self.num_classes_per_task)
+        ):
+            task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
+            task_target = y[:, task_idx]
+
+            if task_type == "classification":
+                # Classification metrics
+                probs = task_pred.softmax(dim=1)
+                pred = torch.argmax(probs, dim=1)
+
+                # Handle ignore_index
+                mask = torch.zeros_like(task_target, dtype=torch.bool)
+                if ignore_idx is not None:
+                    mask = task_target == ignore_idx
+
+                if not mask.all():
+                    metrics = seg_metrics(pred[~mask], task_target[~mask])
+                    self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+                # Update confusion matrix for validation
+                if stage == "val":
+                    self.confusion_matrix.update(pred, task_target)
+            else:
+                # Regression metrics
+                mask = torch.zeros_like(task_target, dtype=torch.bool)
+                if ignore_idx is not None:
+                    mask = (task_target == ignore_idx) | (task_target < -1e9)
+
+                if not mask.all():
+                    # Squeeze channel dim for regression (task_pred is [B, 1, H, W])
+                    metrics = reg_metrics(
+                        task_pred[:, 0][~mask].flatten(),
+                        task_target[~mask].float().flatten(),
+                    )
+                    self.log_dict(metrics, on_epoch=True, sync_dist=True)
+
+            channel_offset += num_classes
+
+    def validation_step(self, batch, batch_idx):
+        """Validation step with flexible task handling."""
+        x, y = batch["image"], batch["mask"]
+        ignore_idx = self.hparams.get("ignore_index")
+
+        # Forward pass
+        y_hat = self(x)
+
+        # Crop target to match output shape
+        if y.shape[2:] != y_hat.shape[2:]:
+            y = self.crop_to_match(y, y_hat.shape[2:])
+
+        # Compute loss
+        loss = self.compute_loss(y_hat, y, ignore_idx)
         self.log("val_loss", loss, on_epoch=True, sync_dist=True)
 
-        ft_probs = seg_logits.softmax(dim=1)
-        ft_pred = torch.argmax(ft_probs, dim=1)
+        # Compute metrics for each task
+        self._compute_and_log_metrics(y_hat, y, "val")
 
-        seg_metrics = self.seg_val_metrics(ft_pred, y[:, 0, :, :])
-        self.log_dict(seg_metrics, on_epoch=True, sync_dist=True)
+        # Convert y_hat from raw output [B, total_channels, H, W] to task format [B, num_tasks, H, W]
+        # for visualization. For classification, take argmax. For regression, keep single channel.
+        y_hat_tasks = []
+        channel_offset = 0
+        for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            if task_type == "classification":
+                # Take argmax to get class predictions [B, H, W] -> [B, 1, H, W]
+                task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
+                pred_classes = torch.argmax(task_pred, dim=1, keepdim=True)
+                y_hat_tasks.append(pred_classes)
+            else:  # regression
+                # Keep the single regression channel
+                y_hat_tasks.append(y_hat[:, channel_offset : channel_offset + 1])
+            channel_offset += num_classes
 
-        # Handle variable regression targets for metrics
-        num_regression_targets = y.shape[1] - 1
-        if num_regression_targets > 0:
-            mask = torch.zeros_like(y, dtype=torch.bool)
-            if self.hparams["ignore_index"] is not None:
-                mask = y == self.hparams["ignore_index"]
+        y_hat_for_viz = torch.cat(y_hat_tasks, dim=1)  # [B, num_tasks, H, W]
 
-            # Only calculate regression metrics for available channels
-            y_reg = y[:, 1:, :]
-            y_hat_reg = reg_out[:, :num_regression_targets, :]
-            # Clamp predictions to target min and max range
-            # y_hat_reg = torch.clamp(y_hat_reg, -5, 5)
-            mask_reg = mask[:, 1:, :]
-
-            reg_metrics = self.reg_val_metrics(
-                y_hat_reg[~mask_reg].flatten(),
-                y_reg[~mask_reg].float().flatten(),
-            )
-            self.log_dict(reg_metrics, on_epoch=True, sync_dist=True)
-
-        self.confusion_matrix.update(ft_pred, y[:, 0, :, :])
-
-        # Ensure prediction concatenation matches available regression outputs
-        preds = torch.cat([ft_pred.unsqueeze(1), y_hat_reg], dim=1)
-
-        batch["prediction"] = preds
+        # Store predictions for visualization
+        batch["prediction"] = y_hat_for_viz
         self.validation_step_outputs.append(batch)
 
     def test_step(self, batch, batch_idx):
-        """Test step for multi-task classification and regression."""
-        x, y = batch["image"], batch["mask"].long()
+        """Test step with flexible task handling."""
+        x, y = batch["image"], batch["mask"]
+        ignore_idx = self.hparams.get("ignore_index")
 
-        # Sanitize target: remap all negative values to ignore_index
-        ignore_idx = self.hparams.get("ignore_index", -1)
+        # Forward pass
+        y_hat = self(x)
 
-        seg_logits, reg_out = self(x)  # Model outputs tuple
-        # Crop target to match logits shape (avoids interpolation artifacts on predictions)
-        if y.shape[2:] != seg_logits.shape[2:]:
-            y = self.crop_to_match(y, seg_logits.shape[2:])
+        # Crop target to match output shape
+        if y.shape[2:] != y_hat.shape[2:]:
+            y = self.crop_to_match(y, y_hat.shape[2:])
 
-        loss = self.compute_loss(y, seg_logits, reg_out, ignore_idx)
+        # Compute loss
+        loss = self.compute_loss(y_hat, y, ignore_idx)
         self.log("test_loss", loss, on_epoch=True, sync_dist=True)
 
-        ft_probs = seg_logits.softmax(dim=1)
-        ft_pred = torch.argmax(ft_probs, dim=1)
-
-        seg_metrics = self.seg_test_metrics(ft_pred, y[:, 0, :, :])
-        self.log_dict(seg_metrics, sync_dist=True)
-
-        # Handle variable regression targets for metrics
-        num_regression_targets = y.shape[1] - 1
-        if num_regression_targets > 0:
-            mask = torch.zeros_like(y, dtype=torch.bool)
-            if self.hparams["ignore_index"] is not None:
-                mask = y == self.hparams["ignore_index"]
-
-            # Only calculate regression metrics for available channels
-            y_reg = y[:, 1:, :]
-            y_hat_reg = reg_out[:, :num_regression_targets, :]
-            mask_reg = mask[:, 1:, :]
-
-            reg_metrics = self.reg_test_metrics(
-                y_hat_reg[~mask_reg].flatten(),
-                y_reg[~mask_reg].float().flatten(),
-            )
-            self.log_dict(reg_metrics, sync_dist=True)
+        # Compute metrics for each task
+        self._compute_and_log_metrics(y_hat, y, "test")
 
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch."""
-        # Compute confusion matrix
-        confmat = self.confusion_matrix.compute()
-        self.confusion_matrix.reset()
+        # Only compute confusion matrix if there are classification tasks
+        has_classification = any(t == "classification" for t in self.task_types)
+        if has_classification and hasattr(self, "confusion_matrix"):
+            # Compute confusion matrix
+            confmat = self.confusion_matrix.compute()
+            self.confusion_matrix.reset()
 
-        # Create and log confusion matrix plot
-        confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
-        if self.logger is not None:
-            self.logger.experiment.add_figure(
-                "confusion_matrix", confmat_fig, self.current_epoch
-            )
+            # Create and log confusion matrix plot
+            confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    "confusion_matrix", confmat_fig, self.current_epoch
+                )
 
         # Create and log sample batch plot
         if self.validation_step_outputs:
@@ -1275,341 +1566,306 @@ class MultiTaskUNet(BaseTask):
 
     def forward(self, x):
         """
-        Forward pass through the multi-task U-Net.
+        Forward pass through the multi-task U-Net with flexible task handling.
 
         Args:
             x (torch.Tensor): Input tensor of shape [B, C, H, W].
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: Tuple of (seg_logits, reg_out).
-                - seg_logits: Segmentation logits of shape [B, num_seg_classes, H, W].
-                - reg_out: Regression outputs of shape [B, num_reg_targets, H, W]
-                  with Tanh activation applied (range [-1, 1]).
+            torch.Tensor: Output tensor with task-specific activations applied.
+                Classification tasks: Raw logits (softmax applied in loss).
+                Regression tasks: Tanh activation (if use_reg_tanh=True) or raw values.
         """
-        return self.model(x)
+        # Get model output - model returns tuple of (seg_logits, reg_out)
+        seg_logits, reg_out = self.model(x)
 
-    def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0], max_null_ratio=0.7):
-        """Plot a sample of n images from batch for classification.
+        # Combine into unified tensor based on task configuration
+        outputs = []
+
+        # Track which parts of model output we've consumed
+        seg_channels_used = 0
+        reg_channels_used = 0
+
+        for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            if task_type == "classification":
+                # Take from segmentation logits
+                task_output = seg_logits[
+                    :, seg_channels_used : seg_channels_used + num_classes
+                ]
+                seg_channels_used += num_classes
+                outputs.append(task_output)
+            else:  # regression
+                # Take from regression output
+                task_output = reg_out[:, reg_channels_used : reg_channels_used + 1]
+                reg_channels_used += 1
+
+                if self.hparams.get("use_reg_tanh", False):
+                    # Apply tanh for bounded regression outputs
+                    outputs.append(torch.tanh(task_output))
+                else:
+                    # Raw regression values
+                    outputs.append(task_output)
+
+        # Concatenate all task outputs
+        return torch.cat(outputs, dim=1)
+
+    def _split_outputs_by_task(self, y_hat):
+        """Split model output into task-specific tensors.
 
         Args:
-            batch: Batch dictionary containing images, masks, and predictions
-            n: Maximum number of samples to plot
-            rgb_bands: Bands to use for RGB visualization
-            max_null_ratio: Maximum ratio of null pixels to allow in a sample (0.0-1.0)
+            y_hat: Model output tensor of shape [B, total_channels, H, W].
+
+        Returns:
+            Tuple of (classification_outputs, regression_outputs) where each is
+            a list of tensors, one per task of that type.
+        """
+        classification_outputs = []
+        regression_outputs = []
+        channel_offset = 0
+
+        for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            task_output = y_hat[:, channel_offset : channel_offset + num_classes]
+
+            if task_type == "classification":
+                classification_outputs.append(task_output)
+            else:  # regression
+                regression_outputs.append(task_output)
+
+            channel_offset += num_classes
+
+        return classification_outputs, regression_outputs
+
+    def _plot_input_row(self, axs_row, x, rgb_bands, ignore_idx):
+        """Plot input image row."""
+        for col_idx, img_tensor in enumerate(x):
+            num_channels = img_tensor.shape[0]
+            if num_channels >= 3:
+                bands = [b for b in rgb_bands if b < num_channels]
+                if len(bands) < 3:
+                    bands = list(range(min(3, num_channels)))
+                img = img_tensor[bands]
+                if img.shape[0] == 1:
+                    img = torch.stack([img[0]] * 3)
+                elif img.shape[0] == 2:
+                    img = torch.stack([img[0], img[1], img[0]])
+            else:
+                img = torch.stack([img_tensor[0]] * 3)
+
+            img = minmax_scaling(img, ignore_idx)
+            img = tvF.to_pil_image(img)
+            img = tvF.adjust_contrast(img, 2)
+            img = tvF.adjust_brightness(img, 1)
+
+            axs_row[col_idx].imshow(np.asarray(img))
+            axs_row[col_idx].set_title("input", fontsize="small")
+            axs_row[col_idx].axis("off")
+
+    def _plot_segmentation(self, ax, mask, mask_nodata, title):
+        """Plot segmentation mask."""
+        mask_data = np.round(mask.detach().cpu().numpy()).astype(int)
+        colored_mask = np.zeros((*mask_data.shape, 3), dtype=np.uint8)
+
+        if not self.colormap:
+            valid_mask = ~mask_nodata
+            if valid_mask.any():
+                m_min, m_max = mask_data[valid_mask].min(), mask_data[valid_mask].max()
+                if m_max > m_min:
+                    norm_mask = (mask_data - m_min) / (m_max - m_min)
+                else:
+                    norm_mask = np.zeros_like(mask_data, dtype=float)
+                cmap = plt.get_cmap("tab20")
+                colored_mask = (cmap(norm_mask)[..., :3] * 255).astype(np.uint8)
+        else:
+            for class_id, color in self.colormap.items():
+                try:
+                    cid = int(class_id)
+                except (ValueError, TypeError):
+                    cid = class_id
+                if isinstance(color, str):
+                    color = tuple(
+                        int(color.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4)
+                    )
+                colored_mask[mask_data == cid] = color
+
+            mapped = np.zeros_like(mask_data, dtype=bool)
+            for cid in self.colormap.keys():
+                try:
+                    cid = int(cid)
+                except:
+                    pass
+                mapped |= mask_data == cid
+            colored_mask[(~mapped) & (~mask_nodata)] = (255, 0, 0)
+
+        colored_mask[mask_nodata] = (0, 0, 0)
+        ax.imshow(colored_mask)
+        ax.set_title(title, fontsize="small")
+        ax.axis("off")
+        # Add min/mean/max stats for segmentation
+        valid_mask = ~mask_nodata
+        if valid_mask.any():
+            valid_data = mask_data[valid_mask]
+            stats_text = f"min:{valid_data.min()} mean:{valid_data.mean():.1f} max:{valid_data.max()} uniq:{len(np.unique(valid_data))}"
+        else:
+            stats_text = "nodata"
+        ax.set_xlabel(stats_text, fontsize="xx-small")
+
+    def _plot_regression(self, ax, img, mask_nodata, vmin, vmax, title):
+        """Plot regression image."""
+        img_data = img.detach().cpu().numpy()
+        img_masked = img_data.copy()
+        img_masked[mask_nodata] = np.nan
+        cmap = plt.get_cmap("viridis").copy()
+        cmap.set_bad(color="black")
+        ax.imshow(img_masked, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(title, fontsize="small")
+        ax.axis("off")
+        if (~mask_nodata).any():
+            # Calculate min/mean/max excluding NoData
+            valid_data = img_masked[~np.isnan(img_masked)]
+            stats_text = f"min:{valid_data.min():.1f} mean:{valid_data.mean():.1f} max:{valid_data.max():.1f}"
+            ax.set_xlabel(stats_text, fontsize="xx-small")
+        else:
+            ax.set_xlabel("nodata", fontsize="xx-small")
+
+    def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0], max_null_ratio=0.7):
+        """Plot a sample of n images from batch for multi-task models.
+
+        Works for any combination of classification and regression tasks.
+        Layout: 1 row (input) + 2 rows per task (target + prediction).
         """
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")
 
-        # Robust stats lookup
+        # Stats lookup
         input_stats = self.hparams.get("input_stats")
         target_stats = self.hparams.get("target_stats")
-
-        if input_stats is None:
-            input_stats = (
-                getattr(self.trainer.datamodule, "input_stats", None)
-                if hasattr(self, "trainer")
-                else None
-            )
+        if input_stats is None and hasattr(self, "trainer"):
+            input_stats = getattr(self.trainer.datamodule, "input_stats", None)
         if input_stats is None:
             input_stats = getattr(self, "input_stats", None)
-
-        if target_stats is None:
-            target_stats = (
-                getattr(self.trainer.datamodule, "target_stats", None)
-                if hasattr(self, "trainer")
-                else None
-            )
+        if target_stats is None and hasattr(self, "trainer"):
+            target_stats = getattr(self.trainer.datamodule, "target_stats", None)
         if target_stats is None:
             target_stats = getattr(self, "target_stats", None)
 
         def revert(tensor, stats, is_target=False):
-            if stats is not None:
-                m, s = stats["mean"], stats["std"]
+            if stats is None:
+                return tensor
+            m, s = stats.get("mean"), stats.get("std")
+            if m is None or s is None:
+                return tensor
+            if isinstance(m, list):
+                m = torch.tensor(m)
+            if isinstance(s, list):
+                s = torch.tensor(s)
+            m = m.to(device=tensor.device, dtype=tensor.dtype)
+            s = s.to(device=tensor.device, dtype=tensor.dtype)
+            num_c = tensor.shape[-3]
+            m, s = m[:num_c].clone(), s[:num_c].clone()
+            if is_target:
+                for i, t in enumerate(self.task_types):
+                    if t == "classification" and i < len(m):
+                        m[i], s[i] = 0.0, 1.0
+            view_shape = [1] * tensor.ndim
+            view_shape[-3] = num_c
+            return tensor * s.view(*view_shape) + m.view(*view_shape)
 
-                # Convert back to tensor if they were serialized to lists in hparams
-                if isinstance(m, list):
-                    m = torch.tensor(m).clone()
-                if isinstance(s, list):
-                    s = torch.tensor(s).clone()
-
-                if isinstance(m, torch.Tensor):
-                    m = m.clone()
-                if isinstance(s, torch.Tensor):
-                    s = s.clone()
-
-                # Ensure device match
-                m = m.to(tensor.device)
-                s = s.to(tensor.device)
-
-                num_stats_channels = len(m)
-                num_tensor_channels = tensor.shape[-3]
-
-                # STRICT CHECK: Stats must match tensor channels exactly
-                if num_stats_channels != num_tensor_channels:
-                    print(
-                        f"Warning: Stats channel mismatch in MultiTaskUNet.revert(): stats={num_stats_channels}, tensor={num_tensor_channels}. Slicing."
-                    )
-                    m = m[:num_tensor_channels]
-                    s = s[:num_tensor_channels]
-
-                # IMPORTANT: For MultiTask targets, channel 0 is categorical and SHOULD NOT be denormalized
-                if is_target and len(m) > 0:
-                    m[0] = 0.0
-                    s[0] = 1.0
-
-                return Denormalize(mean=m, std=s)(tensor.float())
-            return tensor
-
-        x, y, y_hat = batch["image"], batch["mask"], batch["prediction"]
-
-        # Sanitize y before revert to handle large negative NoData values
+        x, y, y_hat = batch["image"], batch["mask"], batch.get("prediction")
         ignore_idx = self.hparams.get("ignore_index")
-        y = y.clone()
-        # y[y < 0] = ignore_idx
 
-        # Crop y to match y_hat shape if needed (handles shape mismatch from UNet output)
         if y_hat is not None and y.shape[2:] != y_hat.shape[2:]:
             y = self.crop_to_match(y, y_hat.shape[2:])
 
-        # Create persistent boolean masks for visualization [B, C, H, W]
-        # We track nodata per-channel to handle mismatched NoData patterns in MultiTask
-        mask_nodata = (y == ignore_idx).detach().cpu().numpy()
+        mask_nodata = ((y == ignore_idx) | (y < -1e9)).detach().cpu().numpy()
 
-        # Filter samples based on null pixel ratio
-        # Calculate null ratio for each sample (considering all channels)
+        # Filter samples by null ratio
         batch_size = x.shape[0]
         valid_sample_indices = []
-
         for i in range(batch_size):
-            # Calculate null ratio across all channels for this sample
-            sample_null_mask = mask_nodata[i]  # [C, H, W]
-            total_pixels = sample_null_mask.size  # C * H * W
-            null_pixels = np.sum(sample_null_mask)
-            null_ratio = null_pixels / total_pixels
-
-            # Keep samples with null ratio below threshold
+            sample_null_mask = mask_nodata[i]
+            null_ratio = np.sum(sample_null_mask) / sample_null_mask.size
             if null_ratio <= max_null_ratio:
                 valid_sample_indices.append(i)
-
-        # If no samples meet the criteria, use the first 5
         if not valid_sample_indices:
             valid_sample_indices = list(range(min(5, batch_size)))
-            print(
-                f"Warning: No samples found with null ratio <= {max_null_ratio}. Using first 5 samples."
-            )
-
-        # Limit to n samples from valid indices
         if len(valid_sample_indices) > n:
             valid_sample_indices = valid_sample_indices[:n]
 
-        # Sanitize y_hat for plotting if not already done
+        # Sanitize y_hat
         if y_hat is not None:
             y_hat = y_hat.clone()
-            # Mask y_hat using y's NoData mask (now shapes match)
-            y_hat[y == ignore_idx] = float(ignore_idx)
+            y_hat[(y == ignore_idx) | (y < -1e9)] = float(ignore_idx)
 
-        x = revert(x, input_stats)
-        y = revert(y, target_stats, is_target=True)
-        y_hat = revert(y_hat, target_stats, is_target=True)
-
-        # Use only valid samples for plotting
-        x = x[valid_sample_indices]
-        y = y[valid_sample_indices]
+        # Revert normalization
+        x_plot = revert(x[valid_sample_indices], input_stats)
+        y_plot = revert(y[valid_sample_indices], target_stats, is_target=True)
         if y_hat is not None:
-            y_hat = y_hat[valid_sample_indices]
-        mask_nodata = mask_nodata[valid_sample_indices]
+            y_hat_plot = revert(
+                y_hat[valid_sample_indices], target_stats, is_target=True
+            )
 
-        # Determine actual number of samples to plot
+        mask_nodata_plot = mask_nodata[valid_sample_indices]
         actual_n = len(valid_sample_indices)
+        num_tasks = len(self.task_types)
+        n_rows = 1 + (2 if y_hat is not None else 1) * num_tasks
 
-        sample_dict = {
-            "input": x[:actual_n],
-            "fortypba": y[:actual_n, 0],
-            "fortypba_pred": y_hat[:actual_n, 0],
-        }
-
-        # Dynamically add regression targets if available
-        reg_names = ["cancov", "qmd_dom", "ba_ge_3"]
-        num_reg_available = y.shape[1] - 1
-        for i in range(num_reg_available):
-            name = reg_names[i] if i < len(reg_names) else f"reg_{i}"
-            sample_dict[name] = y[:actual_n, i + 1]
-            sample_dict[f"{name}_pred"] = y_hat[:actual_n, i + 1]
-
-        # Pre-calculate vmin/vmax for each regression target from target data
-        # This ensures predictions use the same colormap range as targets
-        reg_range = {}
-        for i in range(num_reg_available):
-            name = reg_names[i] if i < len(reg_names) else f"reg_{i}"
-            target_data = y[:actual_n, i + 1]  # [actual_n, H, W]
-
-            # Collect valid pixels across all samples for this target
-            valid_pixels_list = []
-            for col_idx in range(actual_n):
-                ch_idx = 1 + i  # Regression channel index
-                current_mask = mask_nodata[col_idx, ch_idx]
-                img = target_data[col_idx].squeeze().cpu().numpy()
-                valid_pixels = img[~current_mask]
-                if len(valid_pixels) > 0:
-                    valid_pixels_list.append(valid_pixels)
-
-            if valid_pixels_list:
-                all_valid = np.concatenate(valid_pixels_list)
-                vmin, vmax = np.percentile(all_valid, [2, 98])
-                if vmin == vmax:
-                    vmin, vmax = all_valid.min(), all_valid.max()
-                reg_range[name] = (vmin, vmax)
-            else:
-                reg_range[name] = (None, None)
-
-        num_rows = len(sample_dict)
-        num_cols = actual_n
         fig, axs = plt.subplots(
-            figsize=(4 * num_cols, 3 * num_rows),
-            nrows=num_rows,
-            ncols=num_cols,
+            nrows=n_rows,
+            ncols=actual_n,
+            figsize=(4 * actual_n, 3 * n_rows),
             squeeze=False,
         )
 
-        # Prepare regression colormap once to show NaNs as black
-        reg_cmap = plt.get_cmap("viridis").copy()
-        reg_cmap.set_bad(color="black")
+        self._plot_input_row(axs[0], x_plot, rgb_bands, ignore_idx)
 
-        for row_idx, (title, item) in enumerate(sample_dict.items()):
-            for col_idx in range(num_cols):
-                ax = axs[row_idx, col_idx]
-                if title == "input":
-                    # Handle different channel counts
-                    img_tensor = item[col_idx]
-                    num_channels = img_tensor.shape[0]
+        for task_idx, task_type in enumerate(self.task_types):
+            row_target = 1 + task_idx * (2 if y_hat is not None else 1)
+            row_pred = row_target + 1 if y_hat is not None else None
 
-                    if num_channels >= 3:
-                        # Use first 3 channels for RGB
-                        img = img_tensor[rgb_bands, :]
-                    elif num_channels == 2:
-                        # For 2 channels, duplicate the first channel to create RGB
-                        img = torch.stack([img_tensor[0], img_tensor[0], img_tensor[0]])
-                    else:
-                        # For 1 channel, create grayscale RGB
-                        img = torch.stack([img_tensor[0], img_tensor[0], img_tensor[0]])
+            vmin = vmax = None
+            if task_type == "regression" and target_stats:
+                vmin = target_stats.get("min", [None] * num_tasks)[task_idx]
+                vmax = target_stats.get("max", [None] * num_tasks)[task_idx]
 
-                    # Explicitly identify NoData areas for input images to show in black
-                    # Use the combined target mask as a reference for NoData areas in visualization
-                    # combined_nodata = mask_nodata[col_idx].any(axis=0)
+            # Get band name for this task
+            band_name = self.task_band_names[task_idx] if task_idx < len(self.task_band_names) else f"task_{task_idx}"
 
-                    img = minmax_scaling(img, ignore_idx)
-                    img = img.clone()
-                    # Ensure all channels are black where we have NoData (force to 0.0 after scaling)
-                    # img[:, combined_nodata] = 0.0
+            for col_idx in range(actual_n):
+                title_t = f"{band_name}_true"
+                title_p = f"{band_name}_pred"
 
-                    img = tvF.to_pil_image(img)
-                    img = tvF.adjust_contrast(img, 2)
-                    img = tvF.adjust_brightness(img, 1)
-                    ax.imshow(np.asarray(img))
-                    ax.set_title(f"{title}", fontsize="small")
-                elif title.startswith("fortypba"):
-                    # Show categorical mask
-                    mask_data = item[col_idx].squeeze().clone().detach().cpu().numpy()
-
-                    # fortypba is at channel 0
-                    ch_idx = 0
-                    current_mask = mask_nodata[col_idx, ch_idx]
-
-                    # Ensure mask_data is integer for categorical comparison
-                    mask_data = np.round(mask_data).astype(int)
-
-                    # Create colored mask using colormap
-                    colored_mask = np.zeros((*mask_data.shape, 3), dtype=np.uint8)
-
-                    if not self.colormap:
-                        # Default colormapping if empty
-                        valid_mask = ~current_mask
-                        if valid_mask.any():
-                            m_min, m_max = (
-                                mask_data[valid_mask].min(),
-                                mask_data[valid_mask].max(),
-                            )
-                            if m_max > m_min:
-                                norm_mask = (mask_data - m_min) / (m_max - m_min)
-                            else:
-                                norm_mask = np.zeros_like(mask_data, dtype=float)
-
-                            import matplotlib.cm as cm
-
-                            cmap = cm.get_cmap("tab20")
-                            colored_mask = (cmap(norm_mask)[..., :3] * 255).astype(
-                                np.uint8
-                            )
-                    else:
-                        # Use provided colormap
-                        for class_id, color in self.colormap.items():
-                            try:
-                                cid = int(class_id)
-                            except (ValueError, TypeError):
-                                cid = class_id
-
-                            if isinstance(color, str):
-                                color = tuple(
-                                    int(color.lstrip("#")[i : i + 2], 16)
-                                    for i in (0, 2, 4)
-                                )
-                            mask_pixels = mask_data == cid
-                            colored_mask[mask_pixels] = color
-
-                        # Add fallback for classes not in colormap (red)
-                        mapped_mask = np.zeros_like(mask_data, dtype=bool)
-                        for class_id in self.colormap.keys():
-                            try:
-                                cid = int(class_id)
-                            except (ValueError, TypeError):
-                                cid = class_id
-                            mapped_mask |= mask_data == cid
-
-                        unmapped_mask = (~mapped_mask) & (~current_mask)
-                        colored_mask[unmapped_mask] = (255, 0, 0)
-
-                    # Always set ignore index to black
-                    colored_mask[current_mask] = (0, 0, 0)
-
-                    ax.imshow(colored_mask)
-                    ax.set_title(f"{title}", fontsize="small")
-
-                    # Add stats to xlabel for debugging
-                    unique_vals = np.unique(mask_data[~current_mask])
-                    ax.set_xlabel(
-                        f"min:{mask_data.min()} max:{mask_data.max()} uniq:{len(unique_vals)}",
-                        fontsize="xx-small",
+                if task_type == "classification":
+                    self._plot_segmentation(
+                        axs[row_target, col_idx],
+                        y_plot[col_idx, task_idx],
+                        mask_nodata_plot[col_idx, task_idx],
+                        title_t,
                     )
-
-                else:
-                    # Show regression output
-                    img = item[col_idx].squeeze().clone().detach().cpu().numpy()
-
-                    # Calculate channel index to retrieve the correct NoData mask
-                    reg_ch_offset = row_idx - 3
-                    ch_idx = 1 + (reg_ch_offset // 2)
-                    current_mask = mask_nodata[col_idx, ch_idx]
-
-                    # Get the regression variable name (remove "_pred" suffix if present)
-                    reg_name = title.replace("_pred", "")
-                    # Use pre-computed vmin/vmax from target data for consistent colormap
-                    vmin, vmax = reg_range.get(reg_name, (None, None))
-
-                    img_masked = img.copy()
-                    img_masked[current_mask] = np.nan
-
-                    ax.imshow(img_masked, cmap=reg_cmap, vmin=vmin, vmax=vmax)
-                    ax.set_title(f"{title}", fontsize="small")
-
-                    valid_mask = ~current_mask
-                    if valid_mask.any():
-                        ax.set_xlabel(
-                            f"min:{np.nanmin(img_masked):.1f} max:{np.nanmax(img_masked):.1f} mean:{np.nanmean(img_masked):.1f}",
-                            fontsize="xx-small",
+                    if row_pred is not None:
+                        self._plot_segmentation(
+                            axs[row_pred, col_idx],
+                            y_hat_plot[col_idx, task_idx],
+                            mask_nodata_plot[col_idx, task_idx],
+                            title_p,
                         )
-
-                ax.get_xaxis().set_ticks([])
-                ax.get_yaxis().set_ticks([])
+                else:
+                    self._plot_regression(
+                        axs[row_target, col_idx],
+                        y_plot[col_idx, task_idx],
+                        mask_nodata_plot[col_idx, task_idx],
+                        vmin,
+                        vmax,
+                        title_t,
+                    )
+                    if row_pred is not None:
+                        self._plot_regression(
+                            axs[row_pred, col_idx],
+                            y_hat_plot[col_idx, task_idx],
+                            mask_nodata_plot[col_idx, task_idx],
+                            vmin,
+                            vmax,
+                            title_p,
+                        )
 
         plt.tight_layout()
         return fig
