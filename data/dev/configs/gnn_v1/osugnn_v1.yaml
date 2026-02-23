@@ -9,39 +9,65 @@ model:
   class_path: forestvision.trainers.litunet.MultiTaskUNet
   init_args:
     in_channels: 11 # 5 S2 bands + 2 indices (NDVI, SAVI) + 1 elevation + 3 climate variables 
-    # Explicit architecture parameters
-    num_seg_classes: 15  # Segmentation classes (NF + Water + 13 forest types)
-    num_reg_targets: 3   # Regression targets (0 - 3)
-    loss: "focal"
-    # lr: 0.004600216969734407
-    # dropout: 0.21625512195259877
-    # weight_decay: 2.2988074881141243e-05
-    # scheduler_patience: 4
-    # scheduler_factor: 0.11788464636738039
-    # focal_alpha: 0.9274758030302558
-    # focal_gamma: 3.609833765630662
-    # reg_loss: sharploss
-    # sharploss_alpha: 0.661701233740305
-    # use_reg_tanh: False
-    # init_log_vars: 0.5319290553835152
+    # Model architecture selection: "MTUNet" (standard) or "ResMTUNet" (ResNet backbone)
+    model: OptimizedMTUNet
+    # For ResMTUNet, uncomment and configure below:
+    # model: ResMTUNet
+    # backbone: resnet34  # Options: resnet18, resnet34, resnet50, resnet101
+    # pretrained: false    # Use ImageNet pretrained weights
+    # freeze_backbone: false  # Freeze backbone for transfer learning
+    # Task configuration - flexible task types
+    # Options: "classification" or "regression" for each task
+    task_types: ["classification", "regression", "regression", "regression"]
+    # Number of classes per task:
+    # - For classification: number of classes (e.g., 15 for segmentation)
+    # - For regression: always 1 (single channel per regression target)
+    num_classes_per_task: [14, 1, 1, 1]
+    # Deprecated (kept for backward compatibility):
+    # num_seg_classes: 15  # Segmentation classes (NF + Water + 13 forest types)
+    # num_reg_targets: 2   # Regression targets (0 - 3)
+    loss: focal
+    # --- Optimized hyperparameters from Optuna ---
+    lr: 0.000133
+    dropout: 0.765
+    weight_decay: 0.00085
+    scheduler_patience: 7
+    scheduler_factor: 0.21
+    focal_alpha: 0.240
+    focal_gamma: 1.232
+    sharploss_alpha: 0.866
+    use_reg_tanh: false
+    # Loss weighting strategy: "uncertainty" (learnable), "fixed" (manual), or "equal"
+    loss_weighting: fixed
+    # For "uncertainty" weighting:
+    # init_log_vars: 0.6648852816008435
+    # For "fixed" weighting (example):
+    # loss_weighting: fixed
+    seg_loss_weight: 0.6
+    reg_loss_weights: [0.2, 0.1, 0.1]
+    # Normalization settings (works with any weighting strategy)
+    use_loss_normalization: False
+    loss_norm_momentum: 0.59
+    reg_loss: l1ssim
+    ssim_w: 0.6
+    # ---
+    # lr: 0.001980377349249981
+    # dropout: 0.500347366287181
+    # weight_decay: 5.656146765126758e-05
+    # scheduler_patience: 3
+    # scheduler_factor: 0.6059236710555266
+    # focal_alpha: 0.9903905684609642
+    # focal_gamma: 3.1543006944754373
+    # reg_loss: mae
+    # sharploss_alpha: 0.3309128418068148
+    # init_log_vars: 0.2010758351200626
     # use_loss_normalization: True
-    # loss_norm_momentum: 0.8717541653445785
-    lr: 0.001980377349249981
-    dropout: 0.500347366287181
-    weight_decay: 5.656146765126758e-05
-    scheduler_patience: 3
-    scheduler_factor: 0.6059236710555266
-    focal_alpha: 0.9903905684609642
-    focal_gamma: 3.1543006944754373
-    reg_loss: mae
-    sharploss_alpha: 0.3309128418068148
-    init_log_vars: 0.2010758351200626
-    use_loss_normalization: True
-    loss_norm_momentum: 0.989119701229876
-    use_reg_tanh: false # Whether to apply tanh activation to regression outputs (to bound them within a range, e.g., for TD which is typically between 0 and 30)
+    # loss_norm_momentum: 0.989119701229876
+    # use_reg_tanh: false # Whether to apply tanh activation to regression outputs (to bound them within a range, e.g., for TD which is typically between 0 and 30)
+    # ---
     ignore_index: -2147483648
     labels:
-      0: NF       # Non-forest
+      0: wat      # Water (from DW) # Non-forest
       1: shr      # Shrub
       2: rip      # Riparian
       3: lpp      # Lodgepole pine
@@ -55,9 +81,10 @@ model:
       11: dfi     # Douglas-fir - Western Hemlock
       12: sfi     # Silver fir - Mountain Hemlock
       13: spr     # Spruce - Subalpine Fir
-      14: wat     # Water (from DW)
+      # 14: wat     # Water (from DW)
     colormap:
-      0: "#ffffff"  
+      # 0: "#ffffff"  
+      0: "#419BDF"  # Water blue (from DW colormap)
       1: "#1f77b4"
       2: "#ff7f0e"
       3: "#2ca02c"
@@ -71,14 +98,13 @@ model:
       11: "#aec7e8"
       12: "#ffbb78"
       13: "#98df8a"
-      14: "#419BDF"  # Water blue (from DW colormap)
 
 data:
   class_path: forestvision.datamodules.ForTypesDataModule
   init_args:
     root: data/
     year: 2021
-    batch_size: 48
+    batch_size: 32
     patch_size: 120
     stats_path: dev/configs/gnn_v1/osugnn_v1_stats.json
     train_tiles_path: dev/tiles/train_test_120p10m.geojson
@@ -136,28 +162,61 @@ data:
         kwargs:
           res: 10
           remap: true
-        transforms:
-          class_path: forestvision.transforms.CombineGNNDWMask
-          init_args:
-            dw_class: forestvision.datasets.GEEDynamicWorld
-            dw_path: "data/datasets/geedw/2021"
-            date_start: "2021-06-01"
-            date_end: "2021-08-31"
-            roi: [-2297985.0, -1541985.0, 2298015.0, 3174015.0]
+      - dataset_class: forestvision.datasets.GEEDynamicWorld
+        path_template: "datasets/geedw/{year}"
+        bands: [label]
+        kwargs:
+          date_start: "2021-06-01"
+          date_end: "2021-08-31"
+          res: 10
+
+    # train_transforms:
+    #   class_path: torchvision.transforms.v2.Compose
+    #   init_args:
+    #     transforms:
+    #     # Random horizontal flip (p=0.5)
+    #     - class_path: forestvision.transforms.augmentations.RandomHorizontalFlip
+    #       init_args:
+    #         p: 0.5
+    #     # Random discrete rotation (90°, 180°, 270°)
+    #     - class_path: forestvision.transforms.augmentations.RandomDiscreteRotation
+    #       init_args:
+    #         degrees: [90, 180, 270]
+    #     Random scaling (0.8-1.2x)
+    #     - class_path: forestvision.transforms.augmentations.RandomScale
+    #       init_args:
+    #         scale: [0.5, 2]
+
+    # Pre-augmentation transforms (run BEFORE augmentations)
+    # Use for any transforms that must happen on raw data before augmentation
     input_transforms:
       class_path: torchvision.transforms.v2.Compose
       init_args:
         transforms:
           - class_path: forestvision.transforms.SelectBands
             init_args:
-              # Indices from full stack: 10 s2 bands + 2 indices (NDVI, SAVI) + 1 elevation + 3 climate = 16 total channels
+              # Indices from full inputs stack: 10 s2 bands + 2 indices (NDVI, SAVI) + 1 elevation + 3 climate = 16 total channels
               indices: [0, 1, 2, 3, 9, 10, 11, 12, 13, 14, 15]
+
+    target_transforms:
+      class_path: torchvision.transforms.v2.Compose
+      init_args:
+        transforms:
+          - class_path: forestvision.transforms.CombineGNNDWMask
+
+    # Post-augmentation transforms (run AFTER augmentations)
+    # These are the main transforms that should happen on augmented data
+    post_aug_input_transforms:
+      class_path: torchvision.transforms.v2.Compose
+      init_args:
+        transforms:
           - class_path: forestvision.transforms.Normalize
             init_args:
               on_key: "image"
               # Channels indices from image stack after SelectBands that should not be normalized.
-              identity_channels: [5, 6] # NDMI and SAVI indices
-    target_transforms:
+              # identity_channels: [5, 6] # NDMI and SAVI indices
+
+    post_aug_target_transforms:
       class_path: torchvision.transforms.v2.Compose
       init_args:
         transforms:
