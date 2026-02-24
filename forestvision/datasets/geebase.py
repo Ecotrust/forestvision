@@ -1481,13 +1481,21 @@ class GEERasterDataset(CloudRasterDataset):
         k = "image" if self.is_image else "mask"
         image = sample[k].squeeze()
         # mask = image == self.nodata
-        if self.rgb_bands and self.bands:
+        if self.bands:
             if denormalizer:
                 image = denormalizer(image)
 
             image = minmax_scaling(image, self.nodata)
-            rgb_bands_idx = [self.bands.index(b) for b in self.rgb_bands]
-            image = image[rgb_bands_idx]
+            
+            # Check if rgb_bands are present in self.bands
+            if self.rgb_bands and all(b in self.bands for b in self.rgb_bands):
+                rgb_bands_idx = [self.bands.index(b) for b in self.rgb_bands]
+                image = image[rgb_bands_idx]
+            else:
+                # Fallback: use only the first band (grayscale)
+                _n = 3 if self.rgb_bands and len(self.rgb_bands) >= 3 else 1
+                image = image[0:_n]
+            
             image = tvF.to_pil_image(image)
             image = tvF.adjust_contrast(image, contrast)
             image = tvF.adjust_brightness(image, brightness)
