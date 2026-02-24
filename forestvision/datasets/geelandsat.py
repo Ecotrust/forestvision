@@ -1,7 +1,7 @@
 from datetime import datetime
 from functools import partial
 from dateutil.parser import parse
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ee
 from rasterio.crs import CRS
@@ -56,6 +56,11 @@ class GEELandsat8(GEERasterDataset):
         "SR_B5",
         "SR_B6",
         "SR_B7",
+        # Tasseled Cap transform outputs if append_transform="TC"
+        'TCW', 
+        'TCG', 
+        'TCB', 
+        'TCA'
     ]
 
     rgb_bands = ["SR_B6", "SR_B5", "SR_B4"]
@@ -72,6 +77,9 @@ class GEELandsat8(GEERasterDataset):
         roi: Optional[BoundingBox] = None,
         res: float = 30,
         season: str = "leafon",
+        spectral_index: Optional[str] = None,
+        spectral_index_only: bool = False,
+        bands: Optional[List[str]] = None,
         path: Optional[str] = None,
         crs: Optional[CRS] = CRS.from_epsg(5070),
         transforms: Callable[[Dict[str, Any]], Dict[str, Any]] | None = None,
@@ -87,6 +95,10 @@ class GEELandsat8(GEERasterDataset):
             res (float, optional): Resolution of the dataset in meters. Defaults to 30.
             season (str, optional): Season of interest, either "leafon" (April to September)
                 or "leafoff" (October to March). Defaults to "leafon".
+            spectral_index (str, optional): Spectral index to compute. Options: "TC" for
+                Tasseled Cap (brightness, greenness, wetness, angle). Defaults to None.
+            spectral_index_only (bool, optional): If True, return only the spectral index
+                bands. If False, append spectral index to original bands. Defaults to False.
             path (str, optional): Directory for data storage. Required if download is True.
             crs (CRS, optional): Coordinate reference system used to load the image.
                 Defaults to EPSG:5070.
@@ -109,7 +121,11 @@ class GEELandsat8(GEERasterDataset):
             cache=cache,
         )
         self.res = res
-        self.bands = [
+        self.spectral_index = spectral_index
+        self.spectral_index_only = spectral_index_only
+        
+        # Define base Landsat 8 bands
+        base_bands = [
             "SR_B1",
             "SR_B2",
             "SR_B3",
@@ -118,6 +134,21 @@ class GEELandsat8(GEERasterDataset):
             "SR_B6",
             "SR_B7",
         ]
+        
+        self.bands = bands or base_bands
+        if spectral_index == "TC":
+            tc_bands = ["TCB", "TCG", "TCW", "TCA"]
+            if spectral_index_only:
+                # Return only TC bands
+                self.bands = tc_bands
+                self.rgb_bands = ["TCG", "TCB", "TCW"]
+            else:
+                # Append TC to original bands
+                self.bands = base_bands + tc_bands
+                self.rgb_bands = ["SR_B6", "SR_B5", "SR_B4"]
+        else:
+            self.bands = base_bands
+        
         self.filename_suffix = f"_{year}_{season}"
 
         if season == "leafoff":
@@ -139,14 +170,22 @@ class GEELandsat8(GEERasterDataset):
                 - Date range filtered
                 - Preprocessing applied
                 - Selected bands only
+                - Optional transform applied (e.g., Tasseled Cap)
         """
-        return (
+        collection = (
             ee.ImageCollection(self.gee_asset_id)
             .filter(ee.Filter.lt("CLOUD_COVER", 20))
             .filterDate(self.date_start, self.date_end)
             .map(self._preprocess)
-            .select(self.bands)
         )
+        
+        # Apply transform if requested
+        if self.spectral_index == "TC":
+            collection = collection.map(
+                lambda img: self.tasseled_cap_transform(img, append=not self.spectral_index_only)
+            )
+        
+        return collection.select(self.bands)
 
     def _reducer(self, collection: ee.ImageCollection) -> ee.Image:
         """Reduce image collection to a single image using median.
@@ -180,6 +219,60 @@ class GEELandsat8(GEERasterDataset):
 
         return image.updateMask(cloud).updateMask(snow).unmask(self.nodata)
 
+    def tasseled_cap_transform(self, image: ee.Image, append: bool = False) -> ee.Image:
+        """Calculate tasseled cap transform components from Landsat 8.
+
+        This method implements the tasseled cap transformation for Landsat 8 imagery,
+        calculating brightness, greenness, wetness, and angle components using
+        predefined coefficients. Maps Landsat 8 bands (SR_B2-SR_B7) to the
+        harmonized band naming convention (B1-B7) for TC calculation.
+
+        Args:
+            image (ee.Image): Earth Engine image containing Landsat 8 spectral bands.
+            append (bool, optional): If True, append TC bands to original image.
+                If False, return only TC bands. Defaults to False.
+
+        Returns:
+            ee.Image: Image with tasseled cap components (TCB, TCG, TCW, TCA),
+                optionally appended to original bands.
+
+        Note:
+            Coefficients are based on Landsat TM/ETM+ tasseled cap transformation.
+            The angle (TCA) is calculated as atan(greenness/brightness) * 180/pi * 100.
+        """
+        # Map Landsat 8 bands to harmonized bands (B1-B7)
+        # SR_B2 (Blue) -> B1, SR_B3 (Green) -> B2, SR_B4 (Red) -> B3
+        # SR_B5 (NIR) -> B4, SR_B6 (SWIR1) -> B5, SR_B7 (SWIR2) -> B7
+        b = image.select(["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"])
+
+        # Define tasseled cap coefficients as ee.Image constants
+        brt_coeffs = ee.Image.constant([0.2043, 0.4158, 0.5524, 0.5741, 0.3124, 0.2303])
+        grn_coeffs = ee.Image.constant([-0.1603, -0.2819, -0.4934, 0.7940, -0.0002, -0.1446])
+        wet_coeffs = ee.Image.constant([0.0315, 0.2021, 0.3102, 0.1594, -0.6806, -0.6109])
+
+        # Create sum reducer
+        sum_reducer = ee.Reducer.sum()
+
+        # Calculate tasseled cap components
+        brightness = b.multiply(brt_coeffs).reduce(sum_reducer)
+        greenness = b.multiply(grn_coeffs).reduce(sum_reducer)
+        wetness = b.multiply(wet_coeffs).reduce(sum_reducer)
+
+        # Calculate angle (TCA)
+        angle = greenness.divide(brightness).atan().multiply(180 / 3.14159).multiply(100)
+
+        # Stack TC components
+        tc = ee.Image.cat([brightness, greenness, wetness, angle]).select(
+            [0, 1, 2, 3], ["TCB", "TCG", "TCW", "TCA"]
+        )
+
+        if append:
+            # Append TC bands to original image
+            return image.addBands(tc).set("system:time_start", image.get("system:time_start"))
+        else:
+            # Return only TC bands
+            return tc.set("system:time_start", image.get("system:time_start"))
+
 
 class GEELandsatFTV(GEERasterDataset):
     """Fit-to-Vertex (FTV) Harmonized Landsat TM/ETM+/OLI dataset.
@@ -211,6 +304,10 @@ class GEELandsatFTV(GEERasterDataset):
         "B4",
         "B5",
         "B7",
+        'TCW', 
+        'TCG', 
+        'TCB', 
+        'TCA'
     ]
 
     rgb_bands = ["B5", "B4", "B3"]
@@ -242,10 +339,13 @@ class GEELandsatFTV(GEERasterDataset):
         year: int,
         roi: BoundingBox,
         season: str = "leafon",
+        bands: Optional[List[str]] = None,
         spectral_index: str = "NBR",
+        spectral_index_only: bool = False,
         path: Optional[str] = None,
         crs: Optional[CRS] = CRS.from_epsg(5070),
         res: float = 30,
+        nodata: Optional[int] = None,
         transforms: Callable[[Dict[str, Any]], Dict[str, Any]] | None = None,
         download: bool = False,
         overwrite: bool = False,
@@ -283,6 +383,10 @@ class GEELandsatFTV(GEERasterDataset):
         self.season = season
         self.spectral_index = spectral_index
         self.year = year
+        if spectral_index_only:
+            self.bands = []
+        else:
+            self.bands = bands or self._bands
         self.collection
 
     @property
@@ -668,6 +772,291 @@ class GEELandsatTimeSeries:
         return self.get_tscollection()
 
 
+class GEELandTrendrDisturbance(GEERasterDataset):
+    """LandTrendr disturbance analysis dataset.
+
+    This dataset uses the LandTrendr algorithm to generate an image where
+    pixel values indicate the number of years since the largest disturbance
+    detected in the Landsat time series.
+
+    The output image contains four bands:
+        - ysd: Years since largest spectral change detected
+        - mag: Magnitude of the change
+        - dur: Duration of the change
+        - rate: Rate of change
+
+    Code adapted from: https://github.com/eMapR/LT-ChangeDB/tree/master
+
+    Attributes:
+        filename_glob (str): File pattern for matching files.
+        all_bands (List[str]): List of output bands (ysd, mag, dur, rate).
+        rgb_bands (List[str]): Bands to use for RGB visualization.
+        nodata (int): NoData value for the dataset.
+        is_image (bool): Whether this dataset contains image data.
+        instrument (str): Name of the analysis method.
+    """
+
+    filename_glob = "*.tif"
+
+    all_bands = ["ysd", "mag", "dur", "rate"]
+
+    rgb_bands = ["mag", "ysd", "rate"]
+
+    nodata = -32768
+
+    is_image = True
+
+    instrument = "LandTrendr Disturbance Analysis"
+
+    _disturbance_image = None
+
+    def __init__(
+        self,
+        year: int,
+        roi: BoundingBox,
+        date_start: int | str | None = None,
+        date_end: int | str | None = None,
+        bands: Optional[List[str]] = None,
+        season: str = "leafon",
+        spectral_index: str = "NBR",
+        nodata: Optional[int] = None,
+        flip_disturbance: bool = False,
+        big_fast: bool = False,
+        sieve: bool = False,
+        path: Optional[str] = None,
+        crs: Optional[CRS] = CRS.from_epsg(5070),
+        res: float = 30,
+        transforms: Callable[[Dict[str, Any]], Dict[str, Any]] | None = None,
+        download: bool = False,
+        overwrite: bool = False,
+        cache: bool = True,
+    ):
+        """Initialize a GEELandTrendrDisturbance dataset instance.
+
+        Args:
+            year (int): Current year used to calculate years since disturbance.
+            roi (BoundingBox): Region of interest to fetch data from.
+            date_start (int | str, optional): Start date of the time series.
+                If int, the year is assumed. If None, defaults to 20 years before year.
+            date_end (int | str, optional): End date of the time series.
+                If int, the year is assumed. If None, defaults to year - 1.
+            bands (List[str], optional): List of bands to include in the output image.
+                Defaults to ["ysd", "mag", "dur", "rate"].
+            season (str, optional): Season of the dataset, either "leafon"
+                (April to September) or "leafoff" (October to March).
+                Defaults to "leafon".
+            spectral_index (str, optional): Spectral index to use, either "NBR"
+                or "NDVI". Defaults to "NBR".
+            flip_disturbance (bool, optional): Whether to flip the sign of the
+                change in spectral change so that disturbances are indicated by
+                increasing reflectance. Defaults to False.
+            big_fast (bool, optional): If True, consider only big and fast
+                disturbances (magnitude > 100 and duration < 4 years).
+                Defaults to False.
+            sieve (bool, optional): If True, filter out disturbances that did
+                not affect more than 11 connected pixels in the year of
+                disturbance. Defaults to False.
+            path (str, optional): Directory where data are stored or downloaded
+                if download is True.
+            crs (CRS, optional): Coordinate reference system. Defaults to EPSG:5070.
+            res (float, optional): Resolution in meters. Defaults to 30.
+            transforms (Callable, optional): Transform function on each sample.
+            download (bool, optional): Whether to download data to path.
+                Defaults to False.
+            overwrite (bool, optional): Whether to overwrite existing files.
+                Defaults to False.
+            cache (bool, optional): Whether to cache data in memory.
+                Defaults to True.
+        """
+        super().__init__(
+            roi=roi,
+            path=path,
+            crs=crs,
+            transforms=transforms,
+            download=download,
+            overwrite=overwrite,
+            cache=cache,
+        )
+        self.res = res
+        self.bands = list(bands) if bands is not None else self.all_bands
+        self.year = year
+        self.season = season
+        self.spectral_index = spectral_index
+        self.flip_disturbance = flip_disturbance
+        self.big_fast = big_fast
+        self.sieve = sieve
+        self.nodata = nodata if nodata is not None else self.nodata
+
+        # Set default date range if not provided
+        if date_end is None:
+            self.date_end = year - 1
+        else:
+            self.date_end = date_end
+
+        if date_start is None:
+            # 20 year lookback window
+            self.date_start = self.date_end - 20
+        else:
+            self.date_start = date_start
+
+        self.filename_suffix = f"_{year}_{season}_disturbance"
+
+    @property
+    def collection(self) -> ee.Image:
+        """Get the disturbance analysis image.
+
+        Returns:
+            ee.Image: LandTrendr disturbance analysis image with selected bands
+                (ysd, mag, dur, rate) indicating years since disturbance,
+                magnitude, duration, and rate of the largest disturbance.
+
+        Note:
+            This property lazily initializes the LandTrendr analysis and
+            parses the results to extract disturbance information.
+        """
+        if self._disturbance_image is None:
+            lt = GEELandTrendr(
+                roi=self.roi,
+                date_start=self.date_start,
+                date_end=self.date_end,
+                season=self.season,
+                spectral_index=self.spectral_index,
+                ftv_bands=None,  # No FTV bands needed for disturbance analysis
+                crs=self.crs,
+            )
+
+            self.date_start = lt.date_start
+            self.date_end = lt.date_end
+
+            self._disturbance_image = self._parse_landtrendr_result(
+                lt.lt_result,
+                self.year,
+                bands=self.bands,
+                flip_disturbance=self.flip_disturbance,
+                big_fast=self.big_fast,
+                sieve=self.sieve,
+            )
+
+        return self._disturbance_image
+
+    def _parse_landtrendr_result(
+        self,
+        lt_result: ee.Image,
+        current_year: int,
+        bands: Optional[List[str]] = None,
+        flip_disturbance: bool = False,
+        big_fast: bool = False,
+        sieve: bool = False,
+    ) -> ee.Image:
+        """Parse LandTrendr segmentation result to extract disturbance information.
+
+        This method parses a LandTrendr segmentation result, returning an image
+        that identifies the years since the largest disturbance.
+
+        Args:
+            lt_result (ee.Image): Result of running
+                ee.Algorithms.TemporalSegmentation.LandTrendr on an image collection.
+            current_year (int): Used to calculate years since disturbance.
+            bands (List[str], optional): List of bands to include in the output image.
+                Defaults to ["ysd", "mag", "dur", "rate"].
+            flip_disturbance (bool): Whether to flip the sign of the change in
+                spectral change so that disturbances are indicated by increasing
+                reflectance.
+            big_fast (bool): Consider only big and fast disturbances.
+            sieve (bool): Filter out disturbances that did not affect more than
+                11 connected pixels in the year of disturbance.
+
+        Returns:
+            ee.Image: An image with selected bands:
+                - ysd: Years since largest spectral change detected
+                - mag: Magnitude of the change
+                - dur: Duration of the change
+                - rate: Rate of change
+        """
+        if bands is None:
+            bands = ["ysd", "mag", "dur", "rate"]
+
+        lt = lt_result.select("LandTrendr")
+        is_vertex = lt.arraySlice(0, 3, 4)  # 'Is Vertex' row - yes(1)/no(0)
+        verts = lt.arrayMask(is_vertex)  # vertices as boolean mask
+
+        left = verts.arraySlice(1, 0, -1)
+        right = verts.arraySlice(1, 1, None)
+        start_yr = left.arraySlice(0, 0, 1)
+        end_yr = right.arraySlice(0, 0, 1)
+        start_val = left.arraySlice(0, 2, 3)
+        end_val = right.arraySlice(0, 2, 3)
+
+        # Time since vertex (years since disturbance)
+        ysd = start_yr.subtract(current_year - 1).multiply(-1)
+        # Duration of change
+        dur = end_yr.subtract(start_yr)
+
+        # Magnitude of change
+        if flip_disturbance:
+            mag = end_val.subtract(start_val).multiply(-1)
+        else:
+            mag = end_val.subtract(start_val)
+
+        # Rate of change
+        rate = mag.divide(dur)
+
+        # Combine segments in the timeseries
+        seg_info = (
+            ee.Image.cat([ysd, mag, dur, rate]).toArray(0).updateMask(is_vertex.mask())
+        )
+
+        # Sort by magnitude of disturbance (descending)
+        sort_by_this = seg_info.arraySlice(0, 1, 2).toArray(0)
+        seg_info_sorted = seg_info.arraySort(sort_by_this.multiply(-1))
+        biggest_loss = seg_info_sorted.arraySlice(1, 0, 1)
+
+        # Create a dictionary of all possible bands
+        all_output_bands = {
+            "ysd": biggest_loss.arraySlice(0, 0, 1).arrayProject([1]).arrayFlatten([["ysd"]]),
+            "mag": biggest_loss.arraySlice(0, 1, 2).arrayProject([1]).arrayFlatten([["mag"]]),
+            "dur": biggest_loss.arraySlice(0, 2, 3).arrayProject([1]).arrayFlatten([["dur"]]),
+            "rate": biggest_loss.arraySlice(0, 3, 4).arrayProject([1]).arrayFlatten([["rate"]]),
+        }
+
+        # Select only the requested bands
+        selected_bands = [all_output_bands[b] for b in bands]
+        img = ee.Image.cat(selected_bands)
+
+        # Apply big_fast filter if requested
+        if big_fast:
+            # Get disturbances larger than 100 and less than 4 years in duration
+            dist_mask = img.select(["mag"]).gt(100).And(img.select(["dur"]).lt(4))
+            img = img.updateMask(dist_mask)
+
+        # Apply sieve filter if requested
+        if sieve:
+            max_size = 128  # Maximum map unit size in pixels
+            # Group adjacent pixels with disturbance in same year
+            # Create a mask identifying clumps larger than 11 pixels
+            mmu_patches = (
+                img.int16().select(["ysd"]).connectedPixelCount(max_size, True).gte(11)
+            )
+            img = img.updateMask(mmu_patches)
+
+        return img.round().toShort()
+
+    def _reducer(self, image: ee.Image) -> ee.Image:
+        """Reduce method for disturbance dataset (identity function).
+
+        Args:
+            image (ee.Image): Input Earth Engine image.
+
+        Returns:
+            ee.Image: The same input image (identity function).
+
+        Note:
+            For disturbance datasets, the reduction is handled by LandTrendr
+            and the parsing method, so this acts as an identity function.
+        """
+        return image
+
+
 class GEELandTrendr:
     """Performs LandTrendr analysis on a Harmonized Landsat time series.
 
@@ -731,20 +1120,23 @@ class GEELandTrendr:
         self.ftv_bands = ftv_bands
         self.lt_result
 
-    def normalized_difference(
+    def append_transform(
         self,
         image: ee.Image,
         sindex: str = "NBR",
     ) -> ee.Image:
-        """Calculate normalized difference spectral index.
+        """Calculate normalized difference spectral index or tasseled cap transform.
 
         Args:
             image (ee.Image): Earth Engine image containing spectral bands.
-            sindex (str, optional): Spectral index to calculate, either "NBR" or "NDVI".
+            sindex (str, optional): Spectral index to calculate. Options are "NBR", "NDVI", or "TC".
+                "NBR" - Normalized Burn Ratio using bands B4 and B7.
+                "NDVI" - Normalized Difference Vegetation Index using bands B4 and B3.
+                "TC" - Tasseled Cap Transform calculating brightness, greenness, wetness, and angle.
                 Defaults to "NBR".
 
         Returns:
-            ee.Image: Image with normalized difference index calculated.
+            ee.Image: Image with spectral index or tasseled cap components calculated.
 
         Raises:
             ValueError: If an invalid spectral index is provided.
@@ -753,8 +1145,10 @@ class GEELandTrendr:
             bands = ["B4", "B7"]
         elif sindex == "NDVI":
             bands = ["B4", "B3"]
+        elif sindex == "TC":
+            return self.tasseled_cap_transform(image)
         else:
-            raise ValueError("Invalid spectral index. Options are 'NBR' or 'NDVI'")
+            raise ValueError("Invalid spectral index. Options are 'NBR', 'NDVI', or 'TC'")
 
         nd = (
             image.normalizedDifference(bands)
@@ -773,6 +1167,58 @@ class GEELandTrendr:
             return nd.addBands(image.select(self.ftv_bands))
         else:
             return nd
+
+    def tasseled_cap_transform(self, image: ee.Image) -> ee.Image:
+        """Calculate tasseled cap transform components.
+
+        This method implements the tasseled cap transformation for Landsat imagery,
+        calculating brightness, greenness, wetness, and angle components using
+        predefined coefficients.
+
+        Args:
+            image (ee.Image): Earth Engine image containing spectral bands B1, B2, B3, B4, B5, B7.
+
+        Returns:
+            ee.Image: Image with tasseled cap components (TCB, TCG, TCW, TCA) and original bands.
+
+        Note:
+            Coefficients are based on Landsat TM/ETM+ tasseled cap transformation.
+            The angle (TCA) is calculated as atan(greenness/brightness) * 180/pi * 100.
+        """
+        # Select the image bands
+        b = image.select(["B1", "B2", "B3", "B4", "B5", "B7"])
+
+        # Define tasseled cap coefficients as ee.Image constants
+        brt_coeffs = ee.Image.constant([0.2043, 0.4158, 0.5524, 0.5741, 0.3124, 0.2303])
+        grn_coeffs = ee.Image.constant([-0.1603, -0.2819, -0.4934, 0.7940, -0.0002, -0.1446])
+        wet_coeffs = ee.Image.constant([0.0315, 0.2021, 0.3102, 0.1594, -0.6806, -0.6109])
+
+        # Create sum reducer
+        sum_reducer = ee.Reducer.sum()
+
+        # Calculate tasseled cap components
+        brightness = b.multiply(brt_coeffs).reduce(sum_reducer)
+        greenness = b.multiply(grn_coeffs).reduce(sum_reducer)
+        wetness = b.multiply(wet_coeffs).reduce(sum_reducer)
+
+        # Calculate angle (TCA)
+        angle = greenness.divide(brightness).atan().multiply(180 / 3.14159).multiply(100)
+
+        # Stack all components and rename bands
+        tc = (
+            brightness
+            .addBands(greenness)
+            .addBands(wetness)
+            .addBands(angle)
+            .select([0, 1, 2, 3], ["TCB", "TCG", "TCW", "TCA"])
+            .set("system:time_start", image.get("system:time_start"))
+        )
+
+        # Add original FTV bands if specified
+        if self.ftv_bands:
+            return tc.addBands(image.select(self.ftv_bands))
+        else:
+            return tc
 
     @property
     def lt_result(self) -> ee.Image:
@@ -799,7 +1245,7 @@ class GEELandTrendr:
             self.date_end = ts_collection.date_end
 
             norm_diff = partial(
-                self.normalized_difference,
+                self.append_transform,
                 sindex=self.spectral_index,
             )
 
@@ -832,6 +1278,8 @@ class GEELandTrendr:
         fitted_bands = []
         band_names = []
         for idx, band in enumerate(lt_res.bandNames().getInfo()):
+            print(f"Processing band: {band}")
+            # The first band contains the segmentation info, so we skip it
             if idx > 0:
                 band_names.append(band)
                 if band == "rmse":

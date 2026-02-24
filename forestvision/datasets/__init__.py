@@ -1,6 +1,12 @@
 from .cloudgeo import CloudRasterDataset
 from .geesentinel import GEESentinel2
-from .geelandsat import GEELandsat8, GEELandsatTimeSeries, GEELandTrendr, GEELandsatFTV
+from .geelandsat import (
+    GEELandsat8,
+    GEELandsatTimeSeries,
+    GEELandTrendr,
+    GEELandsatFTV,
+    GEELandTrendrDisturbance,
+)
 from .geealphaearth import GEEAlphaEarth
 from .geedw import GEEDynamicWorld
 from .gee3dep import GEE3Dep
@@ -21,6 +27,7 @@ __all__ = [
     "GEELandsatTimeSeries",
     "GEELandsatFTV",
     "GEELandTrendr",
+    "GEELandTrendrDisturbance",
     "GEEDynamicWorld",
     "GEEAlphaEarth",
     "GEE3Dep",
