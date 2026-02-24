@@ -850,6 +850,7 @@ class MultiTaskUNet(BaseTask):
         reg_loss: str = "mae",
         ssim_w: float = None,
         sharploss_alpha: float = 0.5,
+        huber_delta: float = 1.0,
         use_reg_tanh: bool = False,
         model: str = "MTUNet",
         backbone: str = "resnet50",
@@ -887,9 +888,11 @@ class MultiTaskUNet(BaseTask):
             init_log_vars: Initial log variances for uncertainty weighting (if used).
             use_loss_normalization: Whether to apply running average normalization to losses before weighting.
             loss_norm_momentum: Momentum for updating running average of losses if normalization is used.
-            reg_loss: Loss type for regression ("mae", "sharploss", or "l1ssim").
+            reg_loss: Loss type for regression ("mae", "mse", "sharploss", "l1ssim", or "huber").
             ssim_w: Weight for SSIM component in L1SSIMComboLoss if used for regression loss.
             sharploss_alpha: Alpha parameter for SharpLoss if used for regression loss.
+            huber_delta: Delta parameter for Huber loss (SmoothL1Loss) if used for regression loss.
+                Controls the point where the loss transitions from L2 to L1. Default is 1.0.
             use_reg_tanh: Whether to apply a tanh activation to the regression output.
             model: Model architecture to use ("MTUNet", "ResMTUNet", or "OptimizedMTUNet").
             backbone: ResNet backbone variant for ResMTUNet ("resnet18", "resnet34", "resnet50", "resnet101").
@@ -1281,16 +1284,21 @@ class MultiTaskUNet(BaseTask):
         reg_loss_type = self.hparams.get("reg_loss", "mae")
         if reg_loss_type == "mae":
             self.reg_loss_fn = nn.L1Loss(reduction="none")
+        elif reg_loss_type == "mse":
+            self.reg_loss_fn = nn.MSELoss(reduction="none")
         elif reg_loss_type == "sharploss":
             self.reg_loss_fn = SharpLoss(alpha=self.hparams.get("sharploss_alpha", 0.5))
         elif reg_loss_type == "l1ssim":
             ssim_w = self.hparams.get("ssim_w", 0.5)
             l1_w = 1 - ssim_w
             self.reg_loss_fn = L1SSIMComboLoss(w=[l1_w, ssim_w])
+        elif reg_loss_type == "huber":
+            delta = self.hparams.get("huber_delta", 1.0)
+            self.reg_loss_fn = nn.SmoothL1Loss(reduction="none", beta=delta)
         else:
             raise ValueError(
                 f"Regression loss type '{reg_loss_type}' is not valid. "
-                "Currently, supports 'mae', 'sharploss', or 'ssim'."
+                "Currently, supports 'mae', 'mse', 'sharploss', 'l1ssim', or 'huber'."
             )
 
         # Initialize loss weighting strategy
