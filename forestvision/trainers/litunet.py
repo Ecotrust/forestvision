@@ -117,11 +117,15 @@ class RegressionUNet(BaseTask):
         x, y = batch["image"], batch["mask"].float()
 
         # DEBUG: Print batch stats
-        print(f"\n[DEBUG training_step] Batch {batch_idx}")
-        print(f"[DEBUG training_step] x shape: {x.shape}, dtype: {x.dtype}")
-        print(f"[DEBUG training_step] x stats: min={x.min().item():.2f}, max={x.max().item():.2f}, mean={x.mean().item():.2f}")
-        print(f"[DEBUG training_step] y shape: {y.shape}, dtype: {y.dtype}")
-        print(f"[DEBUG training_step] y stats: min={y.min().item():.2f}, max={y.max().item():.2f}, mean={y.mean().item():.2f}")
+        # print(f"\n[DEBUG training_step] Batch {batch_idx}")
+        # print(f"[DEBUG training_step] x shape: {x.shape}, dtype: {x.dtype}")
+        # print(
+        #     f"[DEBUG training_step] x stats: min={x.min().item():.2f}, max={x.max().item():.2f}, mean={x.mean().item():.2f}"
+        # )
+        # print(f"[DEBUG training_step] y shape: {y.shape}, dtype: {y.dtype}")
+        # print(
+        #     f"[DEBUG training_step] y stats: min={y.min().item():.2f}, max={y.max().item():.2f}, mean={y.mean().item():.2f}"
+        # )
 
         ignore_idx = self.hparams.get("ignore_index", -1)
         print(f"[DEBUG training_step] ignore_index: {ignore_idx}")
@@ -920,7 +924,9 @@ class MultiTaskUNet(BaseTask):
         # Store as instance attributes (not hyperparameters)
         self.labels = labels or {}
         self.colormap = colormap or {}
-        self.task_band_names = task_band_names or [f"task_{i}" for i in range(len(task_types))]
+        self.task_band_names = task_band_names or [
+            f"task_{i}" for i in range(len(task_types))
+        ]
         self.validation_step_outputs = []
         # Store for loss logging
         self._last_loss_logs = {}
@@ -1562,7 +1568,106 @@ class MultiTaskUNet(BaseTask):
                     "val_images", batch_fig, self.current_epoch
                 )
 
+            # Generate and log marginal distribution plots for regression tasks
+            self._log_regression_marginals()
+
         self.validation_step_outputs.clear()
+
+    def _log_regression_marginals(self):
+        """Generate and log marginal distribution plots for all regression tasks.
+
+        Aggregates predictions across all validation batches and creates
+        true vs predicted scatter plots with marginal histograms.
+        """
+        if not self.validation_step_outputs:
+            return
+
+        # Get target stats for denormalization
+        target_stats = self.hparams.get("target_stats")
+        if target_stats is None and hasattr(self, "trainer"):
+            target_stats = getattr(self.trainer.datamodule, "target_stats", None)
+        if target_stats is None:
+            target_stats = getattr(self, "target_stats", None)
+
+        def revert(tensor, stats, is_target=False):
+            if stats is None:
+                return tensor
+            m, s = stats.get("mean"), stats.get("std")
+            if m is None or s is None:
+                return tensor
+            if isinstance(m, list):
+                m = torch.tensor(m)
+            if isinstance(s, list):
+                s = torch.tensor(s)
+            m = m.to(device=tensor.device, dtype=tensor.dtype)
+            s = s.to(device=tensor.device, dtype=tensor.dtype)
+            num_c = tensor.shape[1]  # [B, num_tasks, H, W]
+            m, s = m[:num_c].clone(), s[:num_c].clone()
+            if is_target:
+                for i, t in enumerate(self.task_types):
+                    if t == "classification" and i < len(m):
+                        m[i], s[i] = 0.0, 1.0
+            view_shape = [1] * tensor.ndim
+            view_shape[1] = num_c
+            return tensor * s.view(*view_shape) + m.view(*view_shape)
+
+        ignore_idx = self.hparams.get("ignore_index", -1)
+
+        # Aggregate all predictions and targets across batches
+        all_y_true = []
+        all_y_pred = []
+
+        for batch in self.validation_step_outputs:
+            y = batch["mask"]
+            y_hat = batch.get("prediction")
+
+            if y_hat is None:
+                continue
+
+            # Crop target to match prediction shape if needed
+            if y.shape[2:] != y_hat.shape[2:]:
+                y = self.crop_to_match(y, y_hat.shape[2:])
+
+            # Revert normalization to get actual values
+            y_denorm = revert(y, target_stats, is_target=True)
+            y_hat_denorm = revert(y_hat, target_stats, is_target=True)
+
+            all_y_true.append(y_denorm)
+            all_y_pred.append(y_hat_denorm)
+
+        if not all_y_true:
+            return
+
+        # Concatenate all batches
+        y_true_all = torch.cat(all_y_true, dim=0)  # [total_samples, num_tasks, H, W]
+        y_pred_all = torch.cat(all_y_pred, dim=0)  # [total_samples, num_tasks, H, W]
+
+        # Generate marginal plots for each regression task
+        for task_idx, task_type in enumerate(self.task_types):
+            if task_type != "regression":
+                continue
+
+            task_name = (
+                self.task_band_names[task_idx]
+                if task_idx < len(self.task_band_names)
+                else f"task_{task_idx}"
+            )
+
+            # Extract this task's data
+            y_true_task = y_true_all[:, task_idx]  # [total_samples, H, W]
+            y_pred_task = y_pred_all[:, task_idx]  # [total_samples, H, W]
+
+            # Create marginal plot
+            marginal_fig = self._plot_regression_marginal(
+                y_true_task, y_pred_task, task_idx, task_name
+            )
+
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    f"regression_marginal_{task_name}",
+                    marginal_fig,
+                    self.current_epoch,
+                )
 
     def forward(self, x):
         """
@@ -1727,6 +1832,136 @@ class MultiTaskUNet(BaseTask):
         else:
             ax.set_xlabel("nodata", fontsize="xx-small")
 
+    def _plot_regression_marginal(self, y_true, y_pred, task_idx, task_name):
+        """Create marginal distribution plot comparing true vs predicted values.
+
+        Creates a joint plot with:
+        - Main scatter plot: true vs predicted values (with transparency)
+        - Top histogram: distribution of true values
+        - Right histogram: distribution of predicted values
+        - Diagonal reference line (y=x) for perfect predictions
+        - R2 and correlation statistics
+
+        Args:
+            y_true: True values tensor [B, H, W]
+            y_pred: Predicted values tensor [B, H, W]
+            task_idx: Index of the regression task
+            task_name: Name of the task for the title
+
+        Returns:
+            matplotlib Figure with joint plot and marginal histograms
+        """
+        import matplotlib.gridspec as gridspec
+
+        plt.rcParams["savefig.bbox"] = "tight"
+
+        # Filter out NoData values
+        valid_mask = ~(
+            torch.isnan(y_true)
+            | torch.isnan(y_pred)
+            | (y_true == self.hparams.get("ignore_index", -1))
+            | (y_pred == self.hparams.get("ignore_index", -1))
+            | (y_true < -1e9)
+            | (y_pred < -1e9)
+        )
+
+        if valid_mask.sum() == 0:
+            # No valid data, return empty figure
+            fig = plt.figure(figsize=(8, 8))
+            fig.text(0.5, 0.5, "No valid data", ha="center", va="center", fontsize=14)
+            return fig
+
+        # Sample 10% of valid pixels (at least 100 points)
+        n_valid = valid_mask.sum().item()
+        sample_size = max(100, int(n_valid * 0.1))
+        if n_valid > sample_size:
+            # Get flat indices of valid pixels
+            valid_indices = torch.where(valid_mask.flatten())[0]
+            # Randomly select sample_size indices
+            perm = torch.randperm(n_valid, device=y_true.device)[:sample_size]
+            sampled_indices = valid_indices[perm]
+            # Create new mask with only sampled indices
+            sample_mask = torch.zeros_like(valid_mask.flatten())
+            sample_mask[sampled_indices] = True
+            valid_mask = sample_mask.reshape(valid_mask.shape)
+
+        y_true_valid = y_true[valid_mask].detach().cpu().numpy()
+        y_pred_valid = y_pred[valid_mask].detach().cpu().numpy()
+
+        # Calculate statistics
+        from sklearn.metrics import r2_score
+
+        r2 = r2_score(y_true_valid, y_pred_valid)
+        correlation = np.corrcoef(y_true_valid, y_pred_valid)[0, 1]
+        mae = np.mean(np.abs(y_true_valid - y_pred_valid))
+        rmse = np.sqrt(np.mean((y_true_valid - y_pred_valid) ** 2))
+
+        # Create figure with gridspec
+        fig = plt.figure(figsize=(10, 10))
+        gs = gridspec.GridSpec(
+            3, 3, figure=fig, height_ratios=[1, 4, 1], width_ratios=[4, 1, 0.2]
+        )
+
+        # Main scatter plot (center)
+        ax_scatter = fig.add_subplot(gs[1, 0])
+        ax_scatter.scatter(
+            y_true_valid,
+            y_pred_valid,
+            alpha=0.3,
+            s=10,
+            c="steelblue",
+            edgecolors="none",
+        )
+
+        # Diagonal reference line (y=x)
+        min_val = min(y_true_valid.min(), y_pred_valid.min())
+        max_val = max(y_true_valid.max(), y_pred_valid.max())
+        ax_scatter.plot(
+            [min_val, max_val],
+            [min_val, max_val],
+            "r--",
+            linewidth=2,
+            label="Perfect prediction (y=x)",
+        )
+
+        ax_scatter.set_xlabel("True Values", fontsize=12)
+        ax_scatter.set_ylabel("Predicted Values", fontsize=12)
+        ax_scatter.set_title(
+            f"{task_name}\nR²={r2:.3f}, ρ={correlation:.3f}, MAE={mae:.2f}, RMSE={rmse:.2f}",
+            fontsize=12,
+        )
+        ax_scatter.legend(loc="upper left", fontsize=9)
+        ax_scatter.grid(True, alpha=0.3)
+
+        # Top histogram (true values)
+        ax_top = fig.add_subplot(gs[0, 0], sharex=ax_scatter)
+        ax_top.hist(
+            y_true_valid, bins=30, color="steelblue", alpha=0.7, edgecolor="black"
+        )
+        ax_top.set_ylabel("Count", fontsize=10)
+        ax_top.tick_params(labelbottom=False)
+        ax_top.set_title(f"True Distribution (n={len(y_true_valid)})", fontsize=10)
+
+        # Right histogram (predicted values)
+        ax_right = fig.add_subplot(gs[1, 1], sharey=ax_scatter)
+        ax_right.hist(
+            y_pred_valid,
+            bins=30,
+            color="steelblue",
+            alpha=0.7,
+            edgecolor="black",
+            orientation="horizontal",
+        )
+        ax_right.set_xlabel("Count", fontsize=10)
+        ax_right.tick_params(labelleft=False)
+
+        # Colorbar space (empty subplot for alignment)
+        ax_cbar = fig.add_subplot(gs[1, 2])
+        ax_cbar.axis("off")
+
+        plt.tight_layout()
+        return fig
+
     def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0], max_null_ratio=0.7):
         """Plot a sample of n images from batch for multi-task models.
 
@@ -1828,7 +2063,11 @@ class MultiTaskUNet(BaseTask):
                 vmax = target_stats.get("max", [None] * num_tasks)[task_idx]
 
             # Get band name for this task
-            band_name = self.task_band_names[task_idx] if task_idx < len(self.task_band_names) else f"task_{task_idx}"
+            band_name = (
+                self.task_band_names[task_idx]
+                if task_idx < len(self.task_band_names)
+                else f"task_{task_idx}"
+            )
 
             for col_idx in range(actual_n):
                 title_t = f"{band_name}_true"
