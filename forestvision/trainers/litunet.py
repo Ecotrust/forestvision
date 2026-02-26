@@ -18,7 +18,44 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torchvision.transforms.functional as tvF
 from torchgeo.trainers import BaseTask
 from kornia.enhance import Denormalize
-from segmentation_models_pytorch.losses import FocalLoss
+from kornia.losses import FocalLoss
+from kornia.losses import focal_loss as kornia_focal_loss
+
+
+class DeviceAwareFocalLoss(nn.Module):
+    """Wrapper around kornia focal_loss that handles device placement for weights.
+    
+    This ensures the weight tensor is always on the same device as the predictions,
+    avoiding device mismatch errors when using class weights with GPU training.
+    """
+
+    def __init__(
+        self,
+        alpha: float | None = None,
+        gamma: float = 2.0,
+        reduction: str = "mean",
+        weight: torch.Tensor | None = None,
+        ignore_index: int = -100,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+        
+        # Register weight as buffer so it moves with the model, but we won't use
+        # it directly - we'll access it and move to correct device in forward
+        if weight is not None:
+            self.register_buffer("_weight", weight)
+        else:
+            self._weight = None
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Ensure weight is on same device as predictions
+        weight = self._weight.to(pred.device) if self._weight is not None else None
+        return kornia_focal_loss(
+            pred, target, self.alpha, self.gamma, self.reduction, weight, self.ignore_index
+        )
 
 from forestvision.models.unet import MTUNet, ResMTUNet, OptimizedMTUNet
 
@@ -128,7 +165,7 @@ class RegressionUNet(BaseTask):
         # )
 
         ignore_idx = self.hparams.get("ignore_index", -1)
-        print(f"[DEBUG training_step] ignore_index: {ignore_idx}")
+        # print(f"[DEBUG training_step] ignore_index: {ignore_idx}")
 
         y_hat = self(x)
 
@@ -427,12 +464,22 @@ class SegmentationUNet(BaseTask):
                 reduction="mean", ignore_index=self.hparams["ignore_index"]
             )
         elif loss == "focal":
-            self.criterion: nn.Module = FocalLoss(
-                mode="multiclass",
+            # Get focal_weight and register as buffer if provided
+            # This ensures the weight moves to the correct device with the model
+            focal_weight = self.hparams.get("focal_weight", None)
+            if focal_weight is not None:
+                if not isinstance(focal_weight, torch.Tensor):
+                    focal_weight = torch.tensor(focal_weight, dtype=torch.float32)
+                self.register_buffer("_focal_weight", focal_weight)
+            else:
+                self._focal_weight = None
+
+            self.criterion: nn.Module = DeviceAwareFocalLoss(
                 alpha=self.hparams.get("focal_alpha"),
                 gamma=self.hparams.get("focal_gamma", 2.0),
                 reduction="mean",
-                ignore_index=self.hparams["ignore_index"],
+                weight=self._focal_weight,
+                ignore_index=self.hparams.get("ignore_index", -100),
             )
         else:
             raise ValueError(
@@ -771,18 +818,18 @@ class SegmentationUNet(BaseTask):
                     # Display raw count
                     text_value = f"{display_matrix[i, j]:d}"
 
-                text = ax.text(
-                    j,
-                    i,
-                    text_value,
-                    ha="center",
-                    va="center",
-                    color=(
-                        "black"
-                        if display_matrix[i, j] < display_matrix.max() * 0.7
-                        else "white"
-                    ),
-                )
+                # text = ax.text(
+                #     j,
+                #     i,
+                #     text_value,
+                #     ha="center",
+                #     va="center",
+                #     color=(
+                #         "black"
+                #         if display_matrix[i, j] < display_matrix.max() * 0.7
+                #         else "white"
+                #     ),
+                # )
 
         ax.set_title("Confusion Matrix")
         plt.tight_layout()
@@ -839,6 +886,7 @@ class MultiTaskUNet(BaseTask):
         scheduler_factor: float = 0.5,
         focal_alpha: float = None,
         focal_gamma: float = 2.0,
+        focal_weight: list[float] = None,
         labels: dict = None,
         colormap: dict = None,
         loss_weighting: str = "uncertainty",
@@ -848,9 +896,10 @@ class MultiTaskUNet(BaseTask):
         use_loss_normalization: bool = False,
         loss_norm_momentum: float = 0.9,
         reg_loss: str = "mae",
-        ssim_w: float = None,
-        sharploss_alpha: float = 0.5,
         huber_delta: float = 1.0,
+        loss_type: str = "mae",
+        ssim_w: float = 0.5,
+        sharploss_alpha: float = 0.5,
         use_reg_tanh: bool = False,
         model: str = "MTUNet",
         backbone: str = "resnet50",
@@ -1272,12 +1321,22 @@ class MultiTaskUNet(BaseTask):
 
     def configure_losses(self) -> None:
         """Initialize the loss criterion and weighting strategy."""
-        self.focal_loss = FocalLoss(
-            mode="multiclass",
+        # Get focal_weight and register as buffer if provided
+        # This ensures the weight moves to the correct device with the model
+        focal_weight = self.hparams.get("focal_weight", None)
+        if focal_weight is not None:
+            if not isinstance(focal_weight, torch.Tensor):
+                focal_weight = torch.tensor(focal_weight, dtype=torch.float32)
+            self.register_buffer("_focal_weight", focal_weight)
+        else:
+            self._focal_weight = None
+
+        self.focal_loss = DeviceAwareFocalLoss(
             alpha=self.hparams.get("focal_alpha"),
             gamma=self.hparams.get("focal_gamma", 2.0),
             reduction="mean",
-            ignore_index=self.hparams.get("ignore_index", -1),
+            weight=self._focal_weight,
+            ignore_index=self.hparams.get("ignore_index", -100),
         )
 
         # Regression loss selection
@@ -1291,7 +1350,13 @@ class MultiTaskUNet(BaseTask):
         elif reg_loss_type == "l1ssim":
             ssim_w = self.hparams.get("ssim_w", 0.5)
             l1_w = 1 - ssim_w
-            self.reg_loss_fn = L1SSIMComboLoss(w=[l1_w, ssim_w])
+            loss_type = self.hparams.get("loss_type", "mae")
+            huber_delta = self.hparams.get("huber_delta", 1.0)
+            self.reg_loss_fn = L1SSIMComboLoss(
+                w=[l1_w, ssim_w],
+                loss_type=loss_type,
+                huber_delta=huber_delta,
+            )
         elif reg_loss_type == "huber":
             delta = self.hparams.get("huber_delta", 1.0)
             self.reg_loss_fn = nn.SmoothL1Loss(reduction="none", beta=delta)
