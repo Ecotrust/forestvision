@@ -223,37 +223,35 @@ class GNNForestAttr(RasterDataset):
 
         try:
             # Get raw data without transforms
+            # Always remap negative values to nodata
             sample = super().__getitem__(idx)
+            mask_negative = sample["mask"] < 0
+            sample["mask"][mask_negative] = self.nodata
+            # num_negative = mask_negative.sum().item()
+            # print(f"[DEBUG GNNForestAttr] Remapping {num_negative} negative values to NoData ({self.nodata})")
+            # print(f"[DEBUG GNNForestAttr] Mask shape: {sample['mask'].shape}, bands: {self.bands}")
+            # print(f"[DEBUG GNNForestAttr] Mask min/max before: {sample['mask'].min()}/{sample['mask'].max()}")
+            # print(f"[DEBUG GNNForestAttr] Mask min/max after: {sample['mask'].min()}/{sample['mask'].max()}")
 
             # Apply remapping FIRST (before transforms)
-            # Always remap negative values to NoData for all bands
-            if self.remap:
-                mask_negative = sample["mask"] < 0
-                num_negative = mask_negative.sum().item()
-                # print(f"[DEBUG GNNForestAttr] Remapping {num_negative} negative values to NoData ({self.nodata})")
-                # print(f"[DEBUG GNNForestAttr] Mask shape: {sample['mask'].shape}, bands: {self.bands}")
-                # print(f"[DEBUG GNNForestAttr] Mask min/max before: {sample['mask'].min()}/{sample['mask'].max()}")
-                sample["mask"][mask_negative] = self.nodata
-                # print(f"[DEBUG GNNForestAttr] Mask min/max after: {sample['mask'].min()}/{sample['mask'].max()}")
-
+            if self.remap and "fortypba" in self.bands:
                 # Additional fortypba-specific remapping only if fortypba band is present
-                if "fortypba" in self.bands:
-                    fortypba_idx = self.bands.index("fortypba")
+                fortypba_idx = self.bands.index("fortypba")
 
-                    if sample["mask"].ndim == 2:
-                        # Single band case: shape is (H, W)
-                        sample["mask"] = self.remap_fortypba(sample["mask"])
+                if sample["mask"].ndim == 2:
+                    # Single band case: shape is (H, W)
+                    sample["mask"] = self.remap_fortypba(sample["mask"])
 
-                    elif sample["mask"].ndim == 3:
-                        # Multi-band case: shape is (C, H, W)
-                        fortypba = sample["mask"][fortypba_idx]
-                        sample["mask"][fortypba_idx] = self.remap_fortypba(fortypba)
+                elif sample["mask"].ndim == 3:
+                    # Multi-band case: shape is (C, H, W)
+                    fortypba = sample["mask"][fortypba_idx]
+                    sample["mask"][fortypba_idx] = self.remap_fortypba(fortypba)
 
-                    else:
-                        raise ValueError(
-                            f"Unexpected mask dimensionality: {sample['mask'].ndim}. "
-                            f"Expected 2 (H, W) or 3 (C, H, W)."
-                        )
+                else:
+                    raise ValueError(
+                        f"Unexpected mask dimensionality: {sample['mask'].ndim}. "
+                        f"Expected 2 (H, W) or 3 (C, H, W)."
+                    )
 
             # Apply transforms AFTER remapping
             if original_transforms is not None:
