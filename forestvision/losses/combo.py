@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torch
 
+
 class HomoscedasticUncertaintyLoss(nn.Module):
     """
     Homoscedastic Uncertainty Loss Weighting for multi-task learning.
@@ -134,38 +135,119 @@ class HomoscedasticUncertaintyLoss(nn.Module):
             weights = self.multipliers.to(precision.device) * precision
         return weights
 
-class L1SSIMComboLoss(nn.Module):
-    def __init__(self, w: list = [1, 1]):
-        super(L1SSIMComboLoss, self).__init__()
+
+class SSIMComboLoss(nn.Module):
+    """
+    Combo loss combining pixel-wise loss (MAE, MSE, or Huber) with SSIM.
+
+    This loss combines a base pixel-wise loss function with the Structural
+    Similarity Index Measure (SSIM) to capture both pixel-level accuracy
+    and structural similarity. Useful for image regression tasks where
+    perceptual quality matters.
+
+    Args:
+        w: Weights for [base_loss, ssim_loss]. Default: [1, 1] (equal weighting).
+        loss_type: Type of base pixel-wise loss to use.
+                   Options: "mae" (L1), "mse" (L2), "huber" (Smooth L1).
+                   Default: "mae".
+        huber_delta: Delta parameter for Huber loss. Controls the point where
+                     the loss transitions from L2 to L1 behavior.
+                     Only used when loss_type="huber". Default: 1.0.
+
+    Example:
+        >>> # MAE + SSIM (default, same as original L1SSIMComboLoss)
+        >>> loss_fn = SSIMComboLoss(w=[0.5, 0.5])
+        >>> # MSE + SSIM
+        >>> loss_fn = SSIMComboLoss(w=[0.5, 0.5], loss_type="mse")
+        >>> # Huber + SSIM with custom delta
+        >>> loss_fn = SSIMComboLoss(w=[0.5, 0.5], loss_type="huber", huber_delta=0.5)
+        >>> pred = torch.randn(2, 1, 64, 64)
+        >>> target = torch.randn(2, 1, 64, 64)
+        >>> loss = loss_fn(pred, target)
+    """
+
+    def __init__(
+        self,
+        w: list = [1, 1],
+        loss_type: Literal["mae", "mse", "huber"] = "mae",
+        huber_delta: float = 1.0,
+    ):
+        super(SSIMComboLoss, self).__init__()
         self.w = w
+        self.loss_type = loss_type
+        self.huber_delta = huber_delta
         self.ssim = StructuralSimilarityIndexMeasure()
 
+    def _compute_base_loss(
+        self, inputs: Tensor, targets: Tensor
+    ) -> Tensor:
+        """
+        Compute the base pixel-wise loss based on loss_type.
+
+        Args:
+            inputs: Predicted tensor of shape [B, C, H, W].
+            targets: Target tensor of shape [B, C, H, W].
+
+        Returns:
+            Tensor: Per-pixel loss of shape [B, C, H, W].
+        """
+        if self.loss_type == "mae":
+            return F.l1_loss(inputs, targets, reduction="none")
+        elif self.loss_type == "mse":
+            return F.mse_loss(inputs, targets, reduction="none")
+        elif self.loss_type == "huber":
+            return F.smooth_l1_loss(
+                inputs, targets, reduction="none", beta=self.huber_delta
+            )
+        else:
+            raise ValueError(
+                f"Unknown loss_type: {self.loss_type}. "
+                "Supported: 'mae', 'mse', 'huber'."
+            )
+
     def forward(self, inputs: Tensor, targets: Tensor, mask: Tensor = None) -> Tensor:
-        # L1 Loss
-        l1_all = F.l1_loss(inputs, targets, reduction="none")
+        """
+        Compute the combined SSIM + base loss.
+
+        Args:
+            inputs: Predicted tensor of shape [B, C, H, W].
+            targets: Target tensor of shape [B, C, H, W].
+            mask: Optional boolean mask of shape [B, C, H, W] where True
+                  indicates pixels to ignore (e.g., nodata regions).
+                  Default: None.
+
+        Returns:
+            Tensor: Scalar loss value combining base loss and SSIM loss.
+        """
+        # Base Loss (MAE, MSE, or Huber)
+        base_loss_all = self._compute_base_loss(inputs, targets)
         if mask is not None:
-            l1_valid = l1_all[~mask]
-            l1_loss = (
-                l1_valid.mean()
-                if l1_valid.numel() > 0
+            base_loss_valid = base_loss_all[~mask]
+            base_loss = (
+                base_loss_valid.mean()
+                if base_loss_valid.numel() > 0
                 else torch.tensor(0.0, device=inputs.device)
             )
         else:
-            l1_loss = l1_all.mean()
+            base_loss = base_loss_all.mean()
 
         # SSIM Loss
         # SSIM is sensitive to extreme values. If we have a mask, we fill masked regions
         # with target values to ensure they don't contribute to the loss.
         if mask is not None:
             inputs_masked = inputs.clone()
-            inputs_masked[mask] = targets[mask].float()  
+            inputs_masked[mask] = targets[mask].float()
             ssim_val = self.ssim(inputs_masked, targets.float())
         else:
             ssim_val = self.ssim(inputs, targets.float())
 
         ssim_loss = 1 - ssim_val
 
-        return l1_loss * self.w[0] + ssim_loss * self.w[1]
+        return base_loss * self.w[0] + ssim_loss * self.w[1]
+
+
+# Backward compatibility alias
+L1SSIMComboLoss = SSIMComboLoss
 
 
 class SharpLoss(nn.Module):
@@ -262,11 +344,27 @@ if __name__ == "__main__":
     # Define weights for the loss components
     weights = [0.5, 0.5]
 
-    # Instantiate the loss function
-    loss_fn = L1SSIMComboLoss()
+    # Test SSIMComboLoss with different loss types
+    print("Testing SSIMComboLoss with different loss types:")
 
-    # Calculate the loss
-    loss = loss_fn(input_tensor, target_tensor, weights)
+    # MAE (default)
+    loss_fn_mae = SSIMComboLoss(w=weights, loss_type="mae")
+    loss_mae = loss_fn_mae(input_tensor, target_tensor)
+    print(f"MAE + SSIM loss: {loss_mae.item():.6f}")
 
-    # Print the loss
-    print(f"Calculated loss: {loss.item()}")
+    # MSE
+    loss_fn_mse = SSIMComboLoss(w=weights, loss_type="mse")
+    loss_mse = loss_fn_mse(input_tensor, target_tensor)
+    print(f"MSE + SSIM loss: {loss_mse.item():.6f}")
+
+    # Huber
+    loss_fn_huber = SSIMComboLoss(w=weights, loss_type="huber", huber_delta=1.0)
+    loss_huber = loss_fn_huber(input_tensor, target_tensor)
+    print(f"Huber + SSIM loss: {loss_huber.item():.6f}")
+
+    # Test backward compatibility alias
+    loss_fn_compat = L1SSIMComboLoss(w=weights)
+    loss_compat = loss_fn_compat(input_tensor, target_tensor)
+    print(f"L1SSIMComboLoss (backward compat): {loss_compat.item():.6f}")
+
+    print("\nAll tests passed!")

@@ -1,3 +1,9 @@
-from .combo import L1SSIMComboLoss, SharpLoss, HomoscedasticUncertaintyLoss
+from .combo import SSIMComboLoss, L1SSIMComboLoss, SharpLoss, HomoscedasticUncertaintyLoss
+from .histogram import HistogramLoss
 
-__all__ = ["L1SSIMComboLoss", "SharpLoss", "HomoscedasticUncertaintyLoss"]
+__all__ = [
+    "SSIMComboLoss",
+    "L1SSIMComboLoss",
+    "SharpLoss",
+    "HomoscedasticUncertaintyLoss"
+]
