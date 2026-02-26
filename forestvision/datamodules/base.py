@@ -186,7 +186,7 @@ class BaseGeoDataModule(CloudDataModule):
         std: Optional[List[float]],
         nodata: Optional[int] = None,
     ):
-        print(f"\n[DEBUG _populate_normalize_stats] Called with mean={mean}, std={std}, nodata={nodata}")
+        # print(f"\n[DEBUG _populate_normalize_stats] Called with mean={mean}, std={std}, nodata={nodata}")
         current_indices = None
 
         def find_and_populate(obj):
@@ -236,8 +236,8 @@ class BaseGeoDataModule(CloudDataModule):
                     if s is not None:
                         s = [s[i] for i in current_indices if i < len(s)]
 
-                print(f"[DEBUG _populate_normalize_stats] Found Normalize transform")
-                print(f"[DEBUG _populate_normalize_stats] Before: mean={obj.mean}, std={obj.std}, nodata={obj.nodata}")
+                # print(f"[DEBUG _populate_normalize_stats] Found Normalize transform")
+                # print(f"[DEBUG _populate_normalize_stats] Before: mean={obj.mean}, std={obj.std}, nodata={obj.nodata}")
 
                 if obj.mean is None and m is not None:
                     obj.mean = m
@@ -246,7 +246,7 @@ class BaseGeoDataModule(CloudDataModule):
                 if obj.nodata is None and nodata is not None:
                     obj.nodata = nodata
 
-                print(f"[DEBUG _populate_normalize_stats] After: mean={obj.mean}, std={obj.std}, nodata={obj.nodata}")
+                # print(f"[DEBUG _populate_normalize_stats] After: mean={obj.mean}, std={obj.std}, nodata={obj.nodata}")
                 return obj
 
             if hasattr(obj, "transforms"):
@@ -359,9 +359,9 @@ class BaseGeoDataModule(CloudDataModule):
             train_roi = self.train_tiles.bounds if self.train_tiles else None
             val_roi = self.val_tiles.bounds if self.val_tiles else None
 
-            print(f"\n[DEBUG setup] Creating datasets with stage={stage}")
-            print(f"[DEBUG setup] post_aug_input_transforms={self.post_aug_input_transforms}")
-            print(f"[DEBUG setup] post_aug_target_transforms={self.post_aug_target_transforms}")
+            # print(f"\n[DEBUG setup] Creating datasets with stage={stage}")
+            # print(f"[DEBUG setup] post_aug_input_transforms={self.post_aug_input_transforms}")
+            # print(f"[DEBUG setup] post_aug_target_transforms={self.post_aug_target_transforms}")
 
             train_input_ds = self._instantiate_combined_dataset(
                 self.input_configs, "training", train_roi, transforms=None
@@ -405,9 +405,9 @@ class BaseGeoDataModule(CloudDataModule):
                         instantiated = [instantiated]
                     transform_chain.extend(instantiated)
 
-                print(f"[DEBUG setup] Final transform_chain length: {len(transform_chain)}")
-                for i, t in enumerate(transform_chain):
-                    print(f"[DEBUG setup] Transform {i}: {type(t).__name__} - {t}")
+                # print(f"[DEBUG setup] Final transform_chain length: {len(transform_chain)}")
+                # for i, t in enumerate(transform_chain):
+                #     print(f"[DEBUG setup] Transform {i}: {type(t).__name__} - {t}")
 
                 if transform_chain:
                     from forestvision.transforms.augmentations import ComposeAugmentations
