@@ -7,6 +7,7 @@ import time
 import sys
 import traceback
 import warnings
+import concurrent.futures
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -39,25 +40,27 @@ import torchvision.transforms.functional as tvF
 from .cloudgeo import CloudRasterDataset
 from .utils import minmax_scaling
 
-
 # Hack to suppress rasterio GDAL warnings
 rasterio_logger = logging.getLogger("rasterio._env")
 rasterio_logger.setLevel(logging.ERROR)
 
+
 # GEE Queue Management
 class RequestStatus(Enum):
     """Request lifecycle states."""
+
     PENDING = auto()
     RUNNING = auto()
     COMPLETED = auto()
     FAILED = auto()
 
+
 class GEEQueueRequest:
     """Thread-safe wrapper for GEE API requests.
-    
+
     This class provides thread-safe execution of GEE API requests with
     proper error handling, status tracking, and timeout support.
-    
+
     Attributes:
         func: The function to execute
         args: Positional arguments for the function
@@ -74,18 +77,18 @@ class GEEQueueRequest:
         timeout: Optional timeout in seconds
         max_age: Optional maximum age in seconds
     """
-    
+
     def __init__(
         self,
         func: Callable,
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
-        callback: Optional[Callable[['GEEQueueRequest'], None]] = None,
+        callback: Optional[Callable[["GEEQueueRequest"], None]] = None,
         timeout: Optional[float] = None,
-        max_age: Optional[float] = None
+        max_age: Optional[float] = None,
     ):
         """Initialize a new GEEQueueRequest.
-        
+
         Args:
             func: Callable function to execute
             args: Positional arguments for func
@@ -93,19 +96,19 @@ class GEEQueueRequest:
             callback: Optional callback to call on completion
             timeout: Optional timeout in seconds
             max_age: Optional maximum age in seconds
-            
+
         Raises:
             TypeError: If inputs are invalid
         """
         self._validate_inputs(func, args, kwargs)
-        
+
         self.func = func
         self.args = args
         self.kwargs = kwargs
         self.callback = callback
-        self.request_id = hashlib.md5(
-            f"{time.time()}_{id(func)}".encode()
-        ).hexdigest()[:8]
+        self.request_id = hashlib.md5(f"{time.time()}_{id(func)}".encode()).hexdigest()[
+            :8
+        ]
         self.result: Any = None
         self.error: Optional[Exception] = None
         self.traceback: Optional[str] = None
@@ -114,14 +117,14 @@ class GEEQueueRequest:
         self.timestamp = time.time()
         self.timeout = timeout
         self.max_age = max_age
-        
+
         self._lock = threading.Lock()
         self._complete_event = threading.Event()
         self._cancelled = False
-    
+
     def _validate_inputs(self, func, args, kwargs):
         """Validate input parameters.
-        
+
         Raises:
             TypeError: If inputs are invalid
         """
@@ -131,16 +134,16 @@ class GEEQueueRequest:
             raise TypeError(f"args must be tuple, got {type(args)}")
         if not isinstance(kwargs, dict):
             raise TypeError(f"kwargs must be dict, got {type(kwargs)}")
-    
+
     def execute(self) -> bool:
         """Execute the GEE request.
-        
+
         This method is called by the worker thread. It executes the
         function with optional timeout protection.
-        
+
         Returns:
             bool: True if successful, False if failed
-            
+
         Raises:
             KeyboardInterrupt: If interrupted
             SystemExit: If system exit requested
@@ -149,47 +152,39 @@ class GEEQueueRequest:
         # Check for cancellation before starting
         if self._cancelled:
             return False
-            
+
         # Check for expiration
         if self.max_age and (time.time() - self.timestamp) > self.max_age:
-            self.error = TimeoutError(
-                f"Request expired after {self.max_age}s"
-            )
+            self.error = TimeoutError(f"Request expired after {self.max_age}s")
             return False
-        
+
         with self._lock:
             self.status = RequestStatus.RUNNING
-        
+
         try:
-            logging.debug(
-                f"Request {self.request_id} [{self.func.__name__}] started"
-            )
-            
+            logging.debug(f"Request {self.request_id} [{self.func.__name__}] started")
+
             # Execute with optional timeout
             if self.timeout:
                 self._execute_with_timeout()
             else:
                 self.result = self.func(*self.args, **self.kwargs)
-            
+
             with self._lock:
                 self.status = RequestStatus.COMPLETED
                 self.error = None
-                
-            logging.debug(
-                f"Request {self.request_id} [{self.func.__name__}] completed"
-            )
-            
+
+            logging.debug(f"Request {self.request_id} [{self.func.__name__}] completed")
+
             # Call callback if provided
             if self.callback:
                 try:
                     self.callback(self)
                 except Exception as e:
-                    logging.error(
-                        f"Callback error for request {self.request_id}: {e}"
-                    )
-            
+                    logging.error(f"Callback error for request {self.request_id}: {e}")
+
             return True
-            
+
         except KeyboardInterrupt:
             logging.warning(
                 f"Request {self.request_id} [{self.func.__name__}] interrupted"
@@ -206,7 +201,7 @@ class GEEQueueRequest:
                 self.error = e
                 self.traceback = traceback.format_exc()
                 self.exc_info = sys.exc_info()
-            
+
             logging.error(
                 f"Request {self.request_id} [{self.func.__name__}] failed: {e}\n"
                 f"Traceback: {self.traceback}"
@@ -214,11 +209,14 @@ class GEEQueueRequest:
             return False
         finally:
             self._complete_event.set()
-    
+
     def _execute_with_timeout(self):
         """Execute function with timeout protection using ThreadPoolExecutor."""
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-        
+        from concurrent.futures import (
+            ThreadPoolExecutor,
+            TimeoutError as FuturesTimeoutError,
+        )
+
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.func, *self.args, **self.kwargs)
             try:
@@ -228,21 +226,21 @@ class GEEQueueRequest:
                 raise TimeoutError(
                     f"Request {self.request_id} timed out after {self.timeout}s"
                 )
-    
+
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Wait for the request to complete.
-        
+
         Args:
             timeout: Optional timeout in seconds
-            
+
         Returns:
             bool: True if completed, False if timeout
         """
         return self._complete_event.wait(timeout)
-    
+
     def cancel(self) -> bool:
         """Attempt to cancel the request.
-        
+
         Returns:
             bool: True if cancellation was attempted
         """
@@ -252,28 +250,28 @@ class GEEQueueRequest:
             self.error = TimeoutError("Request was cancelled")
             return True
         return False
-    
+
     def get_result(self) -> Tuple[Any, Optional[Exception]]:
         """Thread-safe getter for result and error.
-        
+
         Returns:
             Tuple[Any, Optional[Exception]]: (result, error)
         """
         with self._lock:
             return self.result, self.error
-    
+
     @property
     def successful(self) -> bool:
         """Check if request completed successfully."""
         with self._lock:
             return self.status == RequestStatus.COMPLETED
-    
+
     @property
     def completed(self) -> bool:
         """Check if request has completed (success or failure)."""
         with self._lock:
             return self.status in (RequestStatus.COMPLETED, RequestStatus.FAILED)
-    
+
     @property
     def age(self) -> float:
         """Get the age of the request in seconds."""
@@ -282,15 +280,20 @@ class GEEQueueRequest:
 
 class GEEQueueManager:
     """Thread-safe manager for GEE request queue.
-    
+
     This manager handles GEE API requests with URL expiration awareness.
     GEE download URLs expire after approximately 5-10 minutes, so requests
     should not stay in the queue for too long.
     """
-    
-    def __init__(self, max_concurrent: int = 10, rate_limit_delay: float = 0.05, max_queue_age: float = 600.0):
+
+    def __init__(
+        self,
+        max_concurrent: int = 10,
+        rate_limit_delay: float = 0.05,
+        max_queue_age: float = 600.0,
+    ):
         """Initialize a new GEEQueueManager.
-        
+
         Args:
             max_concurrent: Maximum number of concurrent GEE requests
             rate_limit_delay: Delay between requests to avoid rate limiting
@@ -299,47 +302,56 @@ class GEEQueueManager:
         self._queue = queue.Queue()
         self._lock = threading.Lock()
         self._active = False
-        self._thread = None
         self._max_concurrent = max_concurrent
         self._rate_limit_delay = rate_limit_delay
         self._max_queue_age = max_queue_age  # Maximum time requests can stay in queue
         self._stats = {
-            'processed': 0,
-            'failed': 0,
-            'queued': 0,
-            'concurrent': 0,
-            'expired': 0,
-            'queue_expired': 0,  # Requests that expired while in queue
-            'avg_queue_time': 0.0,  # Average time requests spend in queue
+            "processed": 0,
+            "failed": 0,
+            "queued": 0,
+            "concurrent": 0,
+            "expired": 0,
+            "queue_expired": 0,  # Requests that expired while in queue
+            "avg_queue_time": 0.0,  # Average time requests spend in queue
         }
         self._worker_thread = None
         self._queue_times = []  # Track queue times for statistics
-    
+        self._executor = None  # ThreadPoolExecutor for concurrent processing
+        self._shutdown_event = threading.Event()
+
     def start(self):
         """Start the queue worker thread."""
         with self._lock:
             if self._active:
                 return
-                
+
             self._active = True
-            self._worker_thread = threading.Thread(
-                target=self._worker,
-                daemon=True
+            self._shutdown_event.clear()
+            # Create ThreadPoolExecutor for actual concurrent request processing
+            self._executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._max_concurrent, thread_name_prefix="gee_worker"
             )
+            self._worker_thread = threading.Thread(target=self._worker, daemon=True)
             self._worker_thread.start()
-    
+
     def stop(self):
         """Stop the queue worker thread."""
         with self._lock:
             if not self._active:
                 return
-                
+
             self._active = False
+            self._shutdown_event.set()
             self._queue.put(None)  # Poison pill
-            
+
             if self._worker_thread:
                 self._worker_thread.join(timeout=5.0)
-    
+
+            # Shutdown the executor gracefully
+            if self._executor:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+                self._executor = None
+
     def submit(
         self,
         func: Callable,
@@ -347,10 +359,10 @@ class GEEQueueManager:
         kwargs: Dict[str, Any],
         callback: Optional[Callable] = None,
         timeout: Optional[float] = None,
-        max_age: Optional[float] = None
+        max_age: Optional[float] = None,
     ) -> GEEQueueRequest:
         """Submit a request to the queue.
-        
+
         Args:
             func: Function to execute
             args: Positional arguments
@@ -358,34 +370,58 @@ class GEEQueueManager:
             callback: Optional callback
             timeout: Optional timeout
             max_age: Optional maximum age
-            
+
         Returns:
             GEEQueueRequest: The request object
         """
-        request = GEEQueueRequest(
-            func, args, kwargs, callback, timeout, max_age
-        )
+        request = GEEQueueRequest(func, args, kwargs, callback, timeout, max_age)
         self._queue.put(request)
-        
+
         with self._lock:
-            self._stats['queued'] += 1
-            
+            self._stats["queued"] += 1
+
         return request
-    
+
     def get_stats(self) -> Dict[str, int]:
         """Get current statistics."""
         with self._lock:
             return self._stats.copy()
-    
+
     def _worker(self):
-        """Worker thread function."""
+        """Worker thread function.
+
+        Dispatches requests to the ThreadPoolExecutor for concurrent processing.
+        The queue provides ordering and backpressure, while the executor handles
+        actual concurrent execution up to max_concurrent workers.
+        """
+        # Track pending futures for proper cleanup
+        pending_futures = set()
+
+        def _process_request(request: GEEQueueRequest) -> bool:
+            """Process a single request and update stats."""
+            try:
+                success = request.execute()
+                with self._lock:
+                    if success:
+                        self._stats["processed"] += 1
+                    else:
+                        self._stats["failed"] += 1
+                return success
+            except Exception as e:
+                logging.error(f"Request {request.request_id} execution error: {e}")
+                with self._lock:
+                    self._stats["failed"] += 1
+                return False
+            finally:
+                self._queue.task_done()
+
         while self._active:
             try:
                 request = self._queue.get(timeout=1.0)
-                
+
                 if request is None:  # Poison pill
                     break
-                
+
                 # Check for queue expiration (prevent URLs from expiring in queue)
                 queue_age = request.age
                 if queue_age > self._max_queue_age:
@@ -393,25 +429,25 @@ class GEEQueueManager:
                         f"Request expired in queue after {queue_age:.1f}s (max: {self._max_queue_age}s)"
                     )
                     with self._lock:
-                        self._stats['queue_expired'] += 1
-                        self._stats['expired'] += 1
+                        self._stats["queue_expired"] += 1
+                        self._stats["expired"] += 1
                     self._queue.task_done()
                     logging.warning(
                         f"Request {request.request_id} expired in queue after {queue_age:.1f}s. "
                         f"Consider increasing max_concurrent or reducing queue size."
                     )
                     continue
-                
+
                 # Check for request-specific expiration
                 if request.max_age and request.age > request.max_age:
                     request.error = TimeoutError(
                         f"Request expired after {request.max_age}s"
                     )
                     with self._lock:
-                        self._stats['expired'] += 1
+                        self._stats["expired"] += 1
                     self._queue.task_done()
                     continue
-                
+
                 # Track queue time for statistics
                 queue_time = request.age
                 with self._lock:
@@ -419,42 +455,48 @@ class GEEQueueManager:
                     # Keep only last 1000 samples for statistics
                     if len(self._queue_times) > 1000:
                         self._queue_times.pop(0)
-                    self._stats['avg_queue_time'] = sum(self._queue_times) / len(self._queue_times)
-                
-                # Process request
-                with self._lock:
-                    self._stats['concurrent'] += 1
-                
-                success = request.execute()
-                
-                with self._lock:
-                    self._stats['concurrent'] -= 1
-                
-                if success:
-                    self._stats['processed'] += 1
+                    self._stats["avg_queue_time"] = sum(self._queue_times) / len(
+                        self._queue_times
+                    )
+
+                # Submit request to executor for concurrent processing
+                # The executor handles actual concurrency up to max_concurrent workers
+                if self._executor:
+                    future = self._executor.submit(_process_request, request)
+                    pending_futures.add(future)
+                    # Clean up completed futures to prevent memory growth
+                    done_futures = {f for f in pending_futures if f.done()}
+                    pending_futures -= done_futures
                 else:
-                    self._stats['failed'] += 1
-                
-                self._queue.task_done()
-                
-                # Rate limiting
+                    # Fallback: execute directly if executor not available
+                    _process_request(request)
+
+                # Rate limiting between submissions (not between completions)
                 time.sleep(self._rate_limit_delay)
-                
+
             except queue.Empty:
                 continue
             except Exception as e:
                 logging.error(f"Queue worker error: {e}")
                 with self._lock:
-                    self._stats['failed'] += 1
+                    self._stats["failed"] += 1
+
+        # Wait for all pending futures to complete before exiting
+        if pending_futures and self._executor:
+            logging.debug(
+                f"Waiting for {len(pending_futures)} pending requests to complete..."
+            )
+            concurrent.futures.wait(pending_futures, timeout=30.0)
 
 
 # Global queue manager instance with thread-safe initialization
 _queue_manager = None
 _queue_manager_lock = threading.Lock()
 
+
 def _get_queue_manager() -> GEEQueueManager:
     """Get or create global queue manager (thread-safe).
-    
+
     Returns:
         GEEQueueManager: The global queue manager instance.
     """
@@ -464,13 +506,16 @@ def _get_queue_manager() -> GEEQueueManager:
             if _queue_manager is None:  # Double-check locking
                 # Increase concurrency for multi-worker DataLoaders
                 # 10 concurrent requests is a safe default for most GEE accounts
-                _queue_manager = GEEQueueManager(max_concurrent=10, rate_limit_delay=0.05)
+                _queue_manager = GEEQueueManager(
+                    max_concurrent=10, rate_limit_delay=0.05
+                )
                 _queue_manager.start()  # Auto-start the worker thread
     return _queue_manager
 
+
 def start_gee_queue(max_concurrent: int = 10, rate_limit_delay: float = 0.05):
     """Start the GEE request queue processor.
-    
+
     Args:
         max_concurrent: Maximum number of concurrent GEE requests
         rate_limit_delay: Delay between requests to avoid rate limiting
@@ -483,21 +528,23 @@ def start_gee_queue(max_concurrent: int = 10, rate_limit_delay: float = 0.05):
     manager.start()
     logging.info(f"GEE queue started with {max_concurrent} max concurrent requests")
 
+
 def stop_gee_queue():
     """Stop the GEE request queue processor."""
     manager = _get_queue_manager()
     manager.stop()
     logging.info("GEE queue stopped")
 
+
 def submit_gee_request(func, args=None, kwargs=None, callback=None):
     """Submit a GEE request to the queue.
-    
+
     Args:
         func: Function to execute
         args: Arguments for the function
         kwargs: Keyword arguments for the function
         callback: Callback function to call on completion
-        
+
     Returns:
         GEEQueueRequest: The request object that was queued
     """
@@ -505,28 +552,32 @@ def submit_gee_request(func, args=None, kwargs=None, callback=None):
         args = ()  # Empty tuple, not list
     if kwargs is None:
         kwargs = {}
-        
+
     manager = _get_queue_manager()
     request = manager.submit(func, args, kwargs, callback)
     return request
+
 
 def get_gee_queue_stats():
     """Get current statistics about the GEE queue."""
     manager = _get_queue_manager()
     return manager.get_stats()
 
+
 def reset_gee_queue_stats():
     """Reset the GEE queue statistics."""
     manager = _get_queue_manager()
     manager._stats = {
-        'processed': 0,
-        'failed': 0,
-        'queued': 0,
-        'concurrent': 0,
-        'expired': 0
+        "processed": 0,
+        "failed": 0,
+        "queued": 0,
+        "concurrent": 0,
+        "expired": 0,
     }
 
+
 # TODO: Add option to overwrite existing files
+
 
 class GEEMSImage:
     """Wrapper class to fetch Google Earth Engine (GEE) images.
@@ -551,7 +602,7 @@ class GEEMSImage:
     _rgb_bands: List[str] = []
 
     _zip = None
-    
+
     # Class-level shared session for connection pooling
     _session: Optional[requests.Session] = None
     _session_lock = threading.Lock()
@@ -590,8 +641,6 @@ class GEEMSImage:
         if not isinstance(image, ee.Image):
             raise ValueError("Input image must be an ee.Image object")
 
-
-
         self.image = image
         self.dimensions: Tuple[int, int] = dimensions
         self.crs = f"EPSG:{epsg}"
@@ -600,11 +649,11 @@ class GEEMSImage:
         self._bands: List[str] = bands
         self.nodata = nodata
         self.timeout = timeout or 300.0  # Default timeout: 300 seconds
-    
+
     def __del__(self):
         """Cleanup resources when object is deleted."""
         self.close()
-    
+
     def close(self):
         """Explicitly close the zip file and release resources."""
         if self._zip:
@@ -614,11 +663,11 @@ class GEEMSImage:
                 pass  # Ignore errors during cleanup
             finally:
                 self._zip = None
-    
+
     @classmethod
     def get_session(cls) -> requests.Session:
         """Get or create shared requests session for connection pooling.
-        
+
         Returns:
             requests.Session: Shared session with connection pooling enabled.
         """
@@ -626,22 +675,24 @@ class GEEMSImage:
             with cls._session_lock:
                 if cls._session is None:  # Double-check locking
                     session = requests.Session()
-                    session.headers.update({
-                        'User-Agent': 'forestvision-gEE-client/1.0',
-                        'Accept': 'application/octet-stream',
-                    })
+                    session.headers.update(
+                        {
+                            "User-Agent": "forestvision-gEE-client/1.0",
+                            "Accept": "application/octet-stream",
+                        }
+                    )
                     # Configure connection pooling
                     adapter = requests.adapters.HTTPAdapter(
                         max_retries=3,
                         pool_connections=10,
                         pool_maxsize=20,
-                        pool_block=False
+                        pool_block=False,
                     )
-                    session.mount('https://', adapter)
-                    session.mount('http://', adapter)
+                    session.mount("https://", adapter)
+                    session.mount("http://", adapter)
                     cls._session = session
         return cls._session
-    
+
     @classmethod
     def close_session(cls):
         """Close the shared session and release all connections."""
@@ -715,7 +766,6 @@ class GEEMSImage:
         else:
             return self.image.geometry()
 
-
     @property
     def params(self) -> Dict[str, Any]:
         """Get the parameters for GEE image fetching.
@@ -775,7 +825,6 @@ class GEEMSImage:
         """
         self._vis_params.update(**kwargs)
 
-
     def _reduce_image(self, reducer) -> List[float]:
         """Reduce image region using the specified reducer.
 
@@ -819,19 +868,21 @@ class GEEMSImage:
         else:
             return self.image.getDownloadURL(params)
 
-    def _fetch_internal(self, max_url_regenerations: int = 3) -> Tuple[numpy.ndarray, Dict[str, Any]]:
+    def _fetch_internal(
+        self, max_url_regenerations: int = 3
+    ) -> Tuple[numpy.ndarray, Dict[str, Any]]:
         """Internal fetch method that performs actual GEE request.
-        
+
         This method generates a fresh download URL just before making the request
         to avoid URL expiration issues. GEE download URLs are temporary and
         expire after a short period (typically 5-10 minutes).
-        
+
         Args:
             max_url_regenerations: Maximum number of times to regenerate URL on expiration
-            
+
         Returns:
             Tuple[numpy.ndarray, Dict[str, Any]]: Image data and profile
-            
+
         Raises:
             HTTPError: If request fails after all retries
             SSLError: If SSL connection fails
@@ -840,17 +891,19 @@ class GEEMSImage:
         """
         # Use shared session for connection pooling
         session = self.get_session()
-        
+
         url_regeneration_attempts = 0
         last_exception = None
-        
+
         while url_regeneration_attempts <= max_url_regenerations:
             try:
                 # Generate fresh URL just before request to avoid expiration
                 url = self.image.getDownloadURL(self.params)
                 url_generated_at = time.time()
-                logging.debug(f"Generated GEE download URL (attempt {url_regeneration_attempts + 1}/{max_url_regenerations + 1}): {url[:100]}...")
-                
+                logging.debug(
+                    f"Generated GEE download URL (attempt {url_regeneration_attempts + 1}/{max_url_regenerations + 1}): {url[:100]}..."
+                )
+
                 with session.get(url, stream=True, timeout=self.timeout) as response:
                     response.raise_for_status()
                     if response.status_code != 200:
@@ -864,8 +917,12 @@ class GEEMSImage:
                             url_regeneration_attempts += 1
                             if url_regeneration_attempts <= max_url_regenerations:
                                 # Exponential backoff before retrying
-                                backoff_time = min(2 ** url_regeneration_attempts, 30)  # Cap at 30 seconds
-                                logging.debug(f"Backing off for {backoff_time}s before retry")
+                                backoff_time = min(
+                                    2**url_regeneration_attempts, 30
+                                )  # Cap at 30 seconds
+                                logging.debug(
+                                    f"Backing off for {backoff_time}s before retry"
+                                )
                                 time.sleep(backoff_time)
                                 continue  # Try again with new URL
                             else:
@@ -876,7 +933,7 @@ class GEEMSImage:
                         raise HTTPError(
                             f"Request failed with status code: {response.status_code}"
                         )
-                    
+
                     # Success! Process the response
                     self._zip = ZipFile(BytesIO(response.content))
                     imgfile = self._zip.infolist()[0]
@@ -885,18 +942,26 @@ class GEEMSImage:
                             data = src.read()
                             profile = src.profile
 
-                    logging.debug(f"Successfully fetched image data (shape: {data.shape})")
+                    logging.debug(
+                        f"Successfully fetched image data (shape: {data.shape})"
+                    )
                     return data, profile
-                    
+
             except (SSLError, ConnectionError) as e:
                 # Log the specific SSL/connection error
-                logging.error(f"SSL/Connection error in fetch (attempt {url_regeneration_attempts + 1}): {str(e)}")
+                logging.error(
+                    f"SSL/Connection error in fetch (attempt {url_regeneration_attempts + 1}): {str(e)}"
+                )
                 last_exception = e
                 url_regeneration_attempts += 1
                 if url_regeneration_attempts <= max_url_regenerations:
                     # Exponential backoff for network errors
-                    backoff_time = min(2 ** url_regeneration_attempts, 60)  # Cap at 60 seconds
-                    logging.debug(f"Network error, backing off for {backoff_time}s before retry")
+                    backoff_time = min(
+                        2**url_regeneration_attempts, 60
+                    )  # Cap at 60 seconds
+                    logging.debug(
+                        f"Network error, backing off for {backoff_time}s before retry"
+                    )
                     time.sleep(backoff_time)
                     continue
                 else:
@@ -908,20 +973,26 @@ class GEEMSImage:
                 last_exception = e
                 url_regeneration_attempts += 1
                 if url_regeneration_attempts <= max_url_regenerations:
-                    backoff_time = min(2 ** url_regeneration_attempts, 30)
-                    logging.debug(f"HTTP error, backing off for {backoff_time}s before retry")
+                    backoff_time = min(2**url_regeneration_attempts, 30)
+                    logging.debug(
+                        f"HTTP error, backing off for {backoff_time}s before retry"
+                    )
                     time.sleep(backoff_time)
                     continue
                 else:
                     raise
             except Exception as e:
-                logging.error(f"Unexpected error in fetch (attempt {url_regeneration_attempts + 1}): {str(e)}")
+                logging.error(
+                    f"Unexpected error in fetch (attempt {url_regeneration_attempts + 1}): {str(e)}"
+                )
                 raise
-        
+
         # If we exit the loop without returning, raise the last exception
         if last_exception:
             raise last_exception
-        raise RuntimeError("Unexpected error: fetch loop exited without result or exception")
+        raise RuntimeError(
+            "Unexpected error: fetch loop exited without result or exception"
+        )
 
     def fetch(self, use_queue: bool = False) -> Tuple[numpy.ndarray, Dict[str, Any]]:
         """Fetch image data from Google Earth Engine.
@@ -943,9 +1014,9 @@ class GEEMSImage:
             # Submit to queue system (queue handles its own retries/timeouts)
             def queue_fetch():
                 return self._fetch_internal()
-            
+
             request = submit_gee_request(queue_fetch)
-            
+
             # Wait for completion with instance timeout
             if not request.wait(timeout=self.timeout):
                 stats = get_gee_queue_stats()
@@ -959,22 +1030,24 @@ class GEEMSImage:
                     msg += "Request is still pending in queue. Consider increasing max_concurrent."
                 elif request.status == RequestStatus.RUNNING:
                     msg += "Request is currently running but taking too long."
-                
+
                 raise TimeoutError(msg)
-            
+
             # Get result and error in thread-safe manner
             result, error = request.get_result()
-            
+
             if error:
                 raise error
-                
+
             return result
         else:
             # Use direct requests with retry decorator for backward compatibility
-            @retry((HTTPError, SSLError, ConnectionError), tries=10, delay=10, backoff=2)
+            @retry(
+                (HTTPError, SSLError, ConnectionError), tries=10, delay=10, backoff=2
+            )
             def fetch_with_retry():
                 return self._fetch_internal()
-            
+
             return fetch_with_retry()
 
     def save(self, dest_path: str, filename: str = None, overwrite: bool = False):
@@ -1127,16 +1200,18 @@ class GEERasterDataset(CloudRasterDataset):
         if not self.paths:
             logging.debug("_load_and_validate_metadata: paths is None, skipping")
             return
-            
+
         metadata_path = os.path.join(self.paths, "collection.json")
-        
+
         # Debug logging - always log what we're checking
         logging.debug(f"_load_and_validate_metadata: checking {metadata_path}")
-        
+
         if not os.path.exists(metadata_path):
-            logging.debug(f"_load_and_validate_metadata: metadata file not found at {metadata_path}")
+            logging.debug(
+                f"_load_and_validate_metadata: metadata file not found at {metadata_path}"
+            )
             return
-            
+
         try:
             with open(metadata_path, "r") as f:
                 metadata = json.load(f)
@@ -1153,7 +1228,9 @@ class GEERasterDataset(CloudRasterDataset):
                     logging.info("Updating all_bands from metadata")
                     self.all_bands = metadata_bands
                 else:
-                    logging.debug(f"all_bands already matches metadata: {metadata_bands}")
+                    logging.debug(
+                        f"all_bands already matches metadata: {metadata_bands}"
+                    )
             else:
                 logging.warning(f"No eo:bands found in metadata at {metadata_path}")
 
@@ -1167,16 +1244,21 @@ class GEERasterDataset(CloudRasterDataset):
             if self.roi and bbox_list:
                 m_minx, m_miny, m_maxx, m_maxy = bbox_list
                 # Requested ROI
-                r_minx, r_miny, r_maxx, r_maxy = self.roi.minx, self.roi.miny, self.roi.maxx, self.roi.maxy
-                
+                r_minx, r_miny, r_maxx, r_maxy = (
+                    self.roi.minx,
+                    self.roi.miny,
+                    self.roi.maxx,
+                    self.roi.maxy,
+                )
+
                 # We check if requested ROI is strictly inside the metadata ROI (with epsilon)
                 is_within = (
-                    (r_minx >= m_minx - 1e-6) and
-                    (r_miny >= m_miny - 1e-6) and
-                    (r_maxx <= m_maxx + 1e-6) and
-                    (r_maxy <= m_maxy + 1e-6)
+                    (r_minx >= m_minx - 1e-6)
+                    and (r_miny >= m_miny - 1e-6)
+                    and (r_maxx <= m_maxx + 1e-6)
+                    and (r_maxy <= m_maxy + 1e-6)
                 )
-                
+
                 if not is_within:
                     warnings.warn(
                         f"Requested ROI { [r_minx, r_miny, r_maxx, r_maxy] } is not contained within "
@@ -1208,7 +1290,9 @@ class GEERasterDataset(CloudRasterDataset):
                     )
 
         except Exception as e:
-            logging.warning(f"Failed to load or validate metadata at {metadata_path}: {e}")
+            logging.warning(
+                f"Failed to load or validate metadata at {metadata_path}: {e}"
+            )
 
     def _save_metadata(self) -> None:
         """Save current configuration to a STAC-like collection.json file."""
@@ -1222,7 +1306,7 @@ class GEERasterDataset(CloudRasterDataset):
         id_parts = [self.__class__.__name__]
         date_start = getattr(self, "date_start", None)
         date_end = getattr(self, "date_end", None)
-        
+
         season = getattr(self, "season", None)
         if season:
             id_parts.append(season)
@@ -1231,14 +1315,14 @@ class GEERasterDataset(CloudRasterDataset):
                 id_parts.append(date_start.replace("-", ""))
             if date_end:
                 id_parts.append(date_end.replace("-", ""))
-        
+
         if self.res is not None:
             id_parts.append(f"{int(self.res)}m")
-            
+
         bands = getattr(self, "bands", None) or getattr(self, "all_bands", [])
         if bands:
             id_parts.append(f"{len(bands)}B")
-            
+
         collection_id = "_".join(id_parts)
 
         # 2. Prepare band summaries
@@ -1257,12 +1341,14 @@ class GEERasterDataset(CloudRasterDataset):
             },
             "extent": {
                 "spatial": {
-                    "bbox": [[self.roi.minx, self.roi.miny, self.roi.maxx, self.roi.maxy]] if self.roi else []
+                    "bbox": (
+                        [[self.roi.minx, self.roi.miny, self.roi.maxx, self.roi.maxy]]
+                        if self.roi
+                        else []
+                    )
                 }
             },
-            "summaries": {
-                "eo:bands": bands_summary
-            }
+            "summaries": {"eo:bands": bands_summary},
         }
 
         try:
@@ -1380,7 +1466,9 @@ class GEERasterDataset(CloudRasterDataset):
             except (TypeError, AttributeError):
                 # Fallback: convert to list if possible
                 try:
-                    files_list = list(self.files) if hasattr(self.files, '__iter__') else []
+                    files_list = (
+                        list(self.files) if hasattr(self.files, "__iter__") else []
+                    )
                     if filepath in files_list and not self.overwrite:
                         load_from_file = True
                 except (TypeError, AttributeError):
@@ -1486,7 +1574,7 @@ class GEERasterDataset(CloudRasterDataset):
                 image = denormalizer(image)
 
             image = minmax_scaling(image, self.nodata)
-            
+
             # Check if rgb_bands are present in self.bands
             if self.rgb_bands and all(b in self.bands for b in self.rgb_bands):
                 rgb_bands_idx = [self.bands.index(b) for b in self.rgb_bands]
@@ -1495,7 +1583,7 @@ class GEERasterDataset(CloudRasterDataset):
                 # Fallback: use only the first band (grayscale)
                 _n = 3 if self.rgb_bands and len(self.rgb_bands) >= 3 else 1
                 image = image[0:_n]
-            
+
             image = tvF.to_pil_image(image)
             image = tvF.adjust_contrast(image, contrast)
             image = tvF.adjust_brightness(image, brightness)
