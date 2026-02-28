@@ -430,6 +430,21 @@ def prepare_data(
         target_datasets = []
         for i, cfg in enumerate(target_datasets_cfg):
             ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
+            
+            # Download target datasets before combining and computing stats
+            if not skip_download and hasattr(ds, "download"):
+                logging.info(f"Downloading target {ds.__class__.__name__}...")
+                sampler = TileGeoSampler(ds, train_tiles.data)
+                loader = torch.utils.data.DataLoader(
+                    ds, 
+                    sampler=sampler, 
+                    batch_size=15, 
+                    num_workers=5, 
+                    collate_fn=lambda x: x
+                )
+                for _ in tqdm(loader, desc=f"Downloading target {ds.__class__.__name__}", leave=False):
+                    pass
+            
             target_datasets.append(ds)
         
         # Combine target datasets via IntersectionDataset (like datamodule does)
