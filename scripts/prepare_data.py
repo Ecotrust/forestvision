@@ -32,6 +32,15 @@ Usage:
     # - Dataset 3 (ClimateNA): identity channels 1, 2, 3
     python scripts/prepare_data.py --config config.yaml \
         --input-identity-channels "10 11; 0; 1 2 3"
+
+    # Download data for prediction only (no stats, no train/val split)
+    python scripts/prepare_data.py --config config.yaml --predict-only
+
+    # Prediction with custom tiles and year
+    python scripts/prepare_data.py --config config.yaml \
+        --predict-only \
+        --predict-tiles-path data/inference/tiles_2023.geojson \
+        --predict-year 2023
     
 """
 
@@ -250,6 +259,9 @@ def prepare_data(
     download_all_bands: bool = False,
     input_identity_channels: Optional[str] = None,
     target_identity_channels: Optional[str] = None,
+    predict_only: bool = False,
+    predict_tiles_path: Optional[str] = None,
+    predict_year: Optional[int] = None,
 ) -> None:
     """Prepare data by downloading and computing statistics using DatasetStats."""
     tqdm_handler = TqdmLoggingHandler()
@@ -268,6 +280,63 @@ def prepare_data(
     data_args = config["data"]["init_args"]
     root = data_args.get("root", ".")
     year = data_args.get("year")
+    
+    # Handle predict-only mode
+    if predict_only:
+        # Determine year: CLI arg > config predict_year > config year
+        year = predict_year or data_args.get("predict_year") or year
+        
+        # Determine tiles path: CLI arg > config predict_tiles_path
+        tiles_path = predict_tiles_path or data_args.get("predict_tiles_path")
+        if not tiles_path:
+            raise ValueError(
+                "Predict-only mode requires either --predict-tiles-path or "
+                "'predict_tiles_path' in config data.init_args"
+            )
+        
+        predict_tiles = GPDFeatureCollection(os.path.join(root, tiles_path))
+        predict_roi = predict_tiles.bounds if hasattr(predict_tiles, "bounds") else None
+        
+        logging.info("=" * 60)
+        logging.info("PREDICT-ONLY MODE")
+        logging.info(f"Tiles path: {tiles_path}")
+        logging.info(f"Number of tiles: {len(predict_tiles)}")
+        logging.info(f"Year: {year}")
+        logging.info("=" * 60)
+        
+        # Extract dataset configs (input only for prediction)
+        input_datasets_cfg = data_args.get("input_datasets", [])
+        
+        if not skip_download:
+            logging.info("Downloading input datasets for prediction...")
+            for cfg in input_datasets_cfg:
+                ds = instantiate_dataset(cfg, root, year, roi=predict_roi, download=True)
+                ds_name = ds.__class__.__name__
+                
+                if hasattr(ds, "download") or hasattr(ds, "_download"):
+                    logging.info(f"Downloading {ds_name}...")
+                    sampler = TileGeoSampler(ds, predict_tiles.data)
+                    loader = torch.utils.data.DataLoader(
+                        ds,
+                        sampler=sampler,
+                        batch_size=15,
+                        num_workers=5,
+                        collate_fn=lambda x: x
+                    )
+                    for _ in tqdm(loader, desc=f"Downloading {ds_name}", leave=False):
+                        pass
+        
+        logging.info("Prediction data download complete.")
+        print(f"\n{'='*60}")
+        print(f"{'PREDICTION DATA PREPARATION COMPLETE':^60}")
+        print(f"{'='*60}")
+        print(f"Tiles:      {tiles_path}")
+        print(f"Count:      {len(predict_tiles)}")
+        print(f"Year:       {year}")
+        print(f"{'='*60}\n")
+        return  # Early exit - no stats to compute
+    
+    # Normal training mode
     train_tiles_path = data_args.get("train_tiles_path")
     
     if not train_tiles_path:
@@ -646,6 +715,24 @@ def main():
              "Format: 'dataset1_ch1; dataset2_ch1 ch2'. "
              "E.g., --target-identity-channels '0' sets identity for channel 0 in the first target dataset.",
     )
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="Download data for prediction tiles only. Skips stats computation and train/val split logic.",
+    )
+    parser.add_argument(
+        "--predict-tiles-path",
+        type=str,
+        default=None,
+        help="Path to prediction tiles GeoJSON (relative to root). Uses predict_tiles_path from config if not specified.",
+    )
+    parser.add_argument(
+        "--predict-year",
+        type=int,
+        default=None,
+        help="Year for prediction data (overrides config year in predict-only mode). "
+             "Can also be set via 'predict_year' in config.",
+    )
     args = parser.parse_args()
 
     # Join list to string if multiple arguments were passed (for backward compatibility)
@@ -665,6 +752,9 @@ def main():
         download_all_bands=args.download_all_bands,
         input_identity_channels=input_identity_str,
         target_identity_channels=target_identity_str,
+        predict_only=args.predict_only,
+        predict_tiles_path=args.predict_tiles_path,
+        predict_year=args.predict_year,
     )
 
 
