@@ -181,7 +181,8 @@ def main():
             tiles = gpd.GeoDataFrame(
                 {"geometry": [box(*bt) for bt in tbounds]}, crs="EPSG:5070"
             )
-            tiles = tiles[tiles.geometry.centroid.apply(b.union_all().contains)].copy()
+            state_union = b.union_all()
+            tiles = tiles[tiles.geometry.intersects(state_union)].copy()
             if not cfg.dry_run:
                 out.mkdir(parents=True, exist_ok=True)
                 tiles.to_file(tp, driver="GeoJSON")
