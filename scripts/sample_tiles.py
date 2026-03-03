@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Generate balanced tile collection for forest type classification.
+Generate tile collection for forest type classification.
 
 1. Download state boundaries
 2. Generate tile grid
 3. Compute class frequencies from GNN data
-4. Select balanced subset using configurable strategy
+4. Select subset using configurable strategy
 5. Export tiles (single file or k-fold splits)
 
 Usage:
@@ -63,7 +63,8 @@ class SamplerConfig:
     overwrite_freq: bool = False
     dry_run: bool = False
     k_folds: int = None
-    val_split: float = 0.1
+    val_split: float = 0.15
+    test_split: float = 0.15
     balance_strategy: str = "none"
     min_samples: int = 10
     inference: bool = False
@@ -80,7 +81,7 @@ class SamplerConfig:
     def base(self):
         """Base name for universal files (all tiles, frequencies)."""
         return (
-            self.name or f"balanced_{self.tile_size}x{self.tile_size}_{self.tile_res}m"
+            self.name or f"all_{self.tile_size}x{self.tile_size}_{self.tile_res}m"
         )
 
     def split_base(self):
@@ -137,7 +138,8 @@ def main():
     p.add_argument("--overwrite-freq", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--k-folds", type=int)
-    p.add_argument("--val-split", type=float, default=0.1)
+    p.add_argument("--val-split", type=float, default=0.15)
+    p.add_argument("--test-split", type=float, default=0.15)
     p.add_argument(
         "--inference",
         action="store_true",
@@ -145,6 +147,8 @@ def main():
     )
 
     args = p.parse_args()
+    # Map sampling_strategy to balance_strategy for SamplerConfig
+    args.balance_strategy = args.sampling_strategy
     kw = {
         k: v for k, v in vars(args).items() if k in SamplerConfig.__dataclass_fields__
     }
@@ -282,13 +286,12 @@ def main():
             )
         elif s == "capped":
             v_v = freqs[~freqs["odf_class"].isin([-2147483648, -1])].copy()
-            assigned = v_v.loc[
-                v_v.groupby(["geohash", "odf_class"])["gnn_counts"]
-                .sum()
-                .reset_index()
-                .groupby("geohash")["gnn_counts"]
-                .idxmax()
-            ]
+            # Group by geohash and odf_class, sum counts
+            summed = v_v.groupby(["geohash", "odf_class"])["gnn_counts"].sum().reset_index()
+            # Get index of max count per geohash (dominant class per tile)
+            max_idx = summed.groupby("geohash")["gnn_counts"].idxmax()
+            # Use iloc for positional indexing to avoid index mismatch
+            assigned = summed.iloc[max_idx]
             bal = [
                 assigned[assigned["odf_class"] == c].sample(
                     n=min(len(assigned[assigned["odf_class"] == c]), cfg.sample_size),
@@ -331,7 +334,7 @@ def main():
             selected = pd.concat(sel, ignore_index=True) if sel else pd.DataFrame()
 
     # 4. Export & Report
-    train_h, val_h = [], []
+    train_h, val_h, test_h = [], [], []
     if cfg.inference:
         # Inference mode: export all tiles without splitting
         if not tiles.empty and not cfg.dry_run:
@@ -350,15 +353,25 @@ def main():
             )
 
         if cfg.k_folds:
+            # First split out test set from selected data
             df_st = get_strat_labels(selected, cfg.k_folds, cfg.val_split)
+            tr_val, test = train_test_split(
+                df_st,
+                test_size=cfg.test_split,
+                stratify=df_st["strat"],
+                random_state=cfg.random_state,
+            )
+            test_h = test["geohash"].tolist()
+            save_split(test, "test")
+            # Now split remaining into train/val for k-fold
             tr_i, vl_i = next(
                 StratifiedKFold(
                     n_splits=int(1 / cfg.val_split),
                     shuffle=True,
                     random_state=cfg.random_state,
-                ).split(df_st, df_st["strat"])
+                ).split(tr_val, tr_val["strat"])
             )
-            tr_p, vl_d = df_st.iloc[tr_i], df_st.iloc[vl_i]
+            tr_p, vl_d = tr_val.iloc[tr_i], tr_val.iloc[vl_i]
             train_h, val_h = tr_p["geohash"].tolist(), vl_d["geohash"].tolist()
             save_split(vl_d, "val")
             skf = StratifiedKFold(
@@ -368,10 +381,22 @@ def main():
                 save_split(tr_p.iloc[f_i], f"fold_{i}_train")
         else:
             df_st = get_strat_labels(selected, 0, cfg.val_split)
-            tr_p, vl_d = train_test_split(
+            # First split out test set
+            tr_val, test = train_test_split(
                 df_st,
-                test_size=cfg.val_split,
+                test_size=cfg.test_split,
                 stratify=df_st["strat"],
+                random_state=cfg.random_state,
+            )
+            test_h = test["geohash"].tolist()
+            save_split(test, "test")
+            # Split remaining into train/val
+            # Adjust val_split to account for remaining proportion
+            adjusted_val_split = cfg.val_split / (1 - cfg.test_split)
+            tr_p, vl_d = train_test_split(
+                tr_val,
+                test_size=adjusted_val_split,
+                stratify=tr_val["strat"],
                 random_state=cfg.random_state,
             )
             train_h, val_h = tr_p["geohash"].tolist(), vl_d["geohash"].tolist()
@@ -420,25 +445,28 @@ def main():
             f"- Output: `{out}`",
         ]
         if train_h and val_h:
-            tp, vp = (
+            tp, vp, tep = (
                 valid[valid["geohash"].isin(train_h)]
                 .groupby("odf_class")["gnn_counts"]
                 .sum(),
                 valid[valid["geohash"].isin(val_h)]
                 .groupby("odf_class")["gnn_counts"]
                 .sum(),
+                valid[valid["geohash"].isin(test_h)]
+                .groupby("odf_class")["gnn_counts"]
+                .sum(),
             )
-            ts, vs = tp.sum(), vp.sum()
-            print("- Frequency stats for train/val split (Pixels %):")
+            ts, vs, tes = tp.sum(), vp.sum(), tep.sum()
+            print("- Frequency stats for train/val/test split (Pixels %):")
             md.extend(
-                ["\n## Split Stats", "| ODF | Train % | Val % |", "|:---|---:|---:|"]
+                ["\n## Split Stats", "| ODF | Train % | Val % | Test % |", "|:---|---:|---:|---:|"]
             )
-            for c in sorted(set(tp.index) | set(vp.index)):
-                tr_pct, vl_pct = 100 * tp.get(c, 0) / ts if ts else 0, (
-                    100 * vp.get(c, 0) / vs if vs else 0
-                )
-                print(f"  ODF {int(c):3d}: Train {tr_pct:5.1f}%, Val {vl_pct:5.1f}%")
-                md.append(f"| {int(c)} | {tr_pct:.1f}% | {vl_pct:.1f}% |")
+            for c in sorted(set(tp.index) | set(vp.index) | set(tep.index)):
+                tr_pct = 100 * tp.get(c, 0) / ts if ts else 0
+                vl_pct = 100 * vp.get(c, 0) / vs if vs else 0
+                te_pct = 100 * tep.get(c, 0) / tes if tes else 0
+                print(f"  ODF {int(c):3d}: Train {tr_pct:5.1f}%, Val {vl_pct:5.1f}%, Test {te_pct:5.1f}%")
+                md.append(f"| {int(c)} | {tr_pct:.1f}% | {vl_pct:.1f}% | {te_pct:.1f}% |")
         if not cfg.dry_run:
             dist_v = valid.groupby("odf_class")["gnn_counts"].sum().sort_index()
             w_df = pd.DataFrame(
