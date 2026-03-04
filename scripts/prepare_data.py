@@ -33,7 +33,7 @@ Usage:
     python scripts/prepare_data.py --config config.yaml \
         --input-identity-channels "10 11; 0; 1 2 3"
 
-    # Download data for prediction only (no stats, no train/val split)
+    # Download data for prediction only (no stats, no train/val/test split)
     python scripts/prepare_data.py --config config.yaml --predict-only
 
     # Prediction with custom tiles and year
@@ -396,6 +396,31 @@ def prepare_data(
                 for _ in tqdm(loader, desc=f"Downloading val {ds.__class__.__name__}", leave=False):
                     pass
 
+    # Retrieve Test Data if needed
+    test_tiles_path = data_args.get("test_tiles_path")
+    if not skip_download and test_tiles_path:
+        logging.info("Retrieving test data...")
+        test_tiles = GPDFeatureCollection(os.path.join(root, test_tiles_path))
+        test_roi = test_tiles.bounds if hasattr(test_tiles, "bounds") else None
+        
+        all_ds_cfgs = (input_datasets_cfg or []) + (target_datasets_cfg or [])
+        for cfg in all_ds_cfgs:
+            ds = instantiate_dataset(
+                cfg, root, year, stage="test", roi=test_roi, download=not skip_download
+            )
+            if hasattr(ds, "download") or hasattr(ds, "_download"):
+                logging.info(f"Downloading test data for {ds.__class__.__name__}...")
+                sampler = TileGeoSampler(ds, test_tiles.data)
+                loader = torch.utils.data.DataLoader(
+                    ds, 
+                    sampler=sampler, 
+                    batch_size=15, 
+                    num_workers=5, 
+                    collate_fn=lambda x: x 
+                )
+                for _ in tqdm(loader, desc=f"Downloading test {ds.__class__.__name__}", leave=False):
+                    pass
+
     # Parse per-dataset identity channels from CLI arguments
     input_identity_per_dataset = parse_per_dataset_identity(input_identity_channels)
     target_identity_per_dataset = parse_per_dataset_identity(target_identity_channels)
@@ -718,7 +743,7 @@ def main():
     parser.add_argument(
         "--predict-only",
         action="store_true",
-        help="Download data for prediction tiles only. Skips stats computation and train/val split logic.",
+        help="Download data for prediction tiles only. Skips stats computation and train/val/test split logic.",
     )
     parser.add_argument(
         "--predict-tiles-path",
