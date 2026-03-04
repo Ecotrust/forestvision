@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -906,6 +908,10 @@ class MultiTaskUNet(BaseTask):
         pretrained: bool = True,
         freeze_backbone: bool = False,
         task_band_names: list[str] = None,
+        save_plots_dir: Optional[str] = None,
+        frozen_modules: list[str] = None,
+        max_marginal_samples: int = 10000,
+        max_marginal_batches: int = 32,
     ):
         """Multi-task UNet for flexible task combinations.
 
@@ -947,6 +953,10 @@ class MultiTaskUNet(BaseTask):
             backbone: ResNet backbone variant for ResMTUNet ("resnet18", "resnet34", "resnet50", "resnet101").
             pretrained: Whether to use ImageNet pretrained weights for ResMTUNet.
             freeze_backbone: Whether to freeze the backbone parameters for transfer learning.
+            save_plots_dir: Optional directory path to save plots as PNG files.
+                If provided, plots will be saved to disk in addition to TensorBoard logging.
+            max_marginal_samples: Maximum number of points to sample for marginal distribution plots.
+            max_marginal_batches: Maximum number of batches to aggregate for marginal distribution plots.
         """
         # Handle backward compatibility: convert deprecated params to new format first
         task_types, num_classes_per_task = self._normalize_task_config(
@@ -979,7 +989,9 @@ class MultiTaskUNet(BaseTask):
         self.task_band_names = task_band_names or [
             f"task_{i}" for i in range(len(task_types))
         ]
+        self.save_plots_dir = save_plots_dir
         self.validation_step_outputs = []
+        self.test_step_outputs = []
         # Store for loss logging
         self._last_loss_logs = {}
 
@@ -987,6 +999,32 @@ class MultiTaskUNet(BaseTask):
         num_tasks = len(task_types)
         for i in range(num_tasks):
             self.register_buffer(f"loss_ema_{i}", torch.tensor(1.0))
+
+    def _save_figure(self, fig, filename: str, epoch: int = None):
+        """Save a matplotlib figure to disk if save_plots_dir is configured.
+
+        Args:
+            fig: Matplotlib figure to save
+            filename: Base filename (without extension)
+            epoch: Current epoch number (for organizing files)
+        """
+        if self.save_plots_dir is None:
+            return
+
+        import os
+
+        # Create directory structure: save_plots_dir/epoch_{epoch}/
+        if epoch is not None:
+            save_dir = os.path.join(self.save_plots_dir, f"epoch_{epoch}")
+        else:
+            save_dir = self.save_plots_dir
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save figure as PNG
+        filepath = os.path.join(save_dir, f"{filename}.png")
+        fig.savefig(filepath, dpi=150, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
 
     @staticmethod
     def _normalize_task_config(
@@ -1108,6 +1146,34 @@ class MultiTaskUNet(BaseTask):
                 f"Unknown model type: {model_type}. "
                 "Supported models: 'MTUNet', 'ResMTUNet', 'OptimizedMTUNet'"
             )
+
+        # Apply weight freezing if specified
+        self._freeze_weights()
+
+    def _freeze_weights(self):
+        """Freeze weights of specified modules for transfer learning."""
+        frozen_modules = self.hparams.get("frozen_modules", [])
+        freeze_backbone = self.hparams.get("freeze_backbone", False)
+        
+        if not frozen_modules and not freeze_backbone:
+            return
+            
+        # Handle freeze_backbone for ResMTUNet
+        if freeze_backbone and hasattr(self.model, 'backbone'):
+            for param in self.model.backbone.parameters():
+                param.requires_grad = False
+                
+        # Handle custom frozen_modules
+        if frozen_modules:
+            for module_name in frozen_modules:
+                try:
+                    module = self
+                    for part in module_name.split('.'):
+                        module = getattr(module, part)
+                    for param in module.parameters():
+                        param.requires_grad = False
+                except AttributeError:
+                    print(f"Warning: Module {module_name} not found for freezing")
 
     def compute_loss(self, y_hat, y, ignore_index=None):
         """Compute multi-task loss with flexible task handling.
@@ -1617,6 +1683,27 @@ class MultiTaskUNet(BaseTask):
         # Compute metrics for each task
         self._compute_and_log_metrics(y_hat, y, "test")
 
+        # Convert y_hat from raw output [B, total_channels, H, W] to task format [B, num_tasks, H, W]
+        # for visualization. For classification, take argmax. For regression, keep single channel.
+        y_hat_tasks = []
+        channel_offset = 0
+        for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            if task_type == "classification":
+                # Take argmax to get class predictions [B, H, W] -> [B, 1, H, W]
+                task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
+                pred_classes = torch.argmax(task_pred, dim=1, keepdim=True)
+                y_hat_tasks.append(pred_classes)
+            else:  # regression
+                # Keep the single regression channel
+                y_hat_tasks.append(y_hat[:, channel_offset : channel_offset + 1])
+            channel_offset += num_classes
+
+        y_hat_for_viz = torch.cat(y_hat_tasks, dim=1)  # [B, num_tasks, H, W]
+
+        # Store predictions for visualization
+        batch["prediction"] = y_hat_for_viz
+        self.test_step_outputs.append(batch)
+
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch."""
         # Only compute confusion matrix if there are classification tasks
@@ -1632,6 +1719,8 @@ class MultiTaskUNet(BaseTask):
                 self.logger.experiment.add_figure(
                     "confusion_matrix", confmat_fig, self.current_epoch
                 )
+            # Save to disk if configured
+            self._save_figure(confmat_fig, "confusion_matrix", self.current_epoch)
 
         # Create and log sample batch plot
         if self.validation_step_outputs:
@@ -1640,20 +1729,70 @@ class MultiTaskUNet(BaseTask):
                 self.logger.experiment.add_figure(
                     "val_images", batch_fig, self.current_epoch
                 )
+            # Save to disk if configured
+            self._save_figure(batch_fig, "val_images", self.current_epoch)
 
             # Generate and log marginal distribution plots for regression tasks
-            self._log_regression_marginals()
+            self._log_regression_marginals(save_to_disk=True)
 
         self.validation_step_outputs.clear()
 
-    def _log_regression_marginals(self):
-        """Generate and log marginal distribution plots for all regression tasks.
+    def on_test_epoch_end(self):
+        """Called at the end of test epoch."""
+        # Only compute confusion matrix if there are classification tasks
+        has_classification = any(t == "classification" for t in self.task_types)
+        if has_classification and hasattr(self, "confusion_matrix"):
+            # Compute confusion matrix
+            confmat = self.confusion_matrix.compute()
+            self.confusion_matrix.reset()
 
-        Aggregates predictions across all validation batches and creates
+            # Create and log confusion matrix plot
+            confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    "test_confusion_matrix", confmat_fig, self.current_epoch
+                )
+            # Save to disk if configured
+            self._save_figure(confmat_fig, "test_confusion_matrix", self.current_epoch)
+
+        # Create and log sample batch plot
+        if self.test_step_outputs:
+            batch_fig = self.plot_batch(self.test_step_outputs[0])
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    "test_images", batch_fig, self.current_epoch
+                )
+            # Save to disk if configured
+            self._save_figure(batch_fig, "test_images", self.current_epoch)
+
+            # Generate and log marginal distribution plots for regression tasks
+            self._log_test_regression_marginals(save_to_disk=True)
+
+        self.test_step_outputs.clear()
+
+    def _log_test_regression_marginals(self, save_to_disk: bool = False):
+        """Generate and log marginal distribution plots for all regression tasks during testing.
+
+        Aggregates predictions across all test batches and creates
         true vs predicted scatter plots with marginal histograms.
+
+        Args:
+            save_to_disk: If True, also save plots to disk (in addition to TensorBoard)
         """
-        if not self.validation_step_outputs:
+        if not self.test_step_outputs:
             return
+
+        # Sample batches to avoid memory issues and slow plotting
+        max_batches = self.hparams.get("max_marginal_batches", 32)
+        if len(self.test_step_outputs) > max_batches:
+            print(
+                f"Sampling {max_batches} batches for test regression marginals "
+                f"(out of {len(self.test_step_outputs)})"
+            )
+            indices = torch.randperm(len(self.test_step_outputs))[:max_batches]
+            batches_to_process = [self.test_step_outputs[i] for i in indices]
+        else:
+            batches_to_process = self.test_step_outputs
 
         # Get target stats for denormalization
         target_stats = self.hparams.get("target_stats")
@@ -1690,7 +1829,124 @@ class MultiTaskUNet(BaseTask):
         all_y_true = []
         all_y_pred = []
 
-        for batch in self.validation_step_outputs:
+        for batch in batches_to_process:
+            y = batch["mask"]
+            y_hat = batch.get("prediction")
+
+            if y_hat is None:
+                continue
+
+            # Crop target to match prediction shape if needed
+            if y.shape[2:] != y_hat.shape[2:]:
+                y = self.crop_to_match(y, y_hat.shape[2:])
+
+            # Revert normalization to get actual values
+            y_denorm = revert(y, target_stats, is_target=True)
+            y_hat_denorm = revert(y_hat, target_stats, is_target=True)
+
+            all_y_true.append(y_denorm)
+            all_y_pred.append(y_hat_denorm)
+
+        if not all_y_true:
+            return
+
+        # Concatenate all batches
+        y_true_all = torch.cat(all_y_true, dim=0)  # [total_samples, num_tasks, H, W]
+        y_pred_all = torch.cat(all_y_pred, dim=0)  # [total_samples, num_tasks, H, W]
+
+        # Generate marginal plots for each regression task
+        for task_idx, task_type in enumerate(self.task_types):
+            if task_type != "regression":
+                continue
+
+            task_name = (
+                self.task_band_names[task_idx]
+                if task_idx < len(self.task_band_names)
+                else f"task_{task_idx}"
+            )
+
+            # Extract this task's data
+            y_true_task = y_true_all[:, task_idx]  # [total_samples, H, W]
+            y_pred_task = y_pred_all[:, task_idx]  # [total_samples, H, W]
+
+            # Create marginal plot
+            marginal_fig = self._plot_regression_marginal(
+                y_true_task, y_pred_task, task_idx, task_name
+            )
+
+            if self.logger is not None:
+                self.logger.experiment.add_figure(
+                    f"test_regression_marginal_{task_name}",
+                    marginal_fig,
+                    self.current_epoch,
+                )
+            
+            # Save to disk if requested and configured
+            if save_to_disk:
+                self._save_figure(
+                    marginal_fig, f"test_regression_marginal_{task_name}", self.current_epoch
+                )
+
+    def _log_regression_marginals(self, save_to_disk: bool = False):
+        """Generate and log marginal distribution plots for all regression tasks.
+
+        Aggregates predictions across all validation batches and creates
+        true vs predicted scatter plots with marginal histograms.
+
+        Args:
+            save_to_disk: If True, also save plots to disk (in addition to TensorBoard)
+        """
+        if not self.validation_step_outputs:
+            return
+
+        # Sample batches to avoid memory issues and slow plotting
+        max_batches = self.hparams.get("max_marginal_batches", 32)
+        if len(self.validation_step_outputs) > max_batches:
+            print(
+                f"Sampling {max_batches} batches for regression marginals "
+                f"(out of {len(self.validation_step_outputs)})"
+            )
+            indices = torch.randperm(len(self.validation_step_outputs))[:max_batches]
+            batches_to_process = [self.validation_step_outputs[i] for i in indices]
+        else:
+            batches_to_process = self.validation_step_outputs
+
+        # Get target stats for denormalization
+        target_stats = self.hparams.get("target_stats")
+        if target_stats is None and hasattr(self, "trainer"):
+            target_stats = getattr(self.trainer.datamodule, "target_stats", None)
+        if target_stats is None:
+            target_stats = getattr(self, "target_stats", None)
+
+        def revert(tensor, stats, is_target=False):
+            if stats is None:
+                return tensor
+            m, s = stats.get("mean"), stats.get("std")
+            if m is None or s is None:
+                return tensor
+            if isinstance(m, list):
+                m = torch.tensor(m)
+            if isinstance(s, list):
+                s = torch.tensor(s)
+            m = m.to(device=tensor.device, dtype=tensor.dtype)
+            s = s.to(device=tensor.device, dtype=tensor.dtype)
+            num_c = tensor.shape[1]  # [B, num_tasks, H, W]
+            m, s = m[:num_c].clone(), s[:num_c].clone()
+            if is_target:
+                for i, t in enumerate(self.task_types):
+                    if t == "classification" and i < len(m):
+                        m[i], s[i] = 0.0, 1.0
+            view_shape = [1] * tensor.ndim
+            view_shape[1] = num_c
+            return tensor * s.view(*view_shape) + m.view(*view_shape)
+
+        ignore_idx = self.hparams.get("ignore_index", -1)
+
+        # Aggregate all predictions and targets across batches
+        all_y_true = []
+        all_y_pred = []
+
+        for batch in batches_to_process:
             y = batch["mask"]
             y_hat = batch.get("prediction")
 
@@ -1740,6 +1996,12 @@ class MultiTaskUNet(BaseTask):
                     f"regression_marginal_{task_name}",
                     marginal_fig,
                     self.current_epoch,
+                )
+            
+            # Save to disk if requested and configured
+            if save_to_disk:
+                self._save_figure(
+                    marginal_fig, f"regression_marginal_{task_name}", self.current_epoch
                 )
 
     def forward(self, x):
@@ -1944,14 +2206,15 @@ class MultiTaskUNet(BaseTask):
             fig.text(0.5, 0.5, "No valid data", ha="center", va="center", fontsize=14)
             return fig
 
-        # Sample 10% of valid pixels (at least 100 points)
-        n_valid = valid_mask.sum().item()
-        sample_size = max(100, int(n_valid * 0.1))
-        if n_valid > sample_size:
+        # Sample points for visualization to avoid overcrowded plots and slow rendering
+        n_valid = int(valid_mask.sum().item())
+        max_samples = self.hparams.get("max_marginal_samples", 10000)
+
+        if n_valid > max_samples:
             # Get flat indices of valid pixels
             valid_indices = torch.where(valid_mask.flatten())[0]
-            # Randomly select sample_size indices
-            perm = torch.randperm(n_valid, device=y_true.device)[:sample_size]
+            # Randomly select max_samples indices
+            perm = torch.randperm(n_valid, device=y_true.device)[:max_samples]
             sampled_indices = valid_indices[perm]
             # Create new mask with only sampled indices
             sample_mask = torch.zeros_like(valid_mask.flatten())
@@ -2102,7 +2365,10 @@ class MultiTaskUNet(BaseTask):
         # Sanitize y_hat
         if y_hat is not None:
             y_hat = y_hat.clone()
-            y_hat[(y == ignore_idx) | (y < -1e9)] = float(ignore_idx)
+            if ignore_idx is not None:
+                y_hat[(y == ignore_idx) | (y < -1e9)] = float(ignore_idx)
+            else:
+                y_hat[y < -1e9] = 0.0  # Just handle extreme negative values
 
         # Revert normalization
         x_plot = revert(x[valid_sample_indices], input_stats)
