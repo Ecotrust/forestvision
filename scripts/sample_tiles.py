@@ -68,12 +68,15 @@ class SamplerConfig:
     balance_strategy: str = "none"
     min_samples: int = 10
     inference: bool = False
+    max_nodata: float = 0.3
 
     def __post_init__(self):
         if self.tile_size <= 0:
             raise ValueError("tile_size must be > 0")
         if self.k_folds is not None and self.k_folds < 2:
             raise ValueError("k_folds must be >= 2")
+        if not 0.0 <= self.max_nodata <= 1.0:
+            raise ValueError("max_nodata must be between 0.0 and 1.0")
 
     def out_dir(self):
         return self.output_path / f"tiles_{self.tile_size}x{self.tile_size}"
@@ -145,12 +148,19 @@ def main():
         action="store_true",
         help="Create inference tiles overlapping GNN ROI without computing frequencies",
     )
+    p.add_argument(
+        "--max-nodata",
+        type=float,
+        default=0.3,
+        help="Maximum fraction of nodata pixels allowed per tile (0.0-1.0, default: 0.3)",
+    )
 
     args = p.parse_args()
     # Map sampling_strategy to balance_strategy for SamplerConfig
     args.balance_strategy = args.sampling_strategy
     kw = {
-        k: v for k, v in vars(args).items() if k in SamplerConfig.__dataclass_fields__
+        k: v for k, v in vars(args).items() 
+        if k.replace('-', '_') in SamplerConfig.__dataclass_fields__
     }
     kw["output_path"] = Path(kw["output_path"])
     cfg = SamplerConfig(**kw)
@@ -246,9 +256,30 @@ def main():
                     for bx in b_idx["bounds"]
                 ]
                 for i, h in enumerate(hs):
-                    cl_u, cl_c = b_idx["mask"][i].unique(return_counts=True)
+                    mask = b_idx["mask"][i]
+                    total_pixels = mask.numel()
+                    
+                    # Count valid pixels (non-nodata)
+                    valid_mask = (mask != -2147483648) & (mask != -1)
+                    valid_pixels = valid_mask.sum().item()
+                    nodata_pixels = total_pixels - valid_pixels
+                    nodata_fraction = nodata_pixels / total_pixels if total_pixels > 0 else 0.0
+                    
+                    # Skip tiles with too much nodata
+                    if nodata_fraction > cfg.max_nodata:
+                        continue
+                    
+                    # Count class frequencies for valid pixels only
+                    cl_u, cl_c = mask[valid_mask].unique(return_counts=True)
                     for c, n in zip(cl_u.tolist(), cl_c.tolist()):
-                        recs.append({"geohash": h, "gnn_class": c, "gnn_counts": n})
+                        recs.append({
+                            "geohash": h, 
+                            "gnn_class": c, 
+                            "gnn_counts": n,
+                            "total_pixels": valid_pixels,
+                            "nodata_pixels": nodata_pixels,
+                            "nodata_fraction": nodata_fraction
+                        })
             freqs = pd.DataFrame(recs)
             if not freqs.empty:
                 freqs = freqs.merge(
@@ -257,9 +288,8 @@ def main():
                     .reset_index(name="total"),
                     on="geohash",
                 )
-                freqs["frequency"], freqs["odf_class"] = freqs["gnn_counts"] / freqs[
-                    "total"
-                ], freqs["gnn_class"].replace(gnn.remap_dict)
+                freqs["frequency"] = freqs["gnn_counts"] / freqs["total"]
+                freqs["odf_class"] = freqs["gnn_class"].replace(gnn.remap_dict)
             if not cfg.dry_run:
                 out.mkdir(parents=True, exist_ok=True)
                 freqs.to_csv(fp, index=False)
@@ -281,14 +311,16 @@ def main():
             .reset_index()
         )
         s = cfg.balance_strategy
+        # Filter out only invalid classes for analysis, but keep nodata info
+        valid_classes = freqs[~freqs["odf_class"].isin([-2147483648, -1])].copy()
+        
         if s == "none":
             selected = el.sample(
                 n=min(cfg.sample_size, len(el)), random_state=cfg.random_state
             )
         elif s == "capped":
-            v_v = freqs[~freqs["odf_class"].isin([-2147483648, -1])].copy()
             # Group by geohash and odf_class, sum counts
-            summed = v_v.groupby(["geohash", "odf_class"])["gnn_counts"].sum().reset_index()
+            summed = valid_classes.groupby(["geohash", "odf_class"])["gnn_counts"].sum().reset_index()
             # Get index of max count per geohash (dominant class per tile)
             max_idx = summed.groupby("geohash")["gnn_counts"].idxmax()
             # Use iloc for positional indexing to avoid index mismatch
@@ -298,7 +330,7 @@ def main():
                     n=min(len(assigned[assigned["odf_class"] == c]), cfg.sample_size),
                     random_state=cfg.random_state,
                 )
-                for c in v_v["odf_class"].unique()
+                for c in valid_classes["odf_class"].unique()
                 if not assigned[assigned["odf_class"] == c].empty
             ]
             selected = el[
@@ -434,11 +466,21 @@ def main():
         print(f"- Base frequency CSV:  {f_u}")
         print(f"- Total tiles in CSV:  {freqs['geohash'].nunique():,}")
         print(f"- Sampling strategy:   {cfg.balance_strategy}")
+        print(f"- Max nodata allowed:  {cfg.max_nodata:.1%}")
+        
+        # Calculate nodata statistics
+        if 'nodata_fraction' in freqs.columns:
+            nodata_stats = freqs['nodata_fraction'].describe()
+            print(f"- Mean nodata:         {nodata_stats['mean']:.1%}")
+            print(f"- Median nodata:       {nodata_stats['50%']:.1%}")
+            print(f"- Max nodata:          {nodata_stats['max']:.1%}")
+        
         selected_count = len(selected) if selected is not None else 0
         md = [
             f"# Report: {split_base}",
             "\n## Summary",
             f"- Strategy: {cfg.balance_strategy}",
+            f"- Max Nodata Allowed: {cfg.max_nodata:.1%}",
             f"- Total Tiles Input: {freqs['geohash'].nunique():,}",
             f"- Selected Tiles: {selected_count:,}",
             f"- Base Tile File: `{t_u}`",
