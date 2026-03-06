@@ -509,6 +509,35 @@ class BaseGeoDataModule(CloudDataModule):
             collate_fn=self._collate_fn,
         )
 
+    def predict_dataloader(self) -> DataLoader:
+        """DataLoader for prediction/inference.
+
+        Returns:
+            DataLoader configured for the prediction dataset.
+
+        Raises:
+            RuntimeError: If predict_dataset is not set up or predict_tiles is not provided.
+        """
+        if self.predict_dataset is None:
+            raise RuntimeError(
+                "predict_dataset is not initialized. "
+                "Ensure setup('predict') is called before predict_dataloader()."
+            )
+        if self.predict_tiles is None:
+            raise RuntimeError(
+                "predict_tiles is not set. "
+                "Ensure predict_tiles_path is provided in constructor."
+            )
+
+        sampler = TileGeoSampler(self.predict_dataset, self.predict_tiles.data, shuffle=False)
+        return DataLoader(
+            self.predict_dataset,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=self._collate_fn,
+        )
+
     def prepare_data(self) -> None:
         """Prepare data - called only on the main process in distributed training.
 
