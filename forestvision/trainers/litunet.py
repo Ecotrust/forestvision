@@ -910,7 +910,7 @@ class MultiTaskUNet(BaseTask):
         task_band_names: list[str] = None,
         save_plots_dir: Optional[str] = None,
         frozen_modules: list[str] = None,
-        max_marginal_samples: int = 10000,
+        max_marginal_samples: int = 150000,
         max_marginal_batches: int = 32,
     ):
         """Multi-task UNet for flexible task combinations.
@@ -1785,10 +1785,10 @@ class MultiTaskUNet(BaseTask):
         # Sample batches to avoid memory issues and slow plotting
         max_batches = self.hparams.get("max_marginal_batches", 32)
         if len(self.test_step_outputs) > max_batches:
-            print(
-                f"Sampling {max_batches} batches for test regression marginals "
-                f"(out of {len(self.test_step_outputs)})"
-            )
+            # print(
+            #     f"Sampling {max_batches} batches for test regression marginals "
+            #     f"(out of {len(self.test_step_outputs)})"
+            # )
             indices = torch.randperm(len(self.test_step_outputs))[:max_batches]
             batches_to_process = [self.test_step_outputs[i] for i in indices]
         else:
@@ -2049,6 +2049,55 @@ class MultiTaskUNet(BaseTask):
         # Concatenate all task outputs
         return torch.cat(outputs, dim=1)
 
+    def predict_step(self, batch, batch_idx, dataloader_idx=None):
+        """Prediction step for multi-task inference.
+
+        Converts model logits/outputs to task-specific predictions:
+        - Classification: argmax over logits to get class predictions
+        - Regression: raw values (or tanh activated if configured)
+
+        Args:
+            batch: Dictionary containing "image" tensor and optionally "mask"
+            batch_idx: Index of the current batch
+            dataloader_idx: Index of the current dataloader (for multiple predict dataloaders)
+
+        Returns:
+            dict: Dictionary containing:
+                - "predictions": Tensor of shape [B, num_tasks, H, W] with task predictions
+                - "batch": Original batch dictionary for metadata (crs, bounds, etc.)
+        """
+        x = batch["image"]
+
+        # Forward pass - get raw model output
+        y_hat = self(x)
+
+        # Convert to task predictions
+        predictions = []
+        channel_offset = 0
+
+        for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            task_output = y_hat[:, channel_offset : channel_offset + num_classes]
+
+            if task_type == "classification":
+                # Apply softmax + argmax to get class predictions
+                probs = task_output.softmax(dim=1)
+                pred = torch.argmax(probs, dim=1, keepdim=True)  # [B, 1, H, W]
+                predictions.append(pred)
+            else:  # regression
+                # Keep the single regression channel
+                pred = task_output[:, 0:1]  # [B, 1, H, W]
+                predictions.append(pred)
+
+            channel_offset += num_classes
+
+        # Stack predictions: [B, num_tasks, H, W]
+        predictions = torch.cat(predictions, dim=1)
+
+        return {
+            "predictions": predictions,
+            "batch": batch,
+        }
+
     def _split_outputs_by_task(self, y_hat):
         """Split model output into task-specific tensors.
 
@@ -2208,7 +2257,7 @@ class MultiTaskUNet(BaseTask):
 
         # Sample points for visualization to avoid overcrowded plots and slow rendering
         n_valid = int(valid_mask.sum().item())
-        max_samples = self.hparams.get("max_marginal_samples", 10000)
+        max_samples = self.hparams.get("max_marginal_samples", 150000)
 
         if n_valid > max_samples:
             # Get flat indices of valid pixels
