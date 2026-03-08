@@ -63,7 +63,13 @@ from forestvision.models.unet import MTUNet, ResMTUNet, OptimizedMTUNet
 
 from ..models import UNet
 from ..datasets import minmax_scaling
-from ..losses import L1SSIMComboLoss, SharpLoss, HomoscedasticUncertaintyLoss
+from ..losses import (
+    L1SSIMComboLoss,
+    SharpLoss,
+    HomoscedasticUncertaintyLoss,
+    QuantilePinballLoss,
+    BoundedQuantileLoss,
+)
 
 
 class RegressionUNet(BaseTask):
@@ -899,6 +905,11 @@ class MultiTaskUNet(BaseTask):
         loss_norm_momentum: float = 0.9,
         reg_loss: str = "mae",
         huber_delta: float = 1.0,
+        quantiles: list[float] = None,
+        use_bounded_quantile: bool = False,
+        quantile_min_val: float = 0.0,
+        quantile_max_val: float = None,
+        quantile_bound_penalty: float = 0.1,
         loss_type: str = "mae",
         ssim_w: float = 0.5,
         sharploss_alpha: float = 0.5,
@@ -943,11 +954,12 @@ class MultiTaskUNet(BaseTask):
             init_log_vars: Initial log variances for uncertainty weighting (if used).
             use_loss_normalization: Whether to apply running average normalization to losses before weighting.
             loss_norm_momentum: Momentum for updating running average of losses if normalization is used.
-            reg_loss: Loss type for regression ("mae", "mse", "sharploss", "l1ssim", or "huber").
+            reg_loss: Loss type for regression ("mae", "mse", "sharploss", "l1ssim", "huber", or "quantile").
             ssim_w: Weight for SSIM component in L1SSIMComboLoss if used for regression loss.
             sharploss_alpha: Alpha parameter for SharpLoss if used for regression loss.
             huber_delta: Delta parameter for Huber loss (SmoothL1Loss) if used for regression loss.
                 Controls the point where the loss transitions from L2 to L1. Default is 1.0.
+            quantiles: List of quantiles to predict if using quantile loss for regression.
             use_reg_tanh: Whether to apply a tanh activation to the regression output.
             model: Model architecture to use ("MTUNet", "ResMTUNet", or "OptimizedMTUNet").
             backbone: ResNet backbone variant for ResMTUNet ("resnet18", "resnet34", "resnet50", "resnet101").
@@ -1216,7 +1228,7 @@ class MultiTaskUNet(BaseTask):
                 # Robust mask for regression
                 reg_mask = (task_target == ignore_index) | (task_target < -1e9)
 
-                if isinstance(self.reg_loss_fn, (SharpLoss, L1SSIMComboLoss)):
+                if isinstance(self.reg_loss_fn, (SharpLoss, L1SSIMComboLoss, QuantilePinballLoss, BoundedQuantileLoss)):
                     loss = self.reg_loss_fn(task_pred, task_target, reg_mask)
                 else:
                     loss_all = self.reg_loss_fn(task_pred, task_target)
@@ -1426,10 +1438,30 @@ class MultiTaskUNet(BaseTask):
         elif reg_loss_type == "huber":
             delta = self.hparams.get("huber_delta", 1.0)
             self.reg_loss_fn = nn.SmoothL1Loss(reduction="none", beta=delta)
+        elif reg_loss_type == "quantile":
+            # Quantile (pinball) loss for addressing regression toward the mean
+            quantiles = self.hparams.get("quantiles", [0.1, 0.5, 0.9])
+            use_bounded = self.hparams.get("use_bounded_quantile", False)
+            if use_bounded:
+                min_val = self.hparams.get("quantile_min_val", 0.0)
+                max_val = self.hparams.get("quantile_max_val", None)
+                bound_penalty = self.hparams.get("quantile_bound_penalty", 0.1)
+                self.reg_loss_fn = BoundedQuantileLoss(
+                    quantiles=quantiles,
+                    min_val=min_val,
+                    max_val=max_val,
+                    bound_penalty=bound_penalty,
+                    reduction="mean",
+                )
+            else:
+                self.reg_loss_fn = QuantilePinballLoss(
+                    quantiles=quantiles,
+                    reduction="mean",
+                )
         else:
             raise ValueError(
                 f"Regression loss type '{reg_loss_type}' is not valid. "
-                "Currently, supports 'mae', 'mse', 'sharploss', 'l1ssim', or 'huber'."
+                "Currently, supports 'mae', 'mse', 'sharploss', 'l1ssim', 'huber', or 'quantile'."
             )
 
         # Initialize loss weighting strategy
