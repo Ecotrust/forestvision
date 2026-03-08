@@ -33,8 +33,8 @@ class ClimateNA(AnyRasterDataset):
     nodata = -9999
 
 
-class ForTypesDataModule(BaseGeoDataModule):
-    """LightningDataModule for forest type classification, refactored to use BaseGeoDataModule."""
+class GNNDataModule(BaseGeoDataModule):
+    """LightningDataModule for GNN-based forest type classification, refactored to use BaseGeoDataModule."""
 
     def __init__(
         self,
