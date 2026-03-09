@@ -470,10 +470,40 @@ class BaseGeoDataModule(CloudDataModule):
                 self.test_tiles = GPDFeatureCollection(os.path.join(self.root, self.test_tiles_path))
             test_roi = self.test_tiles.bounds if self.test_tiles else None
 
-            input_ds = self._instantiate_combined_dataset(self.input_configs, "test", test_roi, self.input_transforms)
-            target_ds = self._instantiate_combined_dataset(self.target_configs, "test", test_roi, self.target_transforms)
+            input_ds = self._instantiate_combined_dataset(self.input_configs, "test", test_roi, transforms=None)
+            target_ds = self._instantiate_combined_dataset(self.target_configs, "test", test_roi, transforms=None)
             if input_ds and target_ds:
                 self.test_dataset = target_ds & input_ds
+
+                test_transform_chain = []
+
+                if self.input_transforms:
+                    instantiated = self._instantiate_transforms(self.input_transforms, self.test_dataset)
+                    if not isinstance(instantiated, list):
+                        instantiated = [instantiated]
+                    test_transform_chain.extend(instantiated)
+
+                if self.target_transforms:
+                    instantiated = self._instantiate_transforms(self.target_transforms, self.test_dataset)
+                    if not isinstance(instantiated, list):
+                        instantiated = [instantiated]
+                    test_transform_chain.extend(instantiated)
+
+                if self.post_aug_input_transforms:
+                    instantiated = self._instantiate_transforms(self.post_aug_input_transforms, self.test_dataset)
+                    if not isinstance(instantiated, list):
+                        instantiated = [instantiated]
+                    test_transform_chain.extend(instantiated)
+
+                if self.post_aug_target_transforms:
+                    instantiated = self._instantiate_transforms(self.post_aug_target_transforms, self.test_dataset)
+                    if not isinstance(instantiated, list):
+                        instantiated = [instantiated]
+                    test_transform_chain.extend(instantiated)
+
+                if test_transform_chain:
+                    from forestvision.transforms.augmentations import ComposeAugmentations
+                    self.test_dataset.transforms = ComposeAugmentations(test_transform_chain)
 
         elif stage == "predict":
             p_year = year or self.year

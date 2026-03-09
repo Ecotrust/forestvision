@@ -48,6 +48,7 @@ class GNNDataModule(BaseGeoDataModule):
         val_tiles_path: Optional[str] = None,
         test_tiles_path: Optional[str] = None,
         predict_tiles_path: Optional[str] = None,
+        predict_year: Optional[int] = None,
         input_datasets: Optional[List[Dict[str, Any]]] = None,
         target_datasets: Optional[List[Dict[str, Any]]] = None,
         input_transforms: Optional[Any] = None,
@@ -62,6 +63,7 @@ class GNNDataModule(BaseGeoDataModule):
     ) -> None:
         # Store download flag for use in prepare_data
         self.download = download
+        self.predict_year = predict_year
 
         # Initialize Earth Engine
         ee_project = ee_project or GEE_PROJECT_NAME
@@ -147,6 +149,10 @@ class GNNDataModule(BaseGeoDataModule):
                 f"Stats file not found at {self.stats_path}. Using identity normalization (mean=0, std=1)."
             )
             self._set_identity_stats()
+
+        # Use predict_year for prediction stage if specified
+        if stage == "predict" and self.predict_year is not None:
+            year = self.predict_year
 
         super().setup(stage, year)
 

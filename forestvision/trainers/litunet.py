@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchmetrics import (
     MetricCollection,
     Accuracy,
@@ -20,7 +19,6 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torchvision.transforms.functional as tvF
 from torchgeo.trainers import BaseTask
 from kornia.enhance import Denormalize
-from kornia.losses import FocalLoss
 from kornia.losses import focal_loss as kornia_focal_loss
 
 
@@ -401,9 +399,9 @@ class RegressionUNet(BaseTask):
 
             else:
                 for i, img in enumerate(item):
-                    img = img.squeeze().clone().detach().cpu()
+                    img = img.squeeze().clone().detach().cpu().float()
                     msk = mask_nodata[i].squeeze()
-                    img[msk == True] = np.nan
+                    img[msk] = np.nan
 
                     # Create a colormap that shows NaN as black
                     cmap = plt.get_cmap("viridis").copy()
@@ -981,8 +979,17 @@ class MultiTaskUNet(BaseTask):
 
         super().__init__()
 
+        # Store as instance attributes BEFORE save_hyperparameters
+        self.labels = labels or {}
+        self.colormap = colormap or {}
+        self.task_band_names = task_band_names or [
+            f"task_{i}" for i in range(len(task_types))
+        ]
+        self.save_plots_dir = save_plots_dir
+        
         # Save hyperparameters, excluding visualization-only params and deprecated ones
         # Note: task_types and num_classes_per_task are now instance attributes
+        # save_plots_dir is now included in hyperparameters so it gets passed through LightningCLI
         self.save_hyperparameters(
             ignore=[
                 "labels",
@@ -994,14 +1001,6 @@ class MultiTaskUNet(BaseTask):
                 "task_band_names",
             ]
         )
-
-        # Store as instance attributes (not hyperparameters)
-        self.labels = labels or {}
-        self.colormap = colormap or {}
-        self.task_band_names = task_band_names or [
-            f"task_{i}" for i in range(len(task_types))
-        ]
-        self.save_plots_dir = save_plots_dir
         self.validation_step_outputs = []
         self.test_step_outputs = []
         # Store for loss logging
@@ -1020,16 +1019,26 @@ class MultiTaskUNet(BaseTask):
             filename: Base filename (without extension)
             epoch: Current epoch number (for organizing files)
         """
-        if self.save_plots_dir is None:
-            return
-
         import os
+        
+        # Get save_plots_dir, with fallback to datamodule root + /plots
+        save_plots_dir = self.save_plots_dir
+        if save_plots_dir is None:
+            save_plots_dir = self.hparams.get("save_plots_dir")
+        if save_plots_dir is None and hasattr(self, "trainer") and self.trainer is not None:
+            if hasattr(self.trainer, "datamodule") and self.trainer.datamodule is not None:
+                datamodule_root = getattr(self.trainer.datamodule, "root", None)
+                if datamodule_root:
+                    save_plots_dir = f"{datamodule_root}/plots"
+        
+        if save_plots_dir is None:
+            return
 
         # Create directory structure: save_plots_dir/epoch_{epoch}/
         if epoch is not None:
-            save_dir = os.path.join(self.save_plots_dir, f"epoch_{epoch}")
+            save_dir = os.path.join(save_plots_dir, f"epoch_{epoch}")
         else:
-            save_dir = self.save_plots_dir
+            save_dir = save_plots_dir
 
         os.makedirs(save_dir, exist_ok=True)
 
@@ -1715,6 +1724,18 @@ class MultiTaskUNet(BaseTask):
         # Compute metrics for each task
         self._compute_and_log_metrics(y_hat, y, "test")
 
+        # Update confusion matrix for classification tasks
+        has_classification = any(t == "classification" for t in self.task_types)
+        if has_classification and hasattr(self, "confusion_matrix"):
+            channel_offset = 0
+            for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+                if task_type == "classification":
+                    task_pred = y_hat[:, channel_offset:channel_offset + num_classes]
+                    pred = torch.argmax(task_pred.softmax(dim=1), dim=1)
+                    task_target = y[:, self.task_types.index("classification")]
+                    self.confusion_matrix.update(pred, task_target)
+                channel_offset += num_classes
+
         # Convert y_hat from raw output [B, total_channels, H, W] to task format [B, num_tasks, H, W]
         # for visualization. For classification, take argmax. For regression, keep single channel.
         y_hat_tasks = []
@@ -1778,26 +1799,16 @@ class MultiTaskUNet(BaseTask):
             confmat = self.confusion_matrix.compute()
             self.confusion_matrix.reset()
 
-            # Create and log confusion matrix plot
+            # Create and save confusion matrix plot (skip TensorBoard during testing)
             confmat_fig = self.plot_confusion_matrix(confmat.cpu().numpy())
-            if self.logger is not None:
-                self.logger.experiment.add_figure(
-                    "test_confusion_matrix", confmat_fig, self.current_epoch
-                )
-            # Save to disk if configured
             self._save_figure(confmat_fig, "test_confusion_matrix", self.current_epoch)
 
-        # Create and log sample batch plot
+        # Create and save sample batch plot (skip TensorBoard during testing)
         if self.test_step_outputs:
             batch_fig = self.plot_batch(self.test_step_outputs[0])
-            if self.logger is not None:
-                self.logger.experiment.add_figure(
-                    "test_images", batch_fig, self.current_epoch
-                )
-            # Save to disk if configured
             self._save_figure(batch_fig, "test_images", self.current_epoch)
 
-            # Generate and log marginal distribution plots for regression tasks
+            # Generate and save marginal distribution plots for regression tasks
             self._log_test_regression_marginals(save_to_disk=True)
 
         self.test_step_outputs.clear()
@@ -2232,7 +2243,7 @@ class MultiTaskUNet(BaseTask):
 
     def _plot_regression(self, ax, img, mask_nodata, vmin, vmax, title):
         """Plot regression image."""
-        img_data = img.detach().cpu().numpy()
+        img_data = img.detach().cpu().numpy().astype(float)
         img_masked = img_data.copy()
         img_masked[mask_nodata] = np.nan
         cmap = plt.get_cmap("viridis").copy()
