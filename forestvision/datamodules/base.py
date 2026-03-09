@@ -113,6 +113,19 @@ class BaseGeoDataModule(CloudDataModule):
         self.test_tiles = None
         self.predict_tiles = None
 
+    @property
+    def _shape_str(self) -> str:
+        """Convert patch_size to shape string for path template.
+        
+        Returns:
+            Shape string like "128x128" or "256x256"
+        """
+        if isinstance(self.patch_size, int):
+            return f"{self.patch_size}x{self.patch_size}"
+        elif isinstance(self.patch_size, (tuple, list)) and len(self.patch_size) >= 2:
+            return f"{self.patch_size[0]}x{self.patch_size[1]}"
+        return "128x128"
+
     def _instantiate_transforms(self, transforms_config: Any, dataset: Any) -> Any:
         def instantiate(obj, ds=None):
             if isinstance(obj, dict) and "class_path" in obj:
@@ -266,7 +279,7 @@ class BaseGeoDataModule(CloudDataModule):
     ) -> IntersectionDataset:
         datasets = []
         for cfg in configs:
-            path = cfg.path_template.format(root=self.root, year=self.year, stage=stage)
+            path = cfg.path_template.format(root=self.root, year=self.year, stage=stage, shape=self._shape_str)
 
             if not os.path.isabs(path):
                 path = os.path.join(self.root, path)

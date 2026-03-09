@@ -49,7 +49,7 @@ import argparse
 import logging
 import pydoc
 import inspect
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 
 import yaml
 import json
@@ -64,6 +64,24 @@ from forestvision.datasets.utils import DatasetStats
 from forestvision.datasets import GPDFeatureCollection
 
 os.environ["CPL_LOG"] = "/dev/null"
+
+
+def _get_shape_str(patch_size: Optional[Union[int, tuple]] = None) -> str:
+    """Convert patch_size to shape string for path template.
+    
+    Args:
+        patch_size: Patch size as int (square) or tuple (height, width)
+        
+    Returns:
+        Shape string like "128x128" or "256x256"
+    """
+    if patch_size is None:
+        return "128x128"
+    elif isinstance(patch_size, int):
+        return f"{patch_size}x{patch_size}"
+    elif isinstance(patch_size, (tuple, list)) and len(patch_size) >= 2:
+        return f"{patch_size[0]}x{patch_size[1]}"
+    return "128x128"
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -175,6 +193,7 @@ def instantiate_dataset(
     root: str,
     year: int,
     stage: str = "training",
+    shape: Optional[str] = None,
     roi: Optional[Any] = None,
     download: bool = False,
 ):
@@ -186,7 +205,7 @@ def instantiate_dataset(
         dataset_class = cls_path
 
     path_template = cfg_dict.get("path_template", "")
-    path = path_template.format(root=root, year=year, stage=stage)
+    path = path_template.format(root=root, year=year, stage=stage, shape=shape or "128x128")
     if not os.path.isabs(path):
         path = os.path.join(root, path)
 
@@ -262,8 +281,11 @@ def prepare_data(
     predict_only: bool = False,
     predict_tiles_path: Optional[str] = None,
     predict_year: Optional[int] = None,
+    patch_size: Optional[int] = None,
 ) -> None:
     """Prepare data by downloading and computing statistics using DatasetStats."""
+    # Convert patch_size to shape string for path template
+    shape = _get_shape_str(patch_size)
     tqdm_handler = TqdmLoggingHandler()
     tqdm_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     root_logger = logging.getLogger()
@@ -310,7 +332,7 @@ def prepare_data(
         if not skip_download:
             logging.info("Downloading input datasets for prediction...")
             for cfg in input_datasets_cfg:
-                ds = instantiate_dataset(cfg, root, year, roi=predict_roi, download=True)
+                ds = instantiate_dataset(cfg, root, year, shape=shape, roi=predict_roi, download=True)
                 ds_name = ds.__class__.__name__
                 
                 if hasattr(ds, "download") or hasattr(ds, "_download"):
@@ -381,7 +403,7 @@ def prepare_data(
         all_ds_cfgs = (input_datasets_cfg or []) + (target_datasets_cfg or [])
         for cfg in all_ds_cfgs:
             ds = instantiate_dataset(
-                cfg, root, year, stage="validation", roi=val_roi, download=not skip_download
+                cfg, root, year, stage="validation", shape=shape, roi=val_roi, download=not skip_download
             )
             if hasattr(ds, "download") or hasattr(ds, "_download"):
                 logging.info(f"Downloading validation data for {ds.__class__.__name__}...")
@@ -406,7 +428,7 @@ def prepare_data(
         all_ds_cfgs = (input_datasets_cfg or []) + (target_datasets_cfg or [])
         for cfg in all_ds_cfgs:
             ds = instantiate_dataset(
-                cfg, root, year, stage="test", roi=test_roi, download=not skip_download
+                cfg, root, year, stage="test", shape=shape, roi=test_roi, download=not skip_download
             )
             if hasattr(ds, "download") or hasattr(ds, "_download"):
                 logging.info(f"Downloading test data for {ds.__class__.__name__}...")
@@ -444,7 +466,7 @@ def prepare_data(
     if "image" in on_keys:
         logging.info("Computing statistics for input datasets...")
         for i, cfg in enumerate(input_datasets_cfg):
-            ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
+            ds = instantiate_dataset(cfg, root, year, shape=shape, roi=roi, download=not skip_download)
             
             # Get dataset name for logging
             ds_name = ds.__class__.__name__
@@ -523,7 +545,7 @@ def prepare_data(
         # Instantiate all target datasets
         target_datasets = []
         for i, cfg in enumerate(target_datasets_cfg):
-            ds = instantiate_dataset(cfg, root, year, roi=roi, download=not skip_download)
+            ds = instantiate_dataset(cfg, root, year, shape=shape, roi=roi, download=not skip_download)
             
             # Download target datasets before combining and computing stats
             if not skip_download and hasattr(ds, "download"):
@@ -758,6 +780,13 @@ def main():
         help="Year for prediction data (overrides config year in predict-only mode). "
              "Can also be set via 'predict_year' in config.",
     )
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=None,
+        help="Patch size for path template (e.g., 128, 256, 512). "
+             "Converts to {shape} placeholder like '128x128'. Default: 128",
+    )
     args = parser.parse_args()
 
     # Join list to string if multiple arguments were passed (for backward compatibility)
@@ -780,6 +809,7 @@ def main():
         predict_only=args.predict_only,
         predict_tiles_path=args.predict_tiles_path,
         predict_year=args.predict_year,
+        patch_size=args.patch_size,
     )
 
 
