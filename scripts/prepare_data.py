@@ -300,6 +300,12 @@ def prepare_data(
         raise ValueError("Config must contain 'data.init_args' section")
     
     data_args = config["data"]["init_args"]
+    
+    # Get patch_size from config if not provided via CLI
+    if patch_size is None:
+        patch_size = data_args.get("patch_size")
+        if patch_size is not None:
+            logging.info(f"Using patch_size={patch_size} from config")
     root = data_args.get("root", ".")
     year = data_args.get("year")
     
