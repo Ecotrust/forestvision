@@ -211,19 +211,14 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
                         # Use task_idx directly (same as plot_batch in MultiTaskUNet)
                         print(f"target stats found: mean: {mean}, std: {std}")
                         if task_idx < len(mean):
-                            print(f"task: {task_type}, shape: {pred.shape}, mean: {mean[task_idx]}, std: {std[task_idx]}")
-                            print(f"before denorm: mean: {pred.mean()}, std: {pred.std()}, min: {pred.min()}, max: {pred.max()}")
                             pred = pred/100 * std[task_idx] + mean[task_idx]
-                            print(f"after denorm: mean: {pred.mean()}, std: {pred.std()}, min: {pred.min()}, max: {pred.max()}")
                         # Shift predictions and truncate to positive values
                         if task_idx == 2:
                             pred = pred - 100
-                            pred[pred < 0] = 0
+                            pred[pred < 0] = -1
                         else:
                             pred = pred - 1000
-                            pred[pred < 0] = 0
-                        print(f"after shift/trunc: mean: {pred.mean()}, std: {pred.std()}, min: {pred.min()}, max: {pred.max()}")
-
+                            pred[pred < 0] = -1
 
                     # Keep float values, replace NaN with NoData
                     pred = pred.astype(self.task_dtypes[task_name])
