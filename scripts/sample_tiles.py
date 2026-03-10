@@ -54,6 +54,7 @@ class SamplerConfig:
     states: list[str] = field(default_factory=lambda: ["Oregon", "Washington"])
     tile_size: int = 128
     tile_res: int = 10
+    stride: int = None
     sample_size: int = 8000
     random_state: int = 42
     batch_size: int = 64
@@ -73,6 +74,8 @@ class SamplerConfig:
     def __post_init__(self):
         if self.tile_size <= 0:
             raise ValueError("tile_size must be > 0")
+        if self.stride is not None and self.stride <= 0:
+            raise ValueError("stride must be > 0")
         if self.k_folds is not None and self.k_folds < 2:
             raise ValueError("k_folds must be >= 2")
         if not 0.0 <= self.max_nodata <= 1.0:
@@ -154,6 +157,12 @@ def main():
         default=0.3,
         help="Maximum fraction of nodata pixels allowed per tile (0.0-1.0, default: 0.3)",
     )
+    p.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Stride for tile generation (default: None, meaning stride equals tile-size for no overlap)",
+    )
 
     args = p.parse_args()
     # Map sampling_strategy to balance_strategy for SamplerConfig
@@ -190,7 +199,7 @@ def main():
             tb = b.total_bounds
             roi = BoundingBox(tb[0], tb[2], tb[1], tb[3], 0, sys.maxsize)
             tbounds = roi_to_tiles(
-                roi=roi, size=cfg.tile_size, res=cfg.tile_res, stride=cfg.tile_size
+                roi=roi, size=cfg.tile_size, res=cfg.tile_res, stride=cfg.stride
             )
             tiles = gpd.GeoDataFrame(
                 {"geometry": [box(*bt) for bt in tbounds]}, crs="EPSG:5070"
