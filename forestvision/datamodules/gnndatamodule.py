@@ -33,6 +33,70 @@ class ClimateNA(AnyRasterDataset):
     nodata = -9999
 
 
+class Local3Dep(AnyRasterDataset):
+    all_bands = ["elevation"]
+    rgb_bands = ["elevation"]
+    instrument = "USGS 3DEP"
+    nodata = None
+    is_image = True
+    filename_glob = "*.tif"
+
+    def __init__(self, paths=None, path=None, **kwargs):
+        # GEE classes use 'path', AnyRasterDataset uses 'paths'
+        data_path = paths if paths is not None else path
+        # Handle bands - set before parent init validates them
+        bands = kwargs.pop("bands", None)
+        self.bands = bands if bands is not None else self.all_bands.copy()
+        # Set defaults that ClimateNA-style classes need
+        kwargs.setdefault("glob", self.filename_glob)
+        kwargs.setdefault("nodata", self.nodata)
+        kwargs.setdefault("is_image", self.is_image)
+        super().__init__(paths=data_path, **kwargs)
+
+
+class LocalSentinel2(AnyRasterDataset):
+    all_bands = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"]
+    rgb_bands = ["B4", "B3", "B2"]
+    instrument = "Sentinel 2 MSI"
+    nodata = 0
+    is_image = True
+    filename_glob = "*.tif"
+
+    def __init__(self, paths=None, path=None, **kwargs):
+        data_path = paths if paths is not None else path
+        # Handle bands - set before parent init validates them
+        bands = kwargs.pop("bands", None)
+        self.bands = bands if bands is not None else self.all_bands.copy()
+        kwargs.setdefault("glob", self.filename_glob)
+        kwargs.setdefault("nodata", self.nodata)
+        kwargs.setdefault("is_image", self.is_image)
+        super().__init__(paths=data_path, **kwargs)
+
+
+class LocalLandsat8(AnyRasterDataset):
+    all_bands = [
+        'TCW', 
+        'TCG', 
+        'TCB', 
+        'TCA'
+    ]
+    rgb_bands = ["TCB", "TCG", "TCW"]
+    instrument = "Landsat 8 OLI/TIRS"
+    nodata = 0
+    is_image = True
+    filename_glob = "*.tif"
+
+    def __init__(self, paths=None, path=None, **kwargs):
+        data_path = paths if paths is not None else path
+        # Handle bands - set before parent init validates them
+        bands = kwargs.pop("bands", None)
+        self.bands = bands if bands is not None else self.all_bands.copy()
+        kwargs.setdefault("glob", self.filename_glob)
+        kwargs.setdefault("nodata", self.nodata)
+        kwargs.setdefault("is_image", self.is_image)
+        super().__init__(paths=data_path, **kwargs)
+
+
 class GNNDataModule(BaseGeoDataModule):
     """LightningDataModule for GNN-based forest type classification, refactored to use BaseGeoDataModule."""
 
@@ -471,6 +535,95 @@ class GNNDataModule(BaseGeoDataModule):
     def setup_transforms(self):
         """Hook for future use. Normalization is now handled per-dataset via transforms config."""
         pass
+
+    def _collate_fn(self, batch):
+        """Custom collate function that ensures bounds are included for georeferencing."""
+        from torchgeo.datasets import stack_samples
+        collated = stack_samples(batch)
+        
+        # Get bounds - convert BoundingBox objects to tuples to avoid frozen dataclass issues
+        bounds = collated.get("bbox") or collated.get("bounds")
+        if bounds is None and batch:
+            first_sample = batch[0]
+            if hasattr(first_sample, "get"):
+                bounds = first_sample.get("bbox") or first_sample.get("bounds")
+        
+        # Convert BoundingBox objects to plain tuples (minx, maxx, miny, maxy)
+        # This avoids "frozen dataclass" errors when Lightning moves data to CPU
+        if bounds is not None:
+            if hasattr(bounds, "__iter__"):
+                # List of BoundingBox objects
+                bounds = [(b.minx, b.maxx, b.miny, b.maxy) for b in bounds]
+            elif hasattr(bounds, "minx"):
+                # Single BoundingBox object
+                bounds = (bounds.minx, bounds.maxx, bounds.miny, bounds.maxy)
+        
+        # Ensure bounds are present (needed for MultiTaskPredictionSaver)
+        result = {
+            "mask": collated.get("mask"),
+            "image": collated.get("image"),
+            "crs": collated.get("crs"),
+            "bounds": bounds,
+        }
+        
+        return result
+
+    def transfer_batch_to_device(self, batch: Dict[str, Any], device, dataloader_idx: int) -> Dict[str, Any]:
+        """Override to preserve non-tensor data (bounds, crs) during device transfer."""
+        # Store non-tensor data before parent transfer
+        bounds = batch.get("bounds")
+        crs = batch.get("crs")
+        
+        # Let parent transfer tensor data to device
+        from torchgeo.datamodules.geo import GeoDataModule
+        transferred = GeoDataModule.transfer_batch_to_device(self, batch, device, dataloader_idx)
+        
+        # Restore non-tensor data
+        if bounds is not None:
+            transferred["bounds"] = bounds
+        if crs is not None:
+            transferred["crs"] = crs
+            
+        return transferred
+
+    def on_after_batch_transfer(self, batch: Dict[str, Any], dataloader_idx: int) -> Dict[str, Any]:
+        """Override to skip augmentations during prediction when mask is None.
+        
+        This prevents kornia errors when running inference without target data.
+        """
+        # Skip augmentation if:
+        # 1. No train_transforms configured
+        # 2. Batch has no mask (prediction mode with no targets)
+        if self.train_transforms is None or batch.get("mask") is None:
+            return batch
+        
+        # Otherwise apply parent class augmentation
+        return super().on_after_batch_transfer(batch, dataloader_idx)
+
+    def predict_dataloader(self):
+        """Override to ensure custom _collate_fn is used for prediction."""
+        from torch.utils.data import DataLoader
+        from forestvision.samplers import TileGeoSampler
+        
+        if self.predict_dataset is None:
+            raise RuntimeError(
+                "predict_dataset is not initialized. "
+                "Ensure setup('predict') is called before predict_dataloader()."
+            )
+        if self.predict_tiles is None:
+            raise RuntimeError(
+                "predict_tiles is not set. "
+                "Ensure predict_tiles_path is provided in constructor."
+            )
+
+        sampler = TileGeoSampler(self.predict_dataset, self.predict_tiles.data, shuffle=False)
+        return DataLoader(
+            self.predict_dataset,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            num_workers=self.num_workers,
+            collate_fn=self._collate_fn,
+        )
 
     def train_dataloader(self):
         return super().train_dataloader()

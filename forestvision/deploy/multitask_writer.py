@@ -49,6 +49,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
         crop: int = 0,
         overwrite: bool = False,
         nodata_values: Optional[Dict[str, Any]] = None,
+        target_stats: Optional[Dict[str, Any]] = None,
     ):
         """Initialize the MultiTaskPredictionSaver.
 
@@ -98,9 +99,16 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
         else:
             self.nodata_values = nodata_values
 
+        # Store target stats for denormalization
+        self.target_stats = target_stats
+
     def _generate_tile_id(self, bounds) -> str:
         """Generate a unique tile ID from bounding box coordinates."""
-        minx, maxx, miny, maxy = bounds.minx, bounds.maxx, bounds.miny, bounds.maxy
+        # Handle both BoundingBox objects and tuples (minx, maxx, miny, maxy)
+        if hasattr(bounds, "minx"):
+            minx, maxx, miny, maxy = bounds.minx, bounds.maxx, bounds.miny, bounds.maxy
+        else:
+            minx, maxx, miny, maxy = bounds
         return hashlib.md5(f"({minx}, {miny}, {maxx}, {maxy})".encode()).hexdigest()
 
     def _get_profile(self, task_name: str, height: int, width: int, bounds) -> dict:
@@ -116,12 +124,18 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
             nodata=nodata,
         )
 
+        # Handle both BoundingBox objects and tuples (minx, maxx, miny, maxy)
+        if hasattr(bounds, "minx"):
+            minx, maxx, miny, maxy = bounds.minx, bounds.maxx, bounds.miny, bounds.maxy
+        else:
+            minx, maxx, miny, maxy = bounds
+
         profile.update(
             transform=rasterio.transform.from_bounds(
-                bounds.minx,
-                bounds.miny,
-                bounds.maxx,
-                bounds.maxy,
+                minx,
+                miny,
+                maxx,
+                maxy,
                 width=width,
                 height=height,
             ),
@@ -190,6 +204,27 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
                     # Ensure classification values are integers
                     pred = pred.round().astype(self.task_dtypes[task_name])
                 else:  # regression
+                    # Denormalize regression predictions: pred * std + mean
+                    if self.target_stats is not None:
+                        mean = self.target_stats.get("mean", [0.0])
+                        std = self.target_stats.get("std", [1.0])
+                        # Use task_idx directly (same as plot_batch in MultiTaskUNet)
+                        print(f"target stats found: mean: {mean}, std: {std}")
+                        if task_idx < len(mean):
+                            print(f"task: {task_type}, shape: {pred.shape}, mean: {mean[task_idx]}, std: {std[task_idx]}")
+                            print(f"before denorm: mean: {pred.mean()}, std: {pred.std()}, min: {pred.min()}, max: {pred.max()}")
+                            pred = pred/100 * std[task_idx] + mean[task_idx]
+                            print(f"after denorm: mean: {pred.mean()}, std: {pred.std()}, min: {pred.min()}, max: {pred.max()}")
+                        # Shift predictions and truncate to positive values
+                        if task_idx == 2:
+                            pred = pred - 100
+                            pred[pred < 0] = 0
+                        else:
+                            pred = pred - 1000
+                            pred[pred < 0] = 0
+                        print(f"after shift/trunc: mean: {pred.mean()}, std: {pred.std()}, min: {pred.min()}, max: {pred.max()}")
+
+
                     # Keep float values, replace NaN with NoData
                     pred = pred.astype(self.task_dtypes[task_name])
                     pred = pred.copy()  # Make writeable
@@ -200,9 +235,27 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
 
                 # Get raster profile
                 height, width = pred.shape[-2], pred.shape[-1]
+                
+                # Calculate expected size from bounds (assuming 10m resolution)
+                # Handle both BoundingBox objects and tuples (minx, maxx, miny, maxy)
+                if hasattr(bounds, "minx"):
+                    minx, maxx, miny, maxy = bounds.minx, bounds.maxx, bounds.miny, bounds.maxy
+                else:
+                    minx, maxx, miny, maxy = bounds
+                expected_height = int((maxy - miny) / 10)
+                expected_width = int((maxx - minx) / 10)
+                
+                # Center crop prediction if it doesn't match expected size
+                if height != expected_height or width != expected_width:
+                    crop_h = (height - expected_height) // 2
+                    crop_w = (width - expected_width) // 2
+                    if crop_h > 0 or crop_w > 0:
+                        pred = pred[crop_h:height-crop_h, crop_w:width-crop_w]
+                        height, width = pred.shape[-2], pred.shape[-1]
+                
                 profile = self._get_profile(task_name, height, width, bounds)
 
-                # Handle cropping if specified
+                # Handle additional cropping if specified
                 window = None
                 if self.crop > 0:
                     window = Window(

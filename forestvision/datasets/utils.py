@@ -195,6 +195,9 @@ def save_cog(
     if not os.path.exists(path) or overwrite:
         with MemoryFile() as memfile:
             with memfile.open(**profile) as dst:
+                # Add band dimension if data is 2D (rasterio expects 3D: bands, height, width)
+                if data.ndim == 2:
+                    data = data[numpy.newaxis, :, :]
                 dst.write(data)
                 if window is not None:
                     w_trf = dst.window_transform(window)

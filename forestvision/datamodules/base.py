@@ -511,7 +511,27 @@ class BaseGeoDataModule(CloudDataModule):
                 self.predict_tiles = GPDFeatureCollection(os.path.join(self.root, self.predict_tiles_path))
             predict_roi = self.predict_tiles.bounds if self.predict_tiles else None
 
-            self.predict_dataset = self._instantiate_combined_dataset(self.input_configs, "predict", predict_roi, self.input_transforms)
+            predict_input_ds = self._instantiate_combined_dataset(self.input_configs, "predict", predict_roi, transforms=None)
+            self.predict_dataset = predict_input_ds
+
+            # Apply transforms for prediction (same as test/val)
+            predict_transform_chain = []
+
+            if self.input_transforms:
+                instantiated = self._instantiate_transforms(self.input_transforms, self.predict_dataset)
+                if not isinstance(instantiated, list):
+                    instantiated = [instantiated]
+                predict_transform_chain.extend(instantiated)
+
+            if self.post_aug_input_transforms:
+                instantiated = self._instantiate_transforms(self.post_aug_input_transforms, self.predict_dataset)
+                if not isinstance(instantiated, list):
+                    instantiated = [instantiated]
+                predict_transform_chain.extend(instantiated)
+
+            if predict_transform_chain:
+                from forestvision.transforms.augmentations import ComposeAugmentations
+                self.predict_dataset.transforms = ComposeAugmentations(predict_transform_chain)
 
     def _collate_fn(self, batch):
         collated = stack_samples(batch)
