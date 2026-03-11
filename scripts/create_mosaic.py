@@ -60,6 +60,40 @@ def get_tiles_for_task(input_dir: Path, task_name: str) -> List[Path]:
     return tiles
 
 
+def get_source_dtype(tiles: List[Path]) -> tuple[str, np.dtype]:
+    """Get the data type from the first source tile.
+
+    Args:
+        tiles: List of tile paths
+
+    Returns:
+        Tuple of (gdal_type_string, numpy_dtype)
+    """
+    if not tiles:
+        return "Float32", np.float32
+
+    with rasterio.open(tiles[0]) as src:
+        dtype = src.dtypes[0]
+
+    # Map rasterio dtype to GDAL type string
+    dtype_to_gdal = {
+        "uint8": "Byte",
+        "int8": "Int8",
+        "uint16": "UInt16",
+        "int16": "Int16",
+        "uint32": "UInt32",
+        "int32": "Int32",
+        "float32": "Float32",
+        "float64": "Float64",
+    }
+
+    gdal_type = dtype_to_gdal.get(dtype, "Float32")
+    numpy_dtype = np.dtype(dtype)
+
+    return gdal_type, numpy_dtype
+
+
+
 def validate_tiles(tiles: List[Path]) -> tuple[bool, Optional[str]]:
     """Validate that tiles exist and have consistent CRS.
 
@@ -188,6 +222,7 @@ def create_mosaic_gdalwarp(
     clip_boundary: Optional[Path] = None,
     out_crs: Optional[str] = None,
     agg_method: str = "mean",
+    crs_override: Optional[str] = None,
 ) -> bool:
     """Create mosaic using gdalwarp with optional blending.
 
@@ -216,15 +251,22 @@ def create_mosaic_gdalwarp(
     # Create output directory
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Get source data type to preserve it
+    gdal_type, _ = get_source_dtype(tiles)
+    logger.info(f"Preserving source data type: {gdal_type}")
+
     # Build gdalwarp command
+
     cmd = [
         "gdalwarp",
         "-of", "COG",  # Cloud-Optimized GeoTIFF
+        "-ot", gdal_type,  # Preserve source data type
         "-co", f"COMPRESS={compression}",
         "-co", "BIGTIFF=YES",  # Support large outputs
     ]
 
     # Add overview resampling method
+
     overview_resampling = "nearest" if is_classification else resampling
     cmd.extend(["-co", f"RESAMPLING={overview_resampling}"])
 
@@ -246,6 +288,31 @@ def create_mosaic_gdalwarp(
     cmd.extend(["-r", overlap_resampling])
 
     logger.info(f"Using {overlap_resampling} resampling for overlapping areas (agg_method={agg_method})")
+
+    # Determine source CRS for potential cutline clipping
+    src_crs_str = None
+    if clip_boundary and clip_boundary.exists():
+        # Get CRS from first tile or use override
+        try:
+            with rasterio.open(tiles[0]) as src:
+                tile_crs = src.crs
+                if tile_crs is not None:
+                    src_crs_str = tile_crs.to_string()
+                    logger.debug(f"Using tile CRS for cutline: {src_crs_str}")
+        except Exception as e:
+            logger.warning(f"Could not read CRS from first tile: {e}")
+        
+        # Use crs_override if tile CRS is not available
+        if src_crs_str is None and crs_override:
+            src_crs_str = crs_override
+            logger.info(f"Using --crs override for cutline: {src_crs_str}")
+        
+        # Add -s_srs before -cutline (required for cutline to work)
+        if src_crs_str:
+            cmd.extend(["-s_srs", src_crs_str])
+        else:
+            logger.error("Cannot determine source CRS for clipping. Use --crs option (e.g., --crs EPSG:5070)")
+            return False
 
     # Add output CRS if specified
     if out_crs:
@@ -307,6 +374,10 @@ def create_mosaic_vrt_buildvrt(
         logger.error("No tiles provided for mosaic creation")
         return False
 
+    # Get source data type to preserve it
+    gdal_type, _ = get_source_dtype(tiles)
+    logger.info(f"Preserving source data type: {gdal_type}")
+
     vrt_path = output_path.with_suffix(".vrt")
 
     # Step 1: Build VRT
@@ -330,6 +401,7 @@ def create_mosaic_vrt_buildvrt(
         warp_cmd = [
             "gdalwarp",
             "-of", "COG",
+            "-ot", gdal_type,  # Preserve source data type
             "-co", f"COMPRESS={compression}",
             "-co", "BIGTIFF=YES",
             "-t_srs", out_crs,
@@ -349,6 +421,7 @@ def create_mosaic_vrt_buildvrt(
         translate_cmd = [
             "gdal_translate",
             "-of", "COG",
+            "-ot", gdal_type,  # Preserve source data type
             "-co", f"COMPRESS={compression}",
             "-co", "BIGTIFF=YES",
             str(vrt_path),
@@ -365,6 +438,7 @@ def create_mosaic_vrt_buildvrt(
     # Clean up VRT
     vrt_path.unlink(missing_ok=True)
     return True
+
 
 
 def create_blend_weights(height: int, width: int, blend_distance: int, 
@@ -523,7 +597,12 @@ def create_mosaic_feather_blend(
         shutil.copy(tiles[0], output_path)
         return True
 
+    # Get source data type to preserve it
+    gdal_type, src_dtype = get_source_dtype(tiles)
+    logger.info(f"Preserving source data type: {gdal_type}")
+
     logger.info(f"Creating feather-blended mosaic with {blend_distance}px blend distance")
+
     logger.info(f"Processing {len(tiles)} tiles using streaming mode...")
 
     try:
@@ -622,15 +701,22 @@ def create_mosaic_feather_blend(
         with np.errstate(divide='ignore', invalid='ignore'):
             output_data = np.where(output_weights > 0, output_data / output_weights, nodata if nodata else 0)
 
-        # Convert to appropriate dtype
+        # Convert to source dtype (preserving original data type)
         if is_classification:
             output_data = np.round(output_data).astype(np.uint8)
             dtype = rasterio.uint8
         else:
-            output_data = output_data.astype(np.float32)
-            dtype = rasterio.float32
+            # Round to nearest integer for integer types, otherwise keep as float
+            if np.issubdtype(src_dtype, np.integer):
+                output_data = np.round(output_data).astype(src_dtype)
+            else:
+                output_data = output_data.astype(src_dtype)
+            dtype = src_dtype
+
+        logger.info(f"Converting output to {dtype}")
 
         # Create output transform
+
         out_transform = rasterio.Affine.translation(minx, maxy) * rasterio.Affine.scale(res, -res)
 
         # Write output
@@ -720,6 +806,10 @@ def create_mosaic_python(
 
         logger.info(f"Merging {len(tiles)} tiles using rasterio...")
 
+        # Get source dtype before opening files
+        _, src_dtype = get_source_dtype(tiles)
+        logger.info(f"Preserving source data type: {src_dtype}")
+
         # Open all tiles
         src_files = [rasterio.open(t) for t in tiles]
 
@@ -733,6 +823,7 @@ def create_mosaic_python(
             "height": mosaic.shape[1],
             "width": mosaic.shape[2],
             "transform": out_transform,
+            "dtype": src_dtype,  # Preserve source data type
             "compress": compression.lower(),
             "tiled": True,
             "blockxsize": 512,
@@ -740,6 +831,7 @@ def create_mosaic_python(
         })
 
         # Write output
+
         with rasterio.open(output_path, "w", **out_meta) as dest:
             dest.write(mosaic)
 
@@ -798,6 +890,8 @@ def create_mosaic_for_task(
     out_crs: Optional[str] = None,
     agg_method: str = "mean",
     resampling: str = "bilinear",
+    state: Optional[str] = None,
+    prediction_year: Optional[int] = None,
 ) -> bool:
     """Create mosaic for a single task.
 
@@ -814,10 +908,13 @@ def create_mosaic_for_task(
         out_crs: CRS for output mosaic (e.g., "EPSG:4326"). If not specified, uses input CRS
         agg_method: Aggregation method for overlapping areas (mean, max, min, mode)
         resampling: Resampling method for overview generation (nearest, bilinear, cubic, etc.)
+        state: State code to include in filename (e.g., "OR", "WA")
+        prediction_year: Year to include in filename (e.g., 2024)
 
     Returns:
         True if successful, False otherwise
     """
+
     logger.info(f"\n{'='*60}")
     logger.info(f"Processing task: {task_name}")
     logger.info(f"{'='*60}")
@@ -839,7 +936,10 @@ def create_mosaic_for_task(
     logger.info("Tile validation passed")
 
     # Determine output path
-    output_path = output_dir / f"{task_name}_mosaic.tif"
+    if state and prediction_year:
+        output_path = output_dir / f"{state}_{task_name}_mosaic_{prediction_year}.tif"
+    else:
+        output_path = output_dir / f"{task_name}_mosaic.tif"
 
     # Check if output exists
     if output_path.exists() and not overwrite:
@@ -876,7 +976,8 @@ def create_mosaic_for_task(
             is_classification=is_classification,
             clip_boundary=clip_boundary,
             out_crs=out_crs,
-            agg_method=agg_method
+            agg_method=agg_method,
+            crs_override=crs_override
         )
     elif method == "buildvrt":
         success = create_mosaic_vrt_buildvrt(tiles, output_path, compression, out_crs=out_crs, agg_method=agg_method)
@@ -1007,6 +1108,20 @@ Examples:
     )
 
     parser.add_argument(
+        "--state",
+        type=str,
+        default=None,
+        help="State code to include in filename (e.g., OR, WA)",
+    )
+
+    parser.add_argument(
+        "--prediction-year",
+        type=int,
+        default=None,
+        help="Prediction year to include in filename (e.g., 2024)",
+    )
+
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -1049,6 +1164,8 @@ Examples:
             crs_override=args.crs,
             out_crs=args.out_crs,
             agg_method=args.agg_method,
+            state=args.state,
+            prediction_year=args.prediction_year,
         )
         results.append((task, success))
 
