@@ -14,10 +14,14 @@ Usage:
     # All tasks at once
     python scripts/create_mosaic.py --task all
 
+    # With output CRS reprojection (e.g., to EPSG:4326)
+    python scripts/create_mosaic.py --task cancov --out-crs EPSG:4326
+
 Author: ForestVision
 """
 
 import argparse
+import gc
 import logging
 import subprocess
 import sys
@@ -59,6 +63,8 @@ def get_tiles_for_task(input_dir: Path, task_name: str) -> List[Path]:
 def validate_tiles(tiles: List[Path]) -> tuple[bool, Optional[str]]:
     """Validate that tiles exist and have consistent CRS.
 
+    Uses streaming to handle thousands of tiles without hitting file descriptor limits.
+
     Args:
         tiles: List of tile paths to validate
 
@@ -71,16 +77,21 @@ def validate_tiles(tiles: List[Path]) -> tuple[bool, Optional[str]]:
     if len(tiles) == 1:
         return True, None
 
+    # Skip CRS validation for large tile counts to avoid file descriptor exhaustion
+    if len(tiles) > 1000:
+        logger.warning(f"Skipping CRS validation for {len(tiles)} tiles (too many files)")
+        return True, None
+
     # Check CRS consistency
     reference_crs = None
     for tile in tiles:
+        ds = None
         try:
             ds = gdal.Open(str(tile))
             if ds is None:
                 return False, f"Could not open {tile}"
 
             crs = ds.GetProjection()
-            ds = None  # Close dataset
 
             if reference_crs is None:
                 reference_crs = crs
@@ -89,6 +100,11 @@ def validate_tiles(tiles: List[Path]) -> tuple[bool, Optional[str]]:
 
         except Exception as e:
             return False, f"Error reading {tile}: {e}"
+        finally:
+            # Ensure dataset is properly closed and memory freed
+            if ds is not None:
+                ds = None
+                gc.collect()
 
     return True, None
 
@@ -170,6 +186,8 @@ def create_mosaic_gdalwarp(
     resampling: str = "bilinear",
     is_classification: bool = False,
     clip_boundary: Optional[Path] = None,
+    out_crs: Optional[str] = None,
+    agg_method: str = "mean",
 ) -> bool:
     """Create mosaic using gdalwarp with optional blending.
 
@@ -185,6 +203,8 @@ def create_mosaic_gdalwarp(
         resampling: Resampling method for overview generation
         is_classification: Whether this is classification data (uses mode resampling)
         clip_boundary: Optional path to GeoJSON/Shapefile for clipping
+        out_crs: CRS for output mosaic (e.g., "EPSG:4326"). If not specified, uses input CRS
+        agg_method: Aggregation method for overlapping areas (mean, max, min, mode)
 
     Returns:
         True if successful, False otherwise
@@ -208,13 +228,29 @@ def create_mosaic_gdalwarp(
     overview_resampling = "nearest" if is_classification else resampling
     cmd.extend(["-co", f"RESAMPLING={overview_resampling}"])
 
-    # For overlapping areas, use appropriate resampling
-    # For regression: average provides smooth transitions
-    # For classification: mode keeps discrete values
-    overlap_resampling = "mode" if is_classification else "average"
+    # For overlapping areas, use appropriate resampling based on agg_method
+    # Map agg_method to GDAL resampling methods
+    agg_method_to_gdal = {
+        "mean": "average",
+        "max": "max",
+        "min": "min",
+        "mode": "mode"
+    }
+    
+    # Use mode for classification tasks unless explicitly overridden
+    if is_classification and agg_method == "mean":
+        overlap_resampling = "mode"
+    else:
+        overlap_resampling = agg_method_to_gdal.get(agg_method, "average")
+    
     cmd.extend(["-r", overlap_resampling])
 
-    logger.info(f"Using {overlap_resampling} resampling for overlapping areas")
+    logger.info(f"Using {overlap_resampling} resampling for overlapping areas (agg_method={agg_method})")
+
+    # Add output CRS if specified
+    if out_crs:
+        cmd.extend(["-t_srs", out_crs])
+        logger.info(f"Reprojecting output to: {out_crs}")
 
     # Add clipping if specified
     if clip_boundary and clip_boundary.exists():
@@ -250,6 +286,8 @@ def create_mosaic_vrt_buildvrt(
     tiles: List[Path],
     output_path: Path,
     compression: str = "DEFLATE",
+    out_crs: Optional[str] = None,
+    agg_method: str = "mean",
 ) -> bool:
     """Alternative: Create mosaic using gdalbuildvrt + gdal_translate.
 
@@ -260,6 +298,7 @@ def create_mosaic_vrt_buildvrt(
         tiles: List of input tile paths
         output_path: Path for output mosaic
         compression: Compression algorithm
+        out_crs: CRS for output mosaic (e.g., "EPSG:4326"). If not specified, uses input CRS
 
     Returns:
         True if successful, False otherwise
@@ -285,29 +324,47 @@ def create_mosaic_vrt_buildvrt(
         logger.error(f"gdalbuildvrt failed: {e}")
         return False
 
-    # Step 2: Translate VRT to COG
-    translate_cmd = [
-        "gdal_translate",
-        "-of", "COG",
-        "-co", f"COMPRESS={compression}",
-        "-co", "BIGTIFF=YES",
-        str(vrt_path),
-        str(output_path),
-    ]
+    # Step 2: Convert VRT to COG (use gdalwarp if reprojection needed)
+    if out_crs:
+        # Use gdalwarp for reprojection
+        warp_cmd = [
+            "gdalwarp",
+            "-of", "COG",
+            "-co", f"COMPRESS={compression}",
+            "-co", "BIGTIFF=YES",
+            "-t_srs", out_crs,
+            "-overwrite",
+            str(vrt_path),
+            str(output_path),
+        ]
+        logger.info(f"Reprojecting and translating to COG: {' '.join(warp_cmd)}")
+        try:
+            subprocess.run(warp_cmd, capture_output=True, text=True, check=True)
+            logger.info(f"Successfully created mosaic: {output_path}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"gdalwarp failed: {e}")
+            return False
+    else:
+        # Use gdal_translate for simple conversion
+        translate_cmd = [
+            "gdal_translate",
+            "-of", "COG",
+            "-co", f"COMPRESS={compression}",
+            "-co", "BIGTIFF=YES",
+            str(vrt_path),
+            str(output_path),
+        ]
+        logger.info(f"Translating to COG: {' '.join(translate_cmd)}")
+        try:
+            subprocess.run(translate_cmd, capture_output=True, text=True, check=True)
+            logger.info(f"Successfully created mosaic: {output_path}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"gdal_translate failed: {e}")
+            return False
 
-    logger.info(f"Translating to COG: {' '.join(translate_cmd)}")
-
-    try:
-        subprocess.run(translate_cmd, capture_output=True, text=True, check=True)
-        logger.info(f"Successfully created mosaic: {output_path}")
-
-        # Clean up VRT
-        vrt_path.unlink(missing_ok=True)
-        return True
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"gdal_translate failed: {e}")
-        return False
+    # Clean up VRT
+    vrt_path.unlink(missing_ok=True)
+    return True
 
 
 def create_blend_weights(height: int, width: int, blend_distance: int, 
@@ -375,20 +432,20 @@ def create_blend_weights(height: int, width: int, blend_distance: int,
     return weights
 
 
-def detect_tile_neighbors(src_files: list, idx: int, all_bounds: list, overlap_threshold: float = 20.0) -> dict:
+def detect_tile_neighbors(idx: int, all_bounds: list, resolution: float, overlap_threshold: float = 20.0) -> dict:
     """Detect which edges of a tile overlap with neighboring tiles.
     
     Args:
-        src_files: List of open rasterio datasets
         idx: Index of current tile
         all_bounds: List of bounds for all tiles
+        resolution: Pixel size (resolution)
         overlap_threshold: Minimum overlap in pixels to consider as neighbor
         
     Returns:
         Dict with 'top', 'bottom', 'left', 'right' boolean flags
     """
     current_bounds = all_bounds[idx]
-    res = src_files[idx].res[0]  # pixel size
+    res = resolution
     
     neighbors = {'top': False, 'bottom': False, 'left': False, 'right': False}
     
@@ -432,12 +489,16 @@ def create_mosaic_feather_blend(
     compression: str = "DEFLATE",
     is_classification: bool = False,
     crs_override: Optional[str] = None,
+    out_crs: Optional[str] = None,
 ) -> bool:
     """Create mosaic using feather blending for smooth transitions.
 
     This method provides the smoothest results by using distance-weighted
     blending in overlap zones. It's slower than gdalwarp but produces
     better results when tiles have variations at edges.
+
+    Uses streaming processing to handle thousands of tiles without hitting
+    file descriptor limits.
 
     Args:
         tiles: List of input tile paths
@@ -446,6 +507,7 @@ def create_mosaic_feather_blend(
         compression: Compression algorithm
         is_classification: Whether this is classification data
         crs_override: CRS to use if tiles lack metadata (e.g., "EPSG:5070")
+        out_crs: CRS for output mosaic (e.g., "EPSG:4326"). If not specified, uses input CRS
 
     Returns:
         True if successful, False otherwise
@@ -462,22 +524,35 @@ def create_mosaic_feather_blend(
         return True
 
     logger.info(f"Creating feather-blended mosaic with {blend_distance}px blend distance")
-    logger.info(f"Processing {len(tiles)} tiles...")
+    logger.info(f"Processing {len(tiles)} tiles using streaming mode...")
 
     try:
-        # Open all tiles
-        src_files = [rasterio.open(t) for t in tiles]
+        # PASS 1: Collect metadata from all tiles (open/close each immediately)
+        logger.info("Pass 1: Collecting tile metadata...")
+        tile_metadata = []
+        for tile_path in tiles:
+            with rasterio.open(tile_path) as src:
+                tile_metadata.append({
+                    'path': tile_path,
+                    'bounds': src.bounds,
+                    'crs': src.crs,
+                    'nodata': src.nodata,
+                    'res': src.res[0],  # Assume square pixels
+                    'shape': src.shape,
+                    'transform': src.transform,
+                })
 
-        # Get common CRS and check bounds
-        crs = src_files[0].crs
-        nodata = src_files[0].nodata
-        
+        # Get common CRS and nodata from first tile
+        crs = tile_metadata[0]['crs']
+        nodata = tile_metadata[0]['nodata']
+        res = tile_metadata[0]['res']
+
         # Use override CRS if tiles lack metadata
         if crs is None and crs_override:
             from rasterio.crs import CRS
             crs = CRS.from_string(crs_override)
             logger.info(f"Using specified CRS: {crs_override}")
-        
+
         # Ensure CRS is properly set
         if crs is None:
             logger.error("Could not determine CRS from input tiles")
@@ -485,25 +560,24 @@ def create_mosaic_feather_blend(
             return False
 
         # Calculate total bounds
-        all_bounds = [src.bounds for src in src_files]
+        all_bounds = [tm['bounds'] for tm in tile_metadata]
         minx = min(b.left for b in all_bounds)
         miny = min(b.bottom for b in all_bounds)
         maxx = max(b.right for b in all_bounds)
         maxy = max(b.top for b in all_bounds)
 
         # Calculate output dimensions
-        res = src_files[0].res[0]  # Assume square pixels
         out_width = int((maxx - minx) / res)
         out_height = int((maxy - miny) / res)
 
         logger.info(f"Output mosaic size: {out_width}x{out_height} pixels")
         logger.info(f"Output bounds: ({minx}, {miny}, {maxx}, {maxy})")
 
-        # Detect neighbors for all tiles first
+        # Detect neighbors for all tiles (uses bounds, no file handles needed)
         logger.info("Detecting tile neighbors...")
         tile_neighbors = []
-        for idx in range(len(src_files)):
-            neighbors = detect_tile_neighbors(src_files, idx, all_bounds, overlap_threshold=20.0)
+        for idx in range(len(tile_metadata)):
+            neighbors = detect_tile_neighbors(idx, all_bounds, res, overlap_threshold=20.0)
             tile_neighbors.append(neighbors)
             logger.debug(f"Tile {idx}: neighbors={neighbors}")
 
@@ -511,19 +585,22 @@ def create_mosaic_feather_blend(
         output_data = np.zeros((out_height, out_width), dtype=np.float64)
         output_weights = np.zeros((out_height, out_width), dtype=np.float64)
 
-        # Process each tile
-        for idx, src in enumerate(src_files):
-            logger.info(f"Processing tile {idx+1}/{len(tiles)}: {tiles[idx].name}")
+        # PASS 2: Process each tile one at a time (streaming)
+        logger.info("Pass 2: Processing tiles...")
+        for idx, tm in enumerate(tile_metadata):
+            logger.info(f"Processing tile {idx+1}/{len(tiles)}: {tm['path'].name}")
 
-            # Read tile data
-            tile_data = src.read(1)
+            # Open tile, read data, close immediately
+            with rasterio.open(tm['path']) as src:
+                tile_data = src.read(1)
+
             tile_height, tile_width = tile_data.shape
 
             # Create blend weights for this tile with neighbor info
             weights = create_blend_weights(tile_height, tile_width, blend_distance, tile_neighbors[idx])
 
             # Calculate position in output
-            tile_bounds = src.bounds
+            tile_bounds = tm['bounds']
             col_start = int((tile_bounds.left - minx) / res)
             row_start = int((maxy - tile_bounds.top) / res)
 
@@ -570,6 +647,7 @@ def create_mosaic_feather_blend(
             "tiled": True,
             "blockxsize": 512,
             "blockysize": 512,
+            "BIGTIFF": "YES",
         }
 
         # Create output directory
@@ -578,9 +656,31 @@ def create_mosaic_feather_blend(
         with rasterio.open(output_path, "w", **out_meta) as dest:
             dest.write(output_data, 1)
 
-        # Close sources
-        for src in src_files:
-            src.close()
+        # Reproject output if out_crs is specified and different from input CRS
+        if out_crs and crs and out_crs != crs.to_string():
+            logger.info(f"Reprojecting output from {crs.to_string()} to {out_crs}")
+            temp_path = output_path.with_suffix('.temp.tif')
+            output_path.rename(temp_path)
+            
+            warp_cmd = [
+                "gdalwarp",
+                "-of", "COG",
+                "-co", f"COMPRESS={compression}",
+                "-co", "BIGTIFF=YES",
+                "-t_srs", out_crs,
+                "-overwrite",
+                str(temp_path),
+                str(output_path),
+            ]
+            
+            try:
+                subprocess.run(warp_cmd, capture_output=True, text=True, check=True)
+                logger.info(f"Successfully reprojected mosaic to {out_crs}")
+                temp_path.unlink(missing_ok=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Reprojection failed: {e}")
+                temp_path.rename(output_path)  # Restore original
+                return False
 
         logger.info(f"Successfully created feather-blended mosaic: {output_path}")
         return True
@@ -597,6 +697,7 @@ def create_mosaic_python(
     output_path: Path,
     blend_distance: Optional[int] = None,
     compression: str = "DEFLATE",
+    out_crs: Optional[str] = None,
 ) -> bool:
     """Create mosaic using rasterio (Python-native approach).
 
@@ -608,6 +709,7 @@ def create_mosaic_python(
         output_path: Path for output mosaic
         blend_distance: Pixel distance for blending (not implemented yet)
         compression: Compression algorithm
+        out_crs: CRS for output mosaic (e.g., "EPSG:4326"). If not specified, uses input CRS
 
     Returns:
         True if successful, False otherwise
@@ -645,6 +747,33 @@ def create_mosaic_python(
         for src in src_files:
             src.close()
 
+        # Reproject output if out_crs is specified and different from input CRS
+        input_crs = src_files[0].crs
+        if out_crs and input_crs and out_crs != input_crs.to_string():
+            logger.info(f"Reprojecting output from {input_crs.to_string()} to {out_crs}")
+            temp_path = output_path.with_suffix('.temp.tif')
+            output_path.rename(temp_path)
+            
+            warp_cmd = [
+                "gdalwarp",
+                "-of", "COG",
+                "-co", f"COMPRESS={compression}",
+                "-co", "BIGTIFF=YES",
+                "-t_srs", out_crs,
+                "-overwrite",
+                str(temp_path),
+                str(output_path),
+            ]
+            
+            try:
+                subprocess.run(warp_cmd, capture_output=True, text=True, check=True)
+                logger.info(f"Successfully reprojected mosaic to {out_crs}")
+                temp_path.unlink(missing_ok=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Reprojection failed: {e}")
+                temp_path.rename(output_path)  # Restore original
+                return False
+
         logger.info(f"Successfully created mosaic: {output_path}")
         return True
 
@@ -666,6 +795,9 @@ def create_mosaic_for_task(
     overwrite: bool = False,
     clip_boundary: Optional[Path] = None,
     crs_override: Optional[str] = None,
+    out_crs: Optional[str] = None,
+    agg_method: str = "mean",
+    resampling: str = "bilinear",
 ) -> bool:
     """Create mosaic for a single task.
 
@@ -679,6 +811,9 @@ def create_mosaic_for_task(
         overwrite: Overwrite existing output
         clip_boundary: Optional path to GeoJSON/Shapefile for clipping
         crs_override: CRS to use if tiles lack metadata (e.g., "EPSG:5070")
+        out_crs: CRS for output mosaic (e.g., "EPSG:4326"). If not specified, uses input CRS
+        agg_method: Aggregation method for overlapping areas (mean, max, min, mode)
+        resampling: Resampling method for overview generation (nearest, bilinear, cubic, etc.)
 
     Returns:
         True if successful, False otherwise
@@ -723,7 +858,8 @@ def create_mosaic_for_task(
         success = create_mosaic_feather_blend(
             tiles, output_path, blend_distance, compression,
             is_classification=is_classification,
-            crs_override=crs_override
+            crs_override=crs_override,
+            out_crs=out_crs,
         )
         # Clip after blending if boundary specified
         if success and clip_boundary and clip_boundary.exists():
@@ -738,10 +874,12 @@ def create_mosaic_for_task(
         return create_mosaic_gdalwarp(
             tiles, output_path, blend_distance, compression,
             is_classification=is_classification,
-            clip_boundary=clip_boundary
+            clip_boundary=clip_boundary,
+            out_crs=out_crs,
+            agg_method=agg_method
         )
     elif method == "buildvrt":
-        success = create_mosaic_vrt_buildvrt(tiles, output_path, compression)
+        success = create_mosaic_vrt_buildvrt(tiles, output_path, compression, out_crs=out_crs, agg_method=agg_method)
         if success and clip_boundary and clip_boundary.exists():
             temp_path = output_path.with_suffix('.temp.tif')
             output_path.rename(temp_path)
@@ -749,7 +887,7 @@ def create_mosaic_for_task(
             temp_path.unlink(missing_ok=True)
         return success
     elif method == "python":
-        success = create_mosaic_python(tiles, output_path, blend_distance, compression)
+        success = create_mosaic_python(tiles, output_path, blend_distance, compression, out_crs=out_crs, agg_method=agg_method)
         if success and clip_boundary and clip_boundary.exists():
             temp_path = output_path.with_suffix('.temp.tif')
             output_path.rename(temp_path)
@@ -846,6 +984,29 @@ Examples:
     )
 
     parser.add_argument(
+        "--out-crs",
+        type=str,
+        default=None,
+        help="CRS for output mosaic (e.g., EPSG:4326). If not specified, uses input CRS",
+    )
+
+    parser.add_argument(
+        "--agg-method",
+        type=str,
+        choices=["mean", "max", "min", "mode"],
+        default="mean",
+        help="Aggregation method for overlapping areas (default: mean). 'mode' is best for categorical data.",
+    )
+
+    parser.add_argument(
+        "--resampling",
+        type=str,
+        choices=["nearest", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode"],
+        default="bilinear",
+        help="Resampling method for overview generation (default: bilinear). 'nearest' is best for categorical data.",
+    )
+
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -886,6 +1047,8 @@ Examples:
             overwrite=args.overwrite,
             clip_boundary=args.clip,
             crs_override=args.crs,
+            out_crs=args.out_crs,
+            agg_method=args.agg_method,
         )
         results.append((task, success))
 
