@@ -270,6 +270,36 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
             fortypba_idx = task_names.index("fortypba")
             processed_preds[fortypba_idx][nodata_mask] = 0
 
+        # ((fortypba in [10,11,12]) AND (cancov < 2500)) OR
+        # ((fortypba in [10,11,12]) AND (qmd_dom < 300) AND (cancov < 6000))
+        # Valid pixels keep original fortypba value, invalid pixels set to 0
+        if "fortypba" in task_names and "cancov" in task_names:
+            fortypba_idx = task_names.index("fortypba")
+            cancov_idx = task_names.index("cancov")
+
+            fortypba = processed_preds[fortypba_idx]
+            cancov = processed_preds[cancov_idx]
+
+            # Condition 1: fortypba in [10, 11, 12]
+            valid_fortypba = np.isin(fortypba, [10, 11, 12])
+
+            # First part: valid_fortypba AND (cancov < 2500)
+            part1 = valid_fortypba & (cancov < 2500)
+
+            # Second part (if qmd_dom exists): valid_fortypba AND (qmd_dom < 300) AND (cancov < 6000)
+            if "qmd_dom" in task_names:
+                qmd_dom_idx = task_names.index("qmd_dom")
+                qmd_dom = processed_preds[qmd_dom_idx]
+                part2 = valid_fortypba & (qmd_dom < 300) & (cancov < 6000)
+            else:
+                part2 = np.zeros_like(part1, dtype=bool)
+
+            # Valid mask: pixels that satisfy either condition
+            valid_mask = part1 | part2
+
+            # Remap: keep original fortypba value if valid, else set to 0
+            processed_preds[fortypba_idx] = np.where(valid_mask, fortypba, 0)
+
         return processed_preds
 
     def write_on_batch_end(
@@ -343,23 +373,6 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
                 # Get raster profile
                 height, width = pred.shape[-2], pred.shape[-1]
 
-                # Calculate expected size from bounds (assuming 10m resolution)
-                # Handle both BoundingBox objects and tuples (minx, maxx, miny, maxy)
-                if hasattr(bounds, "minx"):
-                    minx, maxx, miny, maxy = bounds.minx, bounds.maxx, bounds.miny, bounds.maxy
-                else:
-                    minx, maxx, miny, maxy = bounds
-                expected_height = int((maxy - miny) / 10)
-                expected_width = int((maxx - minx) / 10)
-
-                # Center crop prediction if it doesn't match expected size
-                if height != expected_height or width != expected_width:
-                    crop_h = (height - expected_height) // 2
-                    crop_w = (width - expected_width) // 2
-                    if crop_h > 0 or crop_w > 0:
-                        pred = pred[crop_h:height - crop_h, crop_w:width - crop_w]
-                        height, width = pred.shape[-2], pred.shape[-1]
-
                 profile = self._get_profile(task_name, height, width, bounds)
 
                 # Handle additional cropping if specified
@@ -371,11 +384,8 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
                         width - self.crop * 2,
                         height - self.crop * 2,
                     )
-                    pred = pred[self.crop: height - self.crop, self.crop: width - self.crop]
-                    profile.update(
-                        width=width - self.crop * 2,
-                        height=height - self.crop * 2,
-                    )
+                    # The window parameter tells save_cog which region to extract
+                    # and it will compute the correct transform via window_transform
 
                 # Save as Cloud-Optimized GeoTIFF
                 save_cog(
