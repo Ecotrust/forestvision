@@ -25,6 +25,7 @@ import gc
 import logging
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -324,12 +325,41 @@ def create_mosaic_gdalwarp(
         cmd.extend(["-cutline", str(clip_boundary), "-crop_to_cutline"])
         logger.info(f"Clipping to boundary: {clip_boundary}")
 
-    # Add overwrite and input files (output goes last for gdalwarp)
+    # Add overwrite
     cmd.append("-overwrite")
-    cmd.extend([str(t) for t in tiles])
+
+    # Build VRT first to avoid "Too many open files" error with thousands of tiles
+    # gdalwarp opens all source files simultaneously when passed directly
+    # VRT acts as a streaming proxy that gdalwarp can read from without opening all tiles
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.vrt', delete=False) as f:
+        vrt_path = f.name
+
+    # Step 1: Build VRT from all tiles
+    buildvrt_cmd = [
+        "gdalbuildvrt",
+        "-overwrite",
+        vrt_path,
+    ] + [str(t) for t in tiles]
+
+    logger.info(f"Building VRT from {len(tiles)} tiles...")
+    logger.debug(f"Command: {' '.join(buildvrt_cmd)}")
+
+    try:
+        subprocess.run(buildvrt_cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"gdalbuildvrt failed: {e}")
+        logger.error(f"stderr: {e.stderr}")
+        try:
+            Path(vrt_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+    # Step 2: Use gdalwarp with the VRT as input
+    cmd.append(vrt_path)
     cmd.append(str(output_path))
 
-    logger.info(f"Running gdalwarp with {len(tiles)} tiles...")
+    logger.info(f"Running gdalwarp from VRT to create mosaic...")
     logger.debug(f"Command: {' '.join(cmd)}")
 
     try:
@@ -347,6 +377,12 @@ def create_mosaic_gdalwarp(
         logger.error(f"stdout: {e.stdout}")
         logger.error(f"stderr: {e.stderr}")
         return False
+    finally:
+        # Clean up temporary VRT file
+        try:
+            Path(vrt_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def create_mosaic_vrt_buildvrt(
