@@ -295,10 +295,10 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
                 part2 = np.zeros_like(part1, dtype=bool)
 
             # Valid mask: pixels that satisfy either condition
-            valid_mask = part1 | part2
+            invalid_mask = part1 | part2
 
             # Remap: keep original fortypba value if valid, else set to 0
-            processed_preds[fortypba_idx] = np.where(valid_mask, fortypba, 0)
+            processed_preds[fortypba_idx] = np.where(invalid_mask, 0, fortypba)
 
         return processed_preds
 
