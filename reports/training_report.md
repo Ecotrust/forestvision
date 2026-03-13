@@ -2,10 +2,10 @@
 
 Yankuic Galvan
 
----
+
 ## Summary
 
-This report documents the training and evaluation of a multi-task deep learning model for forest attribute mapping. The model employs a UNet architecture with simultaneous classification (forest type segmentation) and regression (structural attributes) capabilities. The experiment trains a model using Oregon State University Gradient Nearest Neighborhood (GNN) forest attribute data from 2021 as the target and a combination of Sentinel-2 imagery, topographic data, and climate variables as inputs. The training process includes hyperparameter optimization using Optuna, and the final model is evaluated on a held-out test set with comprehensive performance metrics.
+This report documents the training and evaluation of a multi-task deep learning model for forest attribute mapping. The model employs a UNet architecture with simultaneous classification (forest type segmentation) and regression (structural attributes) capabilities. The experiment trains a model using Oregon State University Gradient Nearest Neighbor (GNN) forest attribute data from 2021 as the target and a combination of Sentinel-2 imagery, topographic data, and climate variables as inputs. The training process includes hyperparameter optimization using Optuna, and the final model is evaluated on a held-out test set with comprehensive performance metrics.
 
 
 **Key Results at a Glance**
@@ -20,8 +20,6 @@ This report documents the training and evaluation of a multi-task deep learning 
 | **Regression** | RMSE | 0.547 | Good error magnitude |
 | **Regression** | MAE | 0.409 | Average prediction error |
 
----
-
 ## GNN Methodology and Data Layers Overview
 
 The Gradient Nearest Neighbor (GNN) method is a predictive mapping approach developed by the [Landscape Ecology Modeling, Mapping, and Analysis (LEMMA)](https://lemma.forestry.oregonstate.edu/data) team at Oregon State University. It integrates ground-based forest inventory data (such as FIA plots) with satellite imagery and environmental gradients to produce continuous, high-resolution maps of forest composition and structure.
@@ -30,7 +28,6 @@ The Gradient Nearest Neighbor (GNN) method is a predictive mapping approach deve
 - **Direct Gradient Analysis**: Uses multivariate statistical techniques (like Canonical Correspondence Analysis) to relate forest vegetation data from plots to environmental variables (climate, topography, geology) and spectral data from satellite imagery (Landsat/Sentinel).
 - **Nearest Neighbor Imputation**: For every pixel in the landscape, the method identifies the most similar forest inventory plot(s) in the multi-dimensional gradient space. The full suite of measured attributes from those plots is then "imputed" (assigned) to that pixel.
 - **Consistency**: Because entire plot records are imputed, the resulting maps maintain the complex multi-attribute correlations found in real forest stands, ensuring that the predicted forest types, biomass, and structure are ecologically consistent.
-
 
 ## Accuracy and Usage
 
@@ -57,6 +54,36 @@ The following layers are primary targets for the `forestvision` models, represen
 - **Units**: Categorical codes (remapped to ODFW habitat classes in this project).
 - **Usage**: Used to identify the primary ecological community and habitat type.
 
+Forest Type classes were mapped to 13 ODFW Habitat Classes + a non-forest class, resulting in the following 14 classes:
+
+- [0] **Nonforest (NF)**. Areas identified in inventory data as lacking significant tree cover or classified as non-forest land uses.
+
+- [1] **Shrub (shr)**. Landscapes dominated by woody shrub species rather than trees. Common components include Mountain Mahogany (*Cercocarpus ledifolius*), Chinquapin (*Chrysolepis chrysophylla*), and various cherry species (*Prunus* spp.).
+
+- [2] **Riparian (rip)**. Forests and woodlands located along watercourses and wetlands. Dominated by moisture-loving species such as Red Alder (*Alnus rubra*), Willows (*Salix* spp.), Black Cottonwood (*Populus balsamifera*), and Oregon Ash (*Fraxinus latifolia*).
+
+- [3] **Lodgepole pine (lpp)**. Forests primarily composed of Lodgepole Pine (*Pinus contorta*). These are often found in areas with nutrient-poor soils, high-elevation plateaus, or regions with specific fire-return intervals that favor this seral species.    
+
+- [4] **Ponderosa Pine (pdp)**. Dry forest types dominated by Ponderosa Pine (*Pinus ponderosa*). These forests often have an open structure and may include an understory of drought-tolerant shrubs like Mountain Mahogany (*Cercocarpus ledifolius*).
+
+- [5] **Mixed Conifer (mxc)**. Highly diverse conifer forests common in the Siskiyou Mountains and Southern Cascades. Key species include Grand Fir (*Abies grandis*), Incense Cedar (*Calocedrus decurrens*), Ponderosa Pine (*Pinus ponderosa*), and Douglas-fir (*Pseudotsuga menziesii*).
+
+- [6] **Western Juniper (wju)**. Arid woodlands characteristic of the high desert and eastern foothills, dominated by Western Juniper (*Juniperus occidentalis*).
+
+- [7] **Mixed Oak - Conifer (mxo)**. Woodlands and forests characterized by the presence of oak species such as Oregon White Oak (*Quercus garryana*), California Black Oak (*Quercus kelloggii*), and Canyon Live Oak (*Quercus chrysolepis*), often intermingled with Ponderosa Pine or Douglas-fir.
+
+- [8] **Quaking Aspen (asp)**. Deciduous stands dominated by Quaking Aspen (*Populus tremuloides*). These are typically found in moist pockets, riparian edges, or high-elevation sites, particularly in the eastern regions of the state.
+
+- [9] **Mixed Hardwood-Conifer (mxh)**. Transition forests where broadleaf hardwoods mix significantly with conifers. Common hardwoods include Bigleaf Maple (*Acer macrophyllum*), Red Alder (*Alnus rubra*), and Pacific Madrone (*Arbutus menziesii*), typically associated with Douglas-fir or Grand Fir.
+
+- [10] **Coastal Spruce, Cedar or Redwood (red)**. Dominated by coastal-associated species including Sitka Spruce (*Picea sitchensis*), Port Orford Cedar (*Chamaecyparis lawsoniana*), and Coast Redwood (*Sequoia sempervirens*). These forests often include Red Alder (*Alnus rubra*) and Bigleaf Maple (*Acer macrophyllum*) in the understory or as co-dominants in disturbed areas.
+
+- [11] **Douglas-fir - Western Hemlock (dfi)**. The characteristic mesic forests of the Pacific Northwest. Primary species include Douglas-fir (*Pseudotsuga menziesii*) and Western Hemlock (*Tsuga heterophylla*), frequently occurring with Western Redcedar (*Thuja plicata*) and Grand Fir (*Abies grandis*).
+
+- [12] **Silver fir - Mountain Hemlock (sfi)**. High-elevation montane forests dominated by Pacific Silver Fir (*Abies amabilis*) and Mountain Hemlock (*Tsuga mertensiana*). These forests occupy the zone between mid-elevation mixed conifer and true subalpine parklands.
+
+- [13] **Spruce - Subalpine Fir (spr)**. Cold-climate forests of high elevations or frost pockets. Primary species include Subalpine Fir (*Abies lasiocarpa*) and Engelmann Spruce (*Picea engelmannii*), sometimes occurring with Whitebark Pine (*Pinus albicaulis*).
+
 #### 2. Canopy Cover (`cancov`)
 - **Description**: The percentage of the ground covered by the vertical projection of tree crowns.
 - **Units**: Percentage (scaled 0 to 10,000 in raw GNN data, where 10,000 = 100%).
@@ -71,53 +98,6 @@ The following layers are primary targets for the `forestvision` models, represen
 - **Description**: The cross-sectional area of all live tree stems (with diameter at breast height ≥ 2.5 cm) per unit area.
 - **Units**: Square meters per hectare (m²/ha).
 - **Physical Meaning**: A fundamental measure of forest density and stocking. It represents the "occupancy" of the site by trees and is highly correlated with total biomass and carbon storage.
-
----
-
-### Mapping FIA Forest Community Types (FORTYPBA) to ODFW Habitat Classes
-
-#### [0] Nonforest (NF)
-Areas identified in inventory data as lacking significant tree cover or classified as non-forest land uses.
-
-#### [1] Shrub (shr)
-Landscapes dominated by woody shrub species rather than trees. Common components include Mountain Mahogany (*Cercocarpus ledifolius*), Chinquapin (*Chrysolepis chrysophylla*), and various cherry species (*Prunus* spp.).
-
-#### [2] Riparian (rip)
-Forests and woodlands located along watercourses and wetlands. Dominated by moisture-loving species such as Red Alder (*Alnus rubra*), Willows (*Salix* spp.), Black Cottonwood (*Populus balsamifera*), and Oregon Ash (*Fraxinus latifolia*).
-
-#### [3] Lodgepole pine (lpp)
-Forests primarily composed of Lodgepole Pine (*Pinus contorta*). These are often found in areas with nutrient-poor soils, high-elevation plateaus, or regions with specific fire-return intervals that favor this seral species.
-
-#### [4] Ponderosa Pine (pdp)
-Dry forest types dominated by Ponderosa Pine (*Pinus ponderosa*). These forests often have an open structure and may include an understory of drought-tolerant shrubs like Mountain Mahogany (*Cercocarpus ledifolius*).
-
-#### [5] Mixed Conifer (mxc)
-Highly diverse conifer forests common in the Siskiyou Mountains and Southern Cascades. Key species include Grand Fir (*Abies grandis*), Incense Cedar (*Calocedrus decurrens*), Ponderosa Pine (*Pinus ponderosa*), and Douglas-fir (*Pseudotsuga menziesii*).
-
-#### [6] Western Juniper (wju)
-Arid woodlands characteristic of the high desert and eastern foothills, dominated by Western Juniper (*Juniperus occidentalis*).
-
-#### [7] Mixed Oak - Conifer (mxo)
-Woodlands and forests characterized by the presence of oak species such as Oregon White Oak (*Quercus garryana*), California Black Oak (*Quercus kelloggii*), and Canyon Live Oak (*Quercus chrysolepis*), often intermingled with Ponderosa Pine or Douglas-fir.
-
-#### [8] Quaking Aspen (asp)
-Deciduous stands dominated by Quaking Aspen (*Populus tremuloides*). These are typically found in moist pockets, riparian edges, or high-elevation sites, particularly in the eastern regions of the state.
-
-#### [9] Mixed Hardwood-Conifer (mxh)
-Transition forests where broadleaf hardwoods mix significantly with conifers. Common hardwoods include Bigleaf Maple (*Acer macrophyllum*), Red Alder (*Alnus rubra*), and Pacific Madrone (*Arbutus menziesii*), typically associated with Douglas-fir or Grand Fir.
-
-#### [10] Coastal Spruce, Cedar or Redwood (red)
-Dominated by coastal-associated species including Sitka Spruce (*Picea sitchensis*), Port Orford Cedar (*Chamaecyparis lawsoniana*), and Coast Redwood (*Sequoia sempervirens*). These forests often include Red Alder (*Alnus rubra*) and Bigleaf Maple (*Acer macrophyllum*) in the understory or as co-dominants in disturbed areas.
-
-#### [11] Douglas-fir - Western Hemlock (dfi)
-The characteristic mesic forests of the Pacific Northwest. Primary species include Douglas-fir (*Pseudotsuga menziesii*) and Western Hemlock (*Tsuga heterophylla*), frequently occurring with Western Redcedar (*Thuja plicata*) and Grand Fir (*Abies grandis*).
-
-#### [12] Silver fir - Mountain Hemlock (sfi)
-High-elevation montane forests dominated by Pacific Silver Fir (*Abies amabilis*) and Mountain Hemlock (*Tsuga mertensiana*). These forests occupy the zone between mid-elevation mixed conifer and true subalpine parklands.
-
-#### [13] Spruce - Subalpine Fir (spr)
-Cold-climate forests of high elevations or frost pockets. Primary species include Subalpine Fir (*Abies lasiocarpa*) and Engelmann Spruce (*Picea engelmannii*), sometimes occurring with Whitebark Pine (*Pinus albicaulis*).
-
 
 ## 2. Model Architecture
 
@@ -173,8 +153,6 @@ The model performs **4 simultaneous tasks**:
 | 12 | sfi | Silver fir - Mountain Hemlock |
 | 13 | spr | Spruce - Subalpine Fir |
 
----
-
 ## 3. Training Configuration
 
 ### 3.1 Hyperparameters (Optuna-Optimized)
@@ -221,8 +199,6 @@ Fixed weighting across task types:
 | Canopy Cover | 0.25 | Most predictable structural attribute |
 | QMD | 0.10 | Secondary structural metric |
 | Basal Area | 0.10 | Secondary structural metric |
-
----
 
 ## 4. Dataset & Data Pipeline
 
@@ -275,15 +251,11 @@ Raw Data
 | Validation | `proportional_128x128_10m_val.geojson` | Hyperparameter tuning |
 | Test | `proportional_128x128_10m_test.geojson` | Final evaluation |
 
----
-
 ## 5. Results Analysis
 
 ### 5.1 Overall Performance
 
 The test loss of **0.078** indicates good model convergence across all tasks. The multi-task architecture successfully balances segmentation and regression objectives.
-
----
 
 ### 5.2 Segmentation Results
 
@@ -322,8 +294,6 @@ The test loss of **0.078** indicates good model convergence across all tasks. Th
 - **Horizontal stripes**: May indicate a class that is frequently misclassified into others
 - **Vertical stripes**: May indicate a class that the model over-predicts
 - **Common confusions**: Mixed conifer (mxc) vs mixed hardwood-conifer (mxh), or similar species assemblages
-
----
 
 ### 5.3 Regression Results
 
@@ -443,8 +413,6 @@ Raw Value = (Normalized Value × Std Dev) + Mean
 
 The observed R² of 0.569 falls within expected ranges for Tier 1-2 variables in GNN-based mapping.
 
----
-
 ## 6. Sample Predictions Visualization
 
 ### 6.1 Model Output Examples
@@ -463,8 +431,6 @@ This figure displays representative test samples showing:
 - **Spatial coherence**: Predictions should show realistic patch structures
 - **Edge alignment**: Boundaries between forest types should align with image features
 - **Regression smoothness**: Continuous predictions should vary smoothly across homogeneous areas
-
----
 
 ## 7. Technical Implementation Details
 
@@ -509,8 +475,6 @@ seg_loss_weight: 0.55
 reg_loss_weights: [0.25, 0.1, 0.1]
 ```
 
----
-
 ## 8. Methodology Context: GNN Approach
 
 This implementation applies deep learning to the **Gradient Nearest Neighbor (GNN)** imputation methodology developed at Oregon State University. Key aspects:
@@ -528,8 +492,6 @@ This implementation applies deep learning to the **Gradient Nearest Neighbor (GN
 - **End-to-End Learning**: The neural network learns feature representations directly from raw imagery
 - **Spatial Context**: UNet architecture captures spatial patterns through encoder-decoder structure
 - **Multi-Task Efficiency**: Shared representations benefit all prediction tasks
-
----
 
 ## 9. Conclusions
 
@@ -569,8 +531,6 @@ The training experiment successfully implemented a multi-task UNet for forest at
 4. **Ensemble Methods**: Combine multiple model checkpoints
 5. **Spatial Validation**: Assess accuracy at landscape scale (following GNN methodology)
 
----
-
 ## Appendix 1: Metrics Reference Table
 
 | Metric | Value | Target Range | Status |
@@ -584,12 +544,11 @@ The training experiment successfully implemented a multi-task UNet for forest at
 | reg_test_rmse | 0.54717 | < 0.60 | Good |
 | reg_test_r2 | 0.56850 | > 0.60 | Moderate |
 
----
-
 ## Appendix 2: File Reference
-| Resource            | Description                                  | Path                                                                                   |
-|---------------------|----------------------------------------------|----------------------------------------------------------------------------------------|
-| Configuration       | Model and training configuration             | `data/dev/configs/gnn_v0/osugnn_v0.yaml`                                               |
-| Stats               | Training set normalization statistics        | `data/dev/configs/gnn_v0/proportional_128x128_10m_stats.json`                          |
-| Tiles               | Train/Val/Test spatial splits                | `data/dev/configs/gnn_v0/proportional_128x128_10m_{train,val,test}.geojson`            |
-| Model Checkpoints   | Directory for saved model checkpoints        | `data/dev/configs/gnn_v0/checkpoints/`                                                 |
+
+| Resource            | Description                            | Path                                                                        |
+|---------------------|----------------------------------------|-----------------------------------------------------------------------------|
+| Configuration       | Model and training configuration       | `data/dev/configs/gnn_v0/osugnn_v0.yaml`                                    |
+| Stats               | Training set normalization statistics  | `data/dev/configs/gnn_v0/proportional_128x128_10m_stats.json`               |
+| Tiles               | Train/Val/Test spatial splits          | `data/dev/configs/gnn_v0/proportional_128x128_10m_{train,val,test}.geojson` |
+| Model Checkpoints   | Directory for saved model checkpoints  | `data/dev/configs/gnn_v0/checkpoints/`                                      |
