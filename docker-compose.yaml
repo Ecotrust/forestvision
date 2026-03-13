@@ -1,0 +1,25 @@
+services:
+  forestvision:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: forestvision:latest
+    container_name: forestvision
+    stdin_open: true
+    tty: true
+    ipc: host
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=all
+      - PYTHONUNBUFFERED=1
+    command: >
+      bash -c "pip install --no-deps -e . && /bin/bash"
