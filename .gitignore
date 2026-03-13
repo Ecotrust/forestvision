@@ -1,7 +1,6 @@
 # Ignore data files and directories
 *.tif
 *.img
-*.png
 *.pth
 *.lyr
 *vat.cpg
@@ -12,14 +11,18 @@
 *.rar
 *log_*
 *.log
+*.typed
+*.db
+*.pdf
 
 # Ignore specific directories
+configs/
 data/*/
 data/dev
 logs/*
 lightning_logs/*
 experiments/*
-
+optuna_logs/*
 # Ignore Python compiled files
 *.pyc
 *.pyo
@@ -36,6 +39,7 @@ env/
 
 # Ignore IDE files
 .vscode/
+.devcontainer/
 
 # docs
 docs/_build
