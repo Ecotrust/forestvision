@@ -1,15 +1,44 @@
+# DL
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.9.0+cu130
+torchvision==0.24.0
+lightning
+torchmetrics
+kornia
+torchgeo==0.7
+
+# Geo
 earthengine-api
 geopandas
-kornia
-torch>=2.5.1
-torchvision>=0.20.1
-lightning[all]
-torchgeo[all]
 rasterio
+shapely>=2.0
+rio_cogeo
+
+# DS
 scikit-learn
 numpy
 pandas
+
+# Visualization
 matplotlib
-shapely>=2.0
-torchmetrics
+seaborn
+Pillow
+
+# Misc
 tqdm
+python-dotenv
+python-dateutil
+requests
+retry
+pyyaml>=6.0
+
+# Hyperparameter Optimization
+optuna>=3.6.0
+optuna-integration>=3.6.0
+
+# Spatial Indexing
+rtree
+
+# Scientific Computing
+scipy
+
