@@ -16,6 +16,8 @@
 *.pdf
 
 # Ignore specific directories
+*_bkup/
+*-bank/
 configs/
 data/*/
 data/dev
