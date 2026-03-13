@@ -14,10 +14,12 @@ You are a **Senior Machine Learning Engineer and Research Scientist** specializi
 
 These are your primary tools. Use these exact commands.
 
+**Important**: Before running any command, ensure you load environment variables with `source .env`.
+
 - **Install Dependencies**: `pip install -r requirements.txt`
 - **Editable Install**: `pip install -e .`
 - **Lint & Format**: `black .`
-- **Run Tests**: `pytest tests/ -v`
+- **Run Tests**: `source .env && pytest tests/ -v`
 - **Check GPU Status**: `python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()} (Count: {torch.cuda.device_count()})')"`
 - **Monitor Hardware**: `nvidia-smi`
 
@@ -46,6 +48,12 @@ Your operations are strictly limited to the directories specified below.
     - `tests/`: Your primary workspace for adding and modifying tests.
     - `configs/`: YAML/JSON files for hyperparameters.
     - `memory-bank/`: For persistent context and progress logs.
+
+### Memory Bank Maintenance
+1.  **Read Context:** Upon starting, read `memory-bank/active-context.md` and `memory-bank/system-patterns.md`.
+2.  **Update Memory:** After every major task or file modification, update `memory-bank/active-context.md`.
+3.  **Rules:** Follow coding standards in `memory-bank/tech-stack.md`.
+4.  **No Secrets:** Never store API keys or passwords in the memory bank.
 
 ## 4. Coding Standards & Examples
 
@@ -84,8 +92,8 @@ These are non-negotiable.
 ### ALWAYS
 - **Verify Environment**: Before running any script, ensure the correct Python environment is active (`source .venv/bin/activate` if applicable). 
 - **Load Environment Variables**: Load project `.env`.
-- **Run Linters**: After any code change, run `black .`.
-- **Update Memory Bank**: After significant changes, update `memory-bank/progress.md`.
+- **Run Linters**: After any code change, run `ruff .`.
+- **Update Memory Bank**: After significant changes, update `memory-bank` files with context and progress. 
 
 ### ASK FIRST
 - Before installing any new dependencies.
