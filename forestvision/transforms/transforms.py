@@ -874,6 +874,215 @@ class InverseMinMaxScaler:
         return tensor
 
 
+class AppendCentroidXYBits:
+    """Append a channel with packed centroid coordinates.
+
+    Appends a single channel containing the tile centroid's X and Y coordinates
+    packed into a single 64-bit integer using bit packing (X in high 32 bits,
+    Y in low 32 bits). The packed value is stored as a float32 constant channel.
+
+    The centroid is calculated from the sample's bounding box without CRS
+    transformation (uses native CRS coordinates).
+
+    To decode the packed value:
+        packed = int(float_value)
+        x = (packed >> 32) & 0xFFFFFFFF
+        y = packed & 0xFFFFFFFF
+
+    Example:
+        >>> transform = AppendCentroidLatLon()
+        >>> sample = {"image": img, "bounds": bounds, "crs": crs}
+        >>> sample = transform(sample)
+        >>> # sample["image"] now has 1 additional channel with packed centroid
+
+    Note:
+        The centroid coordinates are cast to integers before packing. For
+        sub-meter precision, consider scaling coordinates before using this
+        transform.
+    """
+
+    def __init__(self):
+        """Initialize AppendCentroidLatLon transform."""
+        pass
+
+    def _pack_centroid(self, cx: float, cy: float) -> float:
+        """Pack centroid coordinates into a single 64-bit value.
+
+        Args:
+            cx: Centroid X coordinate (cast to int before packing).
+            cy: Centroid Y coordinate (cast to int before packing).
+
+        Returns:
+            Packed coordinate as float32-compatible value.
+        """
+        # Cast to int and pack: X in high 32 bits, Y in low 32 bits
+        ix = int(cx) & 0xFFFFFFFF
+        iy = int(cy) & 0xFFFFFFFF
+        packed = (ix << 32) | iy
+        # Convert to float for PyTorch tensor compatibility
+        # Note: This may lose precision for very large values (>2^53)
+        return float(packed)
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Append packed centroid channel to the image.
+
+        Args:
+            sample: Dictionary containing:
+                - "image": Tensor of shape (C, H, W) or (B, C, H, W)
+                - "bbox": BoundingBox with minx, maxx, miny, maxy attributes
+                - "crs": Coordinate reference system (not used but preserved)
+
+        Returns:
+            Modified sample with packed centroid channel appended to image.
+        """
+        data = sample["image"]
+        bounds = sample["bounds"]
+        original_ndim = data.ndim
+
+        # Ensure data is 4D (B, C, H, W) for consistent processing
+        if data.ndim == 3:
+            # (C, H, W) -> (1, C, H, W)
+            data = data.unsqueeze(0)
+
+        # Get image dimensions
+        _, _, h, w = data.shape
+
+        # Calculate centroid from bounding box
+        cx = (bounds.minx + bounds.maxx) / 2.0
+        cy = (bounds.miny + bounds.maxy) / 2.0
+
+        # Pack coordinates into single value
+        packed = self._pack_centroid(cx, cy)
+
+        # Create constant channel filled with packed centroid value
+        # Use float64 to preserve full 64-bit precision of packed integer
+        centroid_channel = torch.full((data.shape[0], 1, h, w), packed, dtype=torch.float64)
+
+        # Move to same device as data
+        centroid_channel = centroid_channel.to(data.device)
+
+        # Append centroid channel (result will have mixed dtype: data.dtype for bands, float64 for centroid)
+        data = torch.cat([data, centroid_channel], dim=1)
+
+        # Restore original dimensionality if we added a batch dimension
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
+class AppendCentroidX:
+    """Append a channel with the X coordinate (longitude) of the tile centroid.
+
+    Appends a single channel containing the tile centroid's X coordinate
+    reprojected to EPSG:4326 (WGS84 longitude), then multiplied by 1e5.
+
+    The centroid is calculated from the sample's bounding box, reprojected
+    from the source CRS to EPSG:4326, then scaled.
+
+    Example:
+        >>> transform = AppendCentroidX()
+        >>> sample = {"image": img, "bounds": bounds, "crs": crs}
+        >>> sample = transform(sample)
+        >>> # sample["image"] now has 1 additional channel with longitude * 1e5
+    """
+
+    def __init__(self):
+        """Initialize AppendCentroidX transform."""
+        self._transformer_cache = {}
+
+    def _get_transformer(self, src_crs: Any):
+        """Get or create a cached transformer for the source CRS."""
+        from pyproj import Transformer
+        crs_key = str(src_crs)
+        if crs_key not in self._transformer_cache:
+            self._transformer_cache[crs_key] = Transformer.from_crs(
+                src_crs, "EPSG:4326", always_xy=True
+            )
+        return self._transformer_cache[crs_key]
+
+    def _reproject_to_lon(self, cx: float, cy: float, src_crs: Any) -> float:
+        """Reproject centroid X to EPSG:4326 longitude.
+
+        Args:
+            cx: Centroid X coordinate in source CRS.
+            cy: Centroid Y coordinate in source CRS.
+            src_crs: Source coordinate reference system.
+
+        Returns:
+            Longitude in EPSG:4326 multiplied by 1e5.
+        """
+        transformer = self._get_transformer(src_crs)
+        lon, _ = transformer.transform(cx, cy)
+        return lon * 1e5
+
+    def __call__(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Append centroid X channel to the image.
+
+        Args:
+            sample: Dictionary containing:
+                - "image": Tensor of shape (C, H, W) or (B, C, H, W)
+                - "bounds": BoundingBox with minx, maxx, miny, maxy attributes
+                - "crs": Coordinate reference system
+
+        Returns:
+            Modified sample with centroid X channel appended to image.
+        """
+        if "bounds" not in sample:
+            raise KeyError(
+                "AppendCentroidX requires 'bounds' in sample. "
+                "Ensure this transform is applied to a GeoDataset sample."
+            )
+        if "crs" not in sample:
+            raise KeyError(
+                "AppendCentroidX requires 'crs' in sample. "
+                "Ensure this transform is applied to a GeoDataset sample."
+            )
+
+        data = sample["image"]
+        bounds = sample["bounds"]
+        crs = sample["crs"]
+        original_ndim = data.ndim
+
+        # Ensure data is 4D (B, C, H, W) for consistent processing
+        if data.ndim == 3:
+            # (C, H, W) -> (1, C, H, W)
+            data = data.unsqueeze(0)
+
+        # Get image dimensions
+        _, _, h, w = data.shape
+
+        # Calculate centroid from bounding box
+        cx = (bounds.minx + bounds.maxx) / 2.0
+        cy = (bounds.miny + bounds.maxy) / 2.0
+
+        # Reproject to EPSG:4326 longitude and scale
+        lon_scaled = self._reproject_to_lon(cx, cy, crs)
+
+        # Create constant channel filled with scaled longitude value
+        centroid_channel = torch.full((data.shape[0], 1, h, w), lon_scaled, dtype=data.dtype)
+
+        # Move to same device as data
+        centroid_channel = centroid_channel.to(data.device)
+
+        # Append centroid channel
+        data = torch.cat([data, centroid_channel], dim=1)
+
+        # Restore original dimensionality if we added a batch dimension
+        if original_ndim == 3:
+            data = data.squeeze(0)
+
+        sample["image"] = data
+        return sample
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
+
+
 class CombineGNNDWMask:
     """Combine GNN forest types with Dynamic World labels from combined target dataset.
 
