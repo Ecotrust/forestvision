@@ -16,18 +16,22 @@ Usage:
 import argparse
 import hashlib
 import logging
+import multiprocessing as mp
 import os
 import sys
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import requests
 from shapely.geometry import box
 from sklearn.model_selection import StratifiedKFold, train_test_split
+import torch
 from torch.utils.data import DataLoader
 from torchgeo.datasets import stack_samples
 from tqdm import tqdm
@@ -35,6 +39,10 @@ from tqdm import tqdm
 from forestvision.datasets import GNNForestAttr
 from forestvision.samplers import TileGeoSampler
 from forestvision.samplers.utils import roi_to_tiles
+
+# Set PyTorch multiprocessing sharing strategy to avoid "Too many open files" error
+# when using many DataLoader workers with ProcessPoolExecutor
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 # Suppress annoying logs
 os.environ["CPL_LOG"] = "/dev/null"
@@ -87,7 +95,7 @@ class SamplerConfig:
     def base(self):
         """Base name for universal files (all tiles, frequencies)."""
         return (
-            self.name or f"all_{self.tile_size}x{self.tile_size}_{self.tile_res}m"
+            self.name or f"{self.tile_size}x{self.tile_size}_{self.tile_res}"
         )
 
     def split_base(self):
@@ -115,6 +123,63 @@ def get_strat_labels(df, n, v):
     if rare:
         df["strat"] = df["strat"].apply(lambda x: "other" if x in rare else x)
     return df
+
+
+def compute_tile_frequencies(tile_data: dict, max_nodata: float) -> list[dict]:
+    """
+    Compute class frequencies for a single tile.
+    
+    Args:
+        tile_data: Dictionary with 'geohash', 'mask' (numpy array), and 'bounds'
+        max_nodata: Maximum allowed nodata fraction
+    
+    Returns:
+        List of frequency records for the tile
+    """
+    geohash = tile_data["geohash"]
+    mask = tile_data["mask"]
+    
+    total_pixels = mask.size
+    valid_mask = (mask != -2147483648) & (mask != -1)
+    valid_pixels = valid_mask.sum()
+    nodata_fraction = (total_pixels - valid_pixels) / total_pixels if total_pixels > 0 else 0.0
+    
+    # Skip tiles with too much nodata
+    if nodata_fraction > max_nodata:
+        return []
+    
+    # Count class frequencies for valid pixels only
+    unique_classes, counts = np.unique(mask[valid_mask], return_counts=True)
+    
+    records = []
+    for cls, count in zip(unique_classes, counts):
+        records.append({
+            "geohash": geohash,
+            "gnn_class": int(cls),
+            "gnn_counts": int(count),
+            "total_pixels": int(valid_pixels),
+            "nodata_pixels": int(total_pixels - valid_pixels),
+            "nodata_fraction": float(nodata_fraction),
+        })
+    
+    return records
+
+
+def compute_batch_frequencies(batch_data: list[dict], max_nodata: float) -> list[dict]:
+    """
+    Compute class frequencies for a batch of tiles.
+    
+    Args:
+        batch_data: List of tile data dictionaries
+        max_nodata: Maximum allowed nodata fraction
+    
+    Returns:
+        Combined list of frequency records for all tiles in batch
+    """
+    all_records = []
+    for tile_data in batch_data:
+        all_records.extend(compute_tile_frequencies(tile_data, max_nodata))
+    return all_records
 
 
 def main():
@@ -256,8 +321,13 @@ def main():
                 num_workers=cfg.num_workers,
                 collate_fn=stack_samples,
             )
-            recs = []
-            for b_idx in tqdm(dl, desc="Frequencies"):
+            
+            # Collect all tiles for parallel processing
+            all_tile_batches = []
+            current_batch = []
+            BATCH_SIZE_PER_WORKER = 32  # Process 32 tiles per worker task
+            
+            for b_idx in tqdm(dl, desc="Loading tiles"):
                 hs = [
                     hashlib.md5(
                         str((bx.minx, bx.miny, bx.maxx, bx.maxy)).encode()
@@ -265,30 +335,39 @@ def main():
                     for bx in b_idx["bounds"]
                 ]
                 for i, h in enumerate(hs):
-                    mask = b_idx["mask"][i]
-                    total_pixels = mask.numel()
+                    tile_data = {
+                        "geohash": h,
+                        "mask": b_idx["mask"][i].numpy(),  # Convert tensor to numpy
+                    }
+                    current_batch.append(tile_data)
                     
-                    # Count valid pixels (non-nodata)
-                    valid_mask = (mask != -2147483648) & (mask != -1)
-                    valid_pixels = valid_mask.sum().item()
-                    nodata_pixels = total_pixels - valid_pixels
-                    nodata_fraction = nodata_pixels / total_pixels if total_pixels > 0 else 0.0
-                    
-                    # Skip tiles with too much nodata
-                    if nodata_fraction > cfg.max_nodata:
-                        continue
-                    
-                    # Count class frequencies for valid pixels only
-                    cl_u, cl_c = mask[valid_mask].unique(return_counts=True)
-                    for c, n in zip(cl_u.tolist(), cl_c.tolist()):
-                        recs.append({
-                            "geohash": h, 
-                            "gnn_class": c, 
-                            "gnn_counts": n,
-                            "total_pixels": valid_pixels,
-                            "nodata_pixels": nodata_pixels,
-                            "nodata_fraction": nodata_fraction
-                        })
+                    if len(current_batch) >= BATCH_SIZE_PER_WORKER:
+                        all_tile_batches.append(current_batch)
+                        current_batch = []
+            
+            # Add remaining tiles
+            if current_batch:
+                all_tile_batches.append(current_batch)
+            
+            # Process batches in parallel using ProcessPoolExecutor
+            recs = []
+            num_process_workers = max(1, mp.cpu_count() - 1)  # Leave one core for main process
+            
+            with ProcessPoolExecutor(max_workers=num_process_workers) as executor:
+                # Submit all batch processing tasks
+                futures = [
+                    executor.submit(compute_batch_frequencies, batch, cfg.max_nodata)
+                    for batch in all_tile_batches
+                ]
+                
+                # Collect results as they complete
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Processing frequencies"):
+                    try:
+                        batch_records = future.result()
+                        recs.extend(batch_records)
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {e}")
+            
             freqs = pd.DataFrame(recs)
             if not freqs.empty:
                 freqs = freqs.merge(
