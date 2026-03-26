@@ -14,6 +14,8 @@ from .transforms import (
     AppendSAVI,
     AppendMSAVI,
     AppendNIRv,
+    AppendCentroidXYBits,
+    AppendCentroidX,
     SelectBands,
     CombineGNNDWMask,
 )
