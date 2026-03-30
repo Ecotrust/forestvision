@@ -601,6 +601,12 @@ class SegmentationUNet(BaseTask):
     def test_step(self, batch, batch_idx):
         """Test step for classification."""
         x, y = batch["image"], batch["mask"].long()
+
+        # Sanitize target: remap all negative values to ignore_index
+        ignore_idx = self.hparams.get("ignore_index", -1)
+        if ignore_idx is not None:
+            y[y < 0] = ignore_idx
+
         y_logits = self(x)  # Model outputs logits
 
         loss = self.criterion(y_logits, y.squeeze(1))
@@ -1637,10 +1643,10 @@ class MultiTaskUNet(BaseTask):
                 probs = task_pred.softmax(dim=1)
                 pred = torch.argmax(probs, dim=1)
 
-                # Handle ignore_index
+                # Handle ignore_index - robust to negative NoData values
                 mask = torch.zeros_like(task_target, dtype=torch.bool)
                 if ignore_idx is not None:
-                    mask = task_target == ignore_idx
+                    mask = (task_target == ignore_idx) | (task_target < -1e9)
 
                 if not mask.all():
                     metrics = seg_metrics(pred[~mask], task_target[~mask])
@@ -1728,11 +1734,11 @@ class MultiTaskUNet(BaseTask):
         has_classification = any(t == "classification" for t in self.task_types)
         if has_classification and hasattr(self, "confusion_matrix"):
             channel_offset = 0
-            for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
+            for task_idx, (task_type, num_classes) in enumerate(zip(self.task_types, self.num_classes_per_task)):
                 if task_type == "classification":
                     task_pred = y_hat[:, channel_offset:channel_offset + num_classes]
                     pred = torch.argmax(task_pred.softmax(dim=1), dim=1)
-                    task_target = y[:, self.task_types.index("classification")]
+                    task_target = y[:, task_idx]
                     self.confusion_matrix.update(pred, task_target)
                 channel_offset += num_classes
 
