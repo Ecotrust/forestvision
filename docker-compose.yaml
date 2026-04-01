@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
     image: forestvision:latest
     container_name: forestvision
     stdin_open: true
@@ -10,7 +13,16 @@ services:
     ipc: host
     working_dir: /workspace
     volumes:
+      # Project workspace
       - .:/workspace
+      # Persistent Earth Engine credentials (~/.config/earthengine/credentials)
+      # Run 'earthengine authenticate' once to create; persists across container rebuilds
+      - gee-credentials:/home/developer/.config/earthengine
+      # Persistent Cline configuration and credentials
+      # Cline stores API keys and settings here; persists across container rebuilds
+      - cline-config:/home/developer/.config/cline
+      # Optional: Persist bash history
+      - bash-history:/home/developer/.bash_history
     deploy:
       resources:
         reservations:
@@ -21,5 +33,17 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=all
       - PYTHONUNBUFFERED=1
+      # Pass through host environment variables for GEE
+      - GEE_PROJECT_NAME=${GEE_PROJECT_NAME:-}
     command: >
       bash -c "pip install --no-deps -e . && /bin/bash"
+
+# Named volumes for persistent credential storage
+# These volumes persist even when the container is removed/rebuilt
+volumes:
+  gee-credentials:
+    driver: local
+  cline-config:
+    driver: local
+  bash-history:
+    driver: local
