@@ -10,6 +10,7 @@ from .geelandsat import (
 from .geealphaearth import GEEAlphaEarth
 from .geedw import GEEDynamicWorld
 from .gee3dep import GEE3Dep
+from .geetreemap import GEETreeMap
 from .emapragb import eMapRAGB
 from .geegfc import GEEGlobalForestChange
 from .osugnn import GNNForestAttr
@@ -31,6 +32,7 @@ __all__ = [
     "GEEDynamicWorld",
     "GEEAlphaEarth",
     "GEE3Dep",
+    "GEETreeMap",
     "eMapRAGB",
     "GEEGlobalForestChange",
     "GNNForestAttr",
