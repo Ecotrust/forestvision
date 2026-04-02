@@ -20,7 +20,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
     """Saves multi-task model predictions to separate GeoTIFF files per task.
 
     This class handles multi-task model outputs where each task may require
-    different data types (e.g., uint8 for classification, float32 for regression).
+    different data types (e.g., uint8 for segmentation, float32 for regression).
     Each task's predictions are saved to a separate GeoTIFF file.
 
     The output file naming follows:
@@ -30,7 +30,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
         >>> from forestvision.deploy.multitask_writer import MultiTaskPredictionSaver
         >>> saver = MultiTaskPredictionSaver(
         ...     output_dir="predictions/",
-        ...     task_types=["classification", "regression"],
+        ...     task_types=["segmentation", "regression"],
         ...     task_names=["forest_type", "biomass"],
         ...     crs="EPSG:4326",
         ... )
@@ -38,7 +38,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
         >>> # To export regression predictions as integers:
         >>> saver_int = MultiTaskPredictionSaver(
         ...     output_dir="predictions/",
-        ...     task_types=["classification", "regression"],
+        ...     task_types=["segmentation", "regression"],
         ...     task_names=["forest_type", "biomass"],
         ...     export_dtypes={"forest_type": "uint8", "biomass": "int16"},
         ...     crs="EPSG:4326",
@@ -64,7 +64,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
 
         Args:
             output_dir: Directory to save prediction GeoTIFFs.
-            task_types: List of task types ("classification" or "regression").
+            task_types: List of task types ("segmentation" or "regression").
             task_names: Optional list of human-readable task names. If None,
                 defaults to "task_0", "task_1", etc.
             task_dtypes: Dictionary mapping task names to rasterio data types for storage.
@@ -74,7 +74,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
             crop: Number of pixels to crop from edges of predictions.
             overwrite: Whether to overwrite existing files.
             nodata_values: Dictionary mapping task names to NoData values.
-                If None, defaults are: classification -> 255, regression -> -9999.
+                If None, defaults are: segmentation -> 255, regression -> -9999.
             export_dtypes: Dictionary mapping task names to numpy export dtypes.
                 Specifies the dtype for exported predictions (e.g., "int16", "uint8").
                 This replaces the deprecated round_predictions parameter.
@@ -105,16 +105,16 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
             # Backward compatibility: convert round_predictions to export_dtypes
             self.export_dtypes = {}
             for name, ttype in zip(self.task_names, task_types):
-                if round_predictions.get(name, ttype == "classification"):
+                if round_predictions.get(name, ttype == "segmentation"):
                     self.export_dtypes[name] = "int16" if ttype == "regression" else "uint8"
                 else:
                     self.export_dtypes[name] = "float32"
             self.task_dtypes = self.export_dtypes.copy()
         else:
-            # Default: classification -> uint8, regression -> float32
+            # Default: segmentation -> uint8, regression -> float32
             self.export_dtypes = {}
             for name, ttype in zip(self.task_names, task_types):
-                self.export_dtypes[name] = "uint8" if ttype == "classification" else "float32"
+                self.export_dtypes[name] = "uint8" if ttype == "segmentation" else "float32"
             self.task_dtypes = self.export_dtypes.copy()
 
         # Override with user-provided task_dtypes if given (for backward compatibility)
@@ -125,7 +125,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
         if nodata_values is None:
             self.nodata_values = {}
             for name, ttype in zip(self.task_names, task_types):
-                self.nodata_values[name] = 255 if ttype == "classification" else -9999
+                self.nodata_values[name] = 255 if ttype == "segmentation" else -9999
         else:
             self.nodata_values = nodata_values
 
@@ -227,8 +227,8 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
             pred = predictions[task_idx]
             export_dtype = export_dtypes.get(task_name, "float32")
 
-            if task_type == "classification":
-                # Ensure classification values are integers
+            if task_type == "segmentation":
+                # Ensure segmentation values are integers
                 pred = pred.round().astype(export_dtype)
             else:  # regression
                 # Denormalize regression predictions: pred * std + mean

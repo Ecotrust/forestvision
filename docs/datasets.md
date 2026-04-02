@@ -726,7 +726,7 @@ GEEAlphaEarth(
 - Unit-length vectors distributed on a sphere
 - Consistency across years enables change detection
 - Robust to clouds and missing data
-- Ready for classification, regression, and change detection
+- Ready for segmentation, regression, and change detection
 
 ---
 

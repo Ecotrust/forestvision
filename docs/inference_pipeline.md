@@ -16,19 +16,19 @@
 
 ## 1. Overview
 
-This document covers the inference pipeline for generating predictions with trained ForestVision models. The pipeline supports generating task-specific predictions (classification and regression) and saving them as georeferenced GeoTIFF files. The inference pipeline enables:
+This document covers the inference pipeline for generating predictions with trained ForestVision models. The pipeline supports generating task-specific predictions (segmentation and regression) and saving them as georeferenced GeoTIFF files. The inference pipeline enables:
 
 - **Single-pass inference**: Generate predictions for multiple tasks simultaneously
-- **Task-specific outputs**: Classification (discrete classes) and regression (continuous values)
+- **Task-specific outputs**: Segmentation (semantic classes) and regression (continuous values)
 - **Georeferenced outputs**: Cloud-Optimized GeoTIFFs (COG) with proper CRS and bounds
-- **Flexible data types**: uint8 for classification, float32 for regression
+- **Flexible data types**: uint8 for segmentation, float32 for regression
 - **Distributed inference**: Compatible with PyTorch Lightning's distributed training
 
 ### Supported Models
 
 | Model | Description | Use Case |
 |-------|-------------|----------|
-| `MultiTaskUNet` | Multi-task U-Net with ResNet backbone | Classification + Regression tasks |
+| `MultiTaskUNet` | Multi-task U-Net with ResNet backbone | Segmentation + Regression tasks |
 | `ResMTUNet` | ResNet-based Multi-Task U-Net | Transfer learning with pretrained weights |
 
 ### Key Components
@@ -60,7 +60,7 @@ Input Tiles (GeoTIFF)
 ┌─────────────────────────────────────────┐
 │ MultiTaskUNet.predict_step()            │
 │  - Forward pass → logits               │
-│  - Classification: softmax + argmax     │
+│  - Segmentation: softmax + argmax     │
 │  - Regression: raw/tanh values          │
 │  - Returns {predictions, batch}         │
 └─────────────────────────────────────────┘
@@ -92,7 +92,7 @@ def predict_step(self, batch, batch_idx, dataloader_idx=None):
     for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
         task_output = y_hat[:, channel_offset:channel_offset + num_classes]
         
-        if task_type == "classification":
+        if task_type == "segmentation":
             # Apply softmax + argmax for class predictions
             probs = task_output.softmax(dim=1)
             pred = torch.argmax(probs, dim=1, keepdim=True)
@@ -171,7 +171,7 @@ model:
   init_args:
     in_channels: 15
     task_types:
-      - classification
+      - segmentation
       - regression
       - regression
     num_classes_per_task:
@@ -241,7 +241,7 @@ trainer:
       init_args:
         output_dir: predictions/
         task_types:
-          - classification
+          - segmentation
           - regression
           - regression
         task_names:
@@ -257,7 +257,7 @@ trainer:
 
 | Parameter | Type | Description | Example |
 |-----------|------|-------------|---------|
-| `task_types` | List[str] | Task types in order | `["classification", "regression"]` |
+| `task_types` | List[str] | Task types in order | `["segmentation", "regression"]` |
 | `task_names` | List[str] | Human-readable names | `["forest_type", "agb"]` |
 | `task_dtypes` | Dict[str, str] | Rasterio dtype per task | `{"forest_type": "uint8"}` |
 | `nodata_values` | Dict[str, Any] | NoData value per task | `{"forest_type": 255}` |
@@ -268,7 +268,7 @@ If not specified, the following defaults are used:
 
 | Task Type | Default dtype | Default NoData |
 |-----------|---------------|----------------|
-| classification | uint8 | 255 |
+| segmentation | uint8 | 255 |
 | regression | float32 | -9999 |
 
 ---
@@ -367,7 +367,7 @@ class MultiTaskPredictionSaver(BasePredictionWriter):
     def __init__(
         self,
         output_dir: str | Path,           # Output directory
-        task_types: List[str],            # ["classification", "regression"]
+        task_types: List[str],            # ["segmentation", "regression"]
         task_names: Optional[List[str]],  # ["forest_type", "biomass"]
         task_dtypes: Optional[Dict[str, str]],  # {"forest_type": "uint8"}
         write_interval: str = "batch",    # "batch" or "epoch"
@@ -431,7 +431,7 @@ def predict_dataloader(self):
 ```python
 saver = MultiTaskPredictionSaver(
     output_dir="predictions/",
-    task_types=["classification"],
+    task_types=["segmentation"],
     crs="EPSG:4326",  # Match your input data CRS
 )
 ```
@@ -451,15 +451,15 @@ trainer = Trainer(
 
 Or use gradient accumulation for larger effective batch sizes.
 
-#### Issue: Classification predictions are floats instead of integers
+#### Issue: Segmentation predictions are floats instead of integers
 
 **Cause:** The output dtype is not properly configured.
 
-**Solution:** Ensure task_dtypes specifies uint8 for classification:
+**Solution:** Ensure task_dtypes specifies uint8 for segmentation:
 
 ```python
 saver = MultiTaskPredictionSaver(
-    task_types=["classification", "regression"],
+    task_types=["segmentation", "regression"],
     task_dtypes={
         "forest_type": "uint8",     # Integer classes
         "biomass": "float32",        # Continuous values

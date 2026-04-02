@@ -98,7 +98,7 @@ class LocalLandsat8(AnyRasterDataset):
 
 
 class GNNDataModule(BaseGeoDataModule):
-    """LightningDataModule for GNN-based forest type classification, refactored to use BaseGeoDataModule."""
+    """LightningDataModule for GNN-based forest type segmentation, refactored to use BaseGeoDataModule."""
 
     def __init__(
         self,

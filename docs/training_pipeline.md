@@ -18,7 +18,7 @@
 
 ## 1. Overview
 
-This guide covers the ForestVision training pipeline for multi-task geospatial deep learning. ForestVision enables simultaneous prediction of forest type classification and continuous regression targets (canopy cover, biomass) from Sentinel-2 imagery and auxiliary data.
+This guide covers the ForestVision training pipeline for multi-task geospatial deep learning. ForestVision enables simultaneous prediction of forest type segmentation and continuous regression targets (canopy cover, biomass) from Sentinel-2 imagery and auxiliary data.
 
 ### What This Guide Covers
 
@@ -352,7 +352,7 @@ model:
   backbone: "resnet50"  # resnet18/34/50/101
   pretrained: true
   in_channels: 15
-  task_types: ["classification", "regression", "regression"]
+  task_types: ["segmentation", "regression", "regression"]
   num_classes_per_task: [14, 1, 1]
 ```
 
@@ -385,18 +385,18 @@ Configure tasks using `task_types` and `num_classes_per_task`:
 ```yaml
 model:
   init_args:
-  task_types: ["classification", "regression", "regression"]
+  task_types: ["segmentation", "regression", "regression"]
   num_classes_per_task: [14, 1, 1]
   task_band_names: ["forest_type", "canopy_cover", "biomass"]
 ```
 
 **Task Types:**
-- `classification`: Discrete classes (softmax + argmax)
+- `segmentation`: Discrete classes (softmax + argmax)
 - `regression`: Continuous values (tanh or linear output)
 
 ### 5.3 Loss Functions
 
-#### Classification Loss: Focal Loss
+#### Segmentation Loss: Focal Loss
 
 Addresses class imbalance by down-weighting easy examples:
 
@@ -671,7 +671,7 @@ model:
   class_path: forestvision.trainers.litunet.MultiTaskUNet
   init_args:
   in_channels: 15
-  task_types: ["classification", "regression", "regression"]
+  task_types: ["segmentation", "regression", "regression"]
   num_classes_per_task: [14, 1, 1]
   task_band_names: ["forest_type", "canopy_cover", "biomass"]
   model: "ResMTUNet"
@@ -794,7 +794,7 @@ optimizer:
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
 | `in_channels` | int | Input channels | Required |
-| `task_types` | list | ["classification", "regression", ...] | Required |
+| `task_types` | list | ["segmentation", "regression", ...] | Required |
 | `num_classes_per_task` | list | Classes per task | Required |
 | `model` | str | "MTUNet", "ResMTUNet" | "MTUNet" |
 | `backbone` | str | "resnet18/34/50/101" | "resnet50" |
@@ -956,7 +956,7 @@ data:
 
 ### 11.2 Metrics Reference
 
-**Classification Metrics:**
+**Segmentation Metrics:**
 - `seg_*_accuracy`: Overall pixel accuracy
 - `seg_*_kappa`: Cohen's Kappa (agreement accounting for chance)
 - `seg_*_jaccard`: Jaccard Index (IoU for multi-class)

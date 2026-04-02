@@ -2,7 +2,7 @@
 
 ## Overview
 
-`scripts/sample_tiles.py` generates balanced sets of geographic tiles for forest type classification model training and validation. It analyzes class distributions from GNN (Gradient Nearest Neighbor) data and selects a representative subset of tiles based on configurable balancing strategies.
+`scripts/sample_tiles.py` generates balanced sets of geographic tiles for forest type segmentation model training and validation. It analyzes class distributions from GNN (Gradient Nearest Neighbor) data and selects a representative subset of tiles based on configurable balancing strategies.
 
 This script is the first step in the ForestVision data pipeline, preceding data download and model training.
 

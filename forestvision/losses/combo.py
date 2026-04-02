@@ -19,7 +19,7 @@ class HomoscedasticUncertaintyLoss(nn.Module):
         Cipolla et al., "Multi-task Learning Using Uncertainty to Weigh Losses
         for Scene Geometry and Semantics", 2018.
 
-    For a classification task (softmax likelihood):
+    For a segmentation task (softmax likelihood):
         weighted_loss = (1 / σ²) * L + log σ
 
     For a regression task (Gaussian likelihood):
@@ -30,21 +30,21 @@ class HomoscedasticUncertaintyLoss(nn.Module):
         log σ = 0.5 * log_var
 
     Then:
-        - Classification weight = 1 / σ² = exp(-log_var)
+        - segmentation weight = 1 / σ² = exp(-log_var)
         - Regression weight   = 1 / (2 * σ²) = 0.5 * exp(-log_var)
         - Regularization term = log σ = 0.5 * log_var
 
     Args:
-        task_types: List of strings, each either 'classification' or 'regression',
+        task_types: List of strings, each either 'segmentation' or 'regression',
                     indicating the type of each task.
         init_log_vars: Initial value for log(σ²) of all tasks (default: 0.0).
-                       This gives initial weights ≈ 1 for classification and 0.5 for regression.
+                       This gives initial weights ≈ 1 for segmentation and 0.5 for regression.
         clamp_log_var: Optional tuple (min, max) to clamp log_var for stability.
                        If None, no clamping is applied.
 
     Example:
         >>> loss_wrapper = HomoscedasticUncertaintyLoss(
-        ...     task_types=['classification', 'regression', 'regression']
+        ...     task_types=['segmentation', 'regression', 'regression']
         ... )
         >>> class_loss = torch.tensor(1.2)   # cross-entropy loss
         >>> reg_loss1 = torch.tensor(0.8)    # MSE loss
@@ -55,7 +55,7 @@ class HomoscedasticUncertaintyLoss(nn.Module):
 
     def __init__(
         self,
-        task_types: List[Union[str, Literal['classification', 'regression']]],
+        task_types: List[Union[str, Literal['segmentation', 'regression']]],
         init_log_vars: float = 0.0,
         clamp_log_var: tuple = None
     ):
@@ -67,9 +67,9 @@ class HomoscedasticUncertaintyLoss(nn.Module):
         # Learnable log-variance parameters for each task: log(σ_i²)
         self.log_vars = nn.Parameter(torch.full((self.num_tasks,), init_log_vars))
 
-        # Precompute multipliers for each task: 1 for classification, 0.5 for regression
+        # Precompute multipliers for each task: 1 for segmentation, 0.5 for regression
         self.multipliers = torch.tensor([
-            1.0 if t == 'classification' else 0.5 for t in task_types
+            1.0 if t == 'segmentation' else 0.5 for t in task_types
         ])
 
     def forward(self, task_losses: List[torch.Tensor]) -> tuple[torch.Tensor, dict]:
@@ -98,7 +98,7 @@ class HomoscedasticUncertaintyLoss(nn.Module):
         # precision = exp(-log_var) = 1 / σ²
         precision = torch.exp(-log_vars)
 
-        # Apply task-type specific multiplier (1 for classification, 0.5 for regression)
+        # Apply task-type specific multiplier (1 for segmentation, 0.5 for regression)
         weighted_precision = self.multipliers.to(precision.device) * precision
 
         # Regularization term: log σ = 0.5 * log_var
@@ -127,7 +127,7 @@ class HomoscedasticUncertaintyLoss(nn.Module):
         """
         Return the current effective weight multipliers for each task.
         These are the values that directly multiply the raw loss:
-            classification: 1/σ²
+            segmentation: 1/σ²
             regression: 1/(2σ²)
         """
         with torch.no_grad():

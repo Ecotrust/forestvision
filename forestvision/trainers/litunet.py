@@ -451,7 +451,7 @@ class SegmentationUNet(BaseTask):
         self.validation_step_outputs = []
 
     def configure_models(self):
-        """Initialize the UNet model for classification."""
+        """Initialize the UNet model for segmentation."""
         self.model = UNet(
             in_channels=self.hparams["in_channels"],
             out_channels=self.hparams["num_classes"],
@@ -494,7 +494,7 @@ class SegmentationUNet(BaseTask):
             )
 
     def configure_metrics(self) -> None:
-        """Initialize the performance metrics for classification."""
+        """Initialize the performance metrics for segmentation."""
         metrics = MetricCollection(
             {
                 "accuracy": Accuracy(
@@ -545,7 +545,7 @@ class SegmentationUNet(BaseTask):
         }
 
     def training_step(self, batch, batch_idx):
-        """Training step for classification."""
+        """Training step for segmentation."""
         x, y = batch["image"], batch["mask"].long()
 
         # Sanitize target: remap all negative values to ignore_index
@@ -569,7 +569,7 @@ class SegmentationUNet(BaseTask):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step for classification."""
+        """Validation step for segmentation."""
         x, y = batch["image"], batch["mask"].long()
 
         # Sanitize target: remap all negative values to ignore_index
@@ -599,7 +599,7 @@ class SegmentationUNet(BaseTask):
         self.validation_step_outputs.append(batch)
 
     def test_step(self, batch, batch_idx):
-        """Test step for classification."""
+        """Test step for segmentation."""
         x, y = batch["image"], batch["mask"].long()
 
         # Sanitize target: remap all negative values to ignore_index
@@ -619,9 +619,9 @@ class SegmentationUNet(BaseTask):
 
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch."""
-        # Only compute confusion matrix if there are classification tasks
-        has_classification = any(t == "classification" for t in self.task_types)
-        if has_classification and hasattr(self, "confusion_matrix"):
+        # Only compute confusion matrix if there are segmentation tasks
+        has_segmentation = any(t == "segmentation" for t in self.task_types)
+        if has_segmentation and hasattr(self, "confusion_matrix"):
             # Compute confusion matrix
             confmat = self.confusion_matrix.compute()
             self.confusion_matrix.reset()
@@ -644,7 +644,7 @@ class SegmentationUNet(BaseTask):
         self.validation_step_outputs.clear()
 
     def plot_batch(self, batch, n=5, rgb_bands=[6, 2, 1]):
-        """Plot a sample of n images from batch for classification."""
+        """Plot a sample of n images from batch for segmentation."""
         plt.rcParams["savefig.bbox"] = "tight"
         plt.close("all")  # clear previous plots if any
 
@@ -930,13 +930,13 @@ class MultiTaskUNet(BaseTask):
     ):
         """Multi-task UNet for flexible task combinations.
 
-        Supports any mix of classification and regression tasks.
+        Supports any mix of segmentation and regression tasks.
 
         Args:
             in_channels: Number of input channels.
-            task_types: List of task types, e.g., ["classification", "regression"].
+            task_types: List of task types, e.g., ["segmentation", "regression"].
                 If None, inferred from num_seg_classes/num_reg_targets (deprecated).
-            num_classes_per_task: List of class counts per task. For classification,
+            num_classes_per_task: List of class counts per task. For segmentation,
                 this is the number of classes. For regression, this should be 1.
                 If None, inferred from num_seg_classes/num_reg_targets (deprecated).
             num_seg_classes: (Deprecated) Number of segmentation classes.
@@ -1080,13 +1080,13 @@ class MultiTaskUNet(BaseTask):
         # If neither format provided, use defaults
         if task_types is None and num_classes_per_task is None:
             if num_seg_classes is None and num_reg_targets is None:
-                # Default: single classification task with 14 classes
-                return ["classification"], [14]
+                # Default: single segmentation task with 14 classes
+                return ["segmentation"], [14]
             # Convert deprecated format
             task_types = []
             num_classes_per_task = []
             if num_seg_classes is not None and num_seg_classes > 0:
-                task_types.append("classification")
+                task_types.append("segmentation")
                 num_classes_per_task.append(num_seg_classes)
             if num_reg_targets is not None and num_reg_targets > 0:
                 task_types.extend(["regression"] * num_reg_targets)
@@ -1105,9 +1105,9 @@ class MultiTaskUNet(BaseTask):
         """Calculate total number of output channels needed."""
         return sum(self.num_classes_per_task)
 
-    def _get_classification_task_indices(self) -> list[int]:
-        """Get indices of classification tasks."""
-        return [i for i, t in enumerate(self.task_types) if t == "classification"]
+    def _get_segmentation_task_indices(self) -> list[int]:
+        """Get indices of segmentation tasks."""
+        return [i for i, t in enumerate(self.task_types) if t == "segmentation"]
 
     def _get_regression_task_indices(self) -> list[int]:
         """Get indices of regression tasks."""
@@ -1122,14 +1122,14 @@ class MultiTaskUNet(BaseTask):
         model_type = self.hparams.get("model", "MTUNet")
 
         # Calculate total channels needed for each head type
-        # seg_channels = sum of all classification task classes
+        # seg_channels = sum of all segmentation task classes
         # reg_channels = number of regression tasks (each has 1 channel)
         seg_channels = sum(
             num_classes
             for task_type, num_classes in zip(
                 self.task_types, self.num_classes_per_task
             )
-            if task_type == "classification"
+            if task_type == "segmentation"
         )
         reg_channels = sum(
             1 for task_type in self.task_types if task_type == "regression"
@@ -1231,9 +1231,9 @@ class MultiTaskUNet(BaseTask):
             task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
             task_target = y[:, task_idx]
 
-            if task_type == "classification":
-                # Classification loss using FocalLoss
-                # For classification, we still use exact match for ignore_index as it's usually small positive or -1
+            if task_type == "segmentation":
+                # Segmentation loss using FocalLoss
+                # For segmentation, we still use exact match for ignore_index as it's usually small positive or -1
                 loss = self.focal_loss(task_pred, task_target.long())
             else:  # regression
                 # Regression loss - handle single channel
@@ -1500,13 +1500,13 @@ class MultiTaskUNet(BaseTask):
 
     def configure_metrics(self) -> None:
         """Initialize metrics for all tasks dynamically."""
-        # Get the maximum number of classes for any classification task
+        # Get the maximum number of classes for any segmentation task
         max_num_classes = 0
         for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
-            if task_type == "classification" and num_classes > max_num_classes:
+            if task_type == "segmentation" and num_classes > max_num_classes:
                 max_num_classes = num_classes
 
-        # Classification metrics (shared across all classification tasks)
+        # Segmentation metrics (shared across all segmentation tasks)
         if max_num_classes > 0:
             seg_metrics = MetricCollection(
                 {
@@ -1532,7 +1532,7 @@ class MultiTaskUNet(BaseTask):
             self.seg_val_metrics = seg_metrics.clone(prefix="seg_val_")
             self.seg_test_metrics = seg_metrics.clone(prefix="seg_test_")
 
-            # Confusion matrix for validation epoch end (use first classification task)
+            # Confusion matrix for validation epoch end (use first segmentation task)
             self.confusion_matrix = ConfusionMatrix(
                 task="multiclass",
                 num_classes=max_num_classes,
@@ -1618,8 +1618,8 @@ class MultiTaskUNet(BaseTask):
         ignore_idx = self.hparams.get("ignore_index")
 
         # Get metric collections based on stage
-        # Segmentation metrics only exist if there are classification tasks
-        has_classification = any(t == "classification" for t in self.task_types)
+        # Segmentation metrics only exist if there are segmentation tasks
+        has_segmentation = any(t == "segmentation" for t in self.task_types)
         if stage == "train":
             seg_metrics = getattr(self, "seg_train_metrics", None)
             reg_metrics = self.reg_train_metrics
@@ -1638,8 +1638,8 @@ class MultiTaskUNet(BaseTask):
             task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
             task_target = y[:, task_idx]
 
-            if task_type == "classification":
-                # Classification metrics
+            if task_type == "segmentation":
+                # Segmentation metrics
                 probs = task_pred.softmax(dim=1)
                 pred = torch.argmax(probs, dim=1)
 
@@ -1691,11 +1691,11 @@ class MultiTaskUNet(BaseTask):
         self._compute_and_log_metrics(y_hat, y, "val")
 
         # Convert y_hat from raw output [B, total_channels, H, W] to task format [B, num_tasks, H, W]
-        # for visualization. For classification, take argmax. For regression, keep single channel.
+        # for visualization. For segmentation, take argmax. For regression, keep single channel.
         y_hat_tasks = []
         channel_offset = 0
         for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
-            if task_type == "classification":
+            if task_type == "segmentation":
                 # Take argmax to get class predictions [B, H, W] -> [B, 1, H, W]
                 task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
                 pred_classes = torch.argmax(task_pred, dim=1, keepdim=True)
@@ -1730,12 +1730,12 @@ class MultiTaskUNet(BaseTask):
         # Compute metrics for each task
         self._compute_and_log_metrics(y_hat, y, "test")
 
-        # Update confusion matrix for classification tasks
-        has_classification = any(t == "classification" for t in self.task_types)
-        if has_classification and hasattr(self, "confusion_matrix"):
+        # Update confusion matrix for segmentation tasks
+        has_segmentation = any(t == "segmentation" for t in self.task_types)
+        if has_segmentation and hasattr(self, "confusion_matrix"):
             channel_offset = 0
             for task_idx, (task_type, num_classes) in enumerate(zip(self.task_types, self.num_classes_per_task)):
-                if task_type == "classification":
+                if task_type == "segmentation":
                     task_pred = y_hat[:, channel_offset:channel_offset + num_classes]
                     pred = torch.argmax(task_pred.softmax(dim=1), dim=1)
                     task_target = y[:, task_idx]
@@ -1743,11 +1743,11 @@ class MultiTaskUNet(BaseTask):
                 channel_offset += num_classes
 
         # Convert y_hat from raw output [B, total_channels, H, W] to task format [B, num_tasks, H, W]
-        # for visualization. For classification, take argmax. For regression, keep single channel.
+        # for visualization. For segmentation, take argmax. For regression, keep single channel.
         y_hat_tasks = []
         channel_offset = 0
         for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
-            if task_type == "classification":
+            if task_type == "segmentation":
                 # Take argmax to get class predictions [B, H, W] -> [B, 1, H, W]
                 task_pred = y_hat[:, channel_offset : channel_offset + num_classes]
                 pred_classes = torch.argmax(task_pred, dim=1, keepdim=True)
@@ -1765,9 +1765,9 @@ class MultiTaskUNet(BaseTask):
 
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch."""
-        # Only compute confusion matrix if there are classification tasks
-        has_classification = any(t == "classification" for t in self.task_types)
-        if has_classification and hasattr(self, "confusion_matrix"):
+        # Only compute confusion matrix if there are segmentation tasks
+        has_segmentation = any(t == "segmentation" for t in self.task_types)
+        if has_segmentation and hasattr(self, "confusion_matrix"):
             # Compute confusion matrix
             confmat = self.confusion_matrix.compute()
             self.confusion_matrix.reset()
@@ -1798,9 +1798,9 @@ class MultiTaskUNet(BaseTask):
 
     def on_test_epoch_end(self):
         """Called at the end of test epoch."""
-        # Only compute confusion matrix if there are classification tasks
-        has_classification = any(t == "classification" for t in self.task_types)
-        if has_classification and hasattr(self, "confusion_matrix"):
+        # Only compute confusion matrix if there are segmentation tasks
+        has_segmentation = any(t == "segmentation" for t in self.task_types)
+        if has_segmentation and hasattr(self, "confusion_matrix"):
             # Compute confusion matrix
             confmat = self.confusion_matrix.compute()
             self.confusion_matrix.reset()
@@ -1866,7 +1866,7 @@ class MultiTaskUNet(BaseTask):
             m, s = m[:num_c].clone(), s[:num_c].clone()
             if is_target:
                 for i, t in enumerate(self.task_types):
-                    if t == "classification" and i < len(m):
+                    if t == "segmentation" and i < len(m):
                         m[i], s[i] = 0.0, 1.0
             view_shape = [1] * tensor.ndim
             view_shape[1] = num_c
@@ -1983,7 +1983,7 @@ class MultiTaskUNet(BaseTask):
             m, s = m[:num_c].clone(), s[:num_c].clone()
             if is_target:
                 for i, t in enumerate(self.task_types):
-                    if t == "classification" and i < len(m):
+                    if t == "segmentation" and i < len(m):
                         m[i], s[i] = 0.0, 1.0
             view_shape = [1] * tensor.ndim
             view_shape[1] = num_c
@@ -2062,7 +2062,7 @@ class MultiTaskUNet(BaseTask):
 
         Returns:
             torch.Tensor: Output tensor with task-specific activations applied.
-                Classification tasks: Raw logits (softmax applied in loss).
+                Segmentation tasks: Raw logits (softmax applied in loss).
                 Regression tasks: Tanh activation (if use_reg_tanh=True) or raw values.
         """
         # Get model output - model returns tuple of (seg_logits, reg_out)
@@ -2076,7 +2076,7 @@ class MultiTaskUNet(BaseTask):
         reg_channels_used = 0
 
         for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
-            if task_type == "classification":
+            if task_type == "segmentation":
                 # Take from segmentation logits
                 task_output = seg_logits[
                     :, seg_channels_used : seg_channels_used + num_classes
@@ -2102,7 +2102,7 @@ class MultiTaskUNet(BaseTask):
         """Prediction step for multi-task inference.
 
         Converts model logits/outputs to task-specific predictions:
-        - Classification: argmax over logits to get class predictions
+        - Segmentation: argmax over logits to get class predictions
         - Regression: raw values (or tanh activated if configured)
 
         Args:
@@ -2127,7 +2127,7 @@ class MultiTaskUNet(BaseTask):
         for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
             task_output = y_hat[:, channel_offset : channel_offset + num_classes]
 
-            if task_type == "classification":
+            if task_type == "segmentation":
                 # Apply softmax + argmax to get class predictions
                 probs = task_output.softmax(dim=1)
                 pred = torch.argmax(probs, dim=1, keepdim=True)  # [B, 1, H, W]
@@ -2154,24 +2154,24 @@ class MultiTaskUNet(BaseTask):
             y_hat: Model output tensor of shape [B, total_channels, H, W].
 
         Returns:
-            Tuple of (classification_outputs, regression_outputs) where each is
+            Tuple of (segmentation_outputs, regression_outputs) where each is
             a list of tensors, one per task of that type.
         """
-        classification_outputs = []
+        segmentation_outputs = []
         regression_outputs = []
         channel_offset = 0
 
         for task_type, num_classes in zip(self.task_types, self.num_classes_per_task):
             task_output = y_hat[:, channel_offset : channel_offset + num_classes]
 
-            if task_type == "classification":
-                classification_outputs.append(task_output)
+            if task_type == "segmentation":
+                segmentation_outputs.append(task_output)
             else:  # regression
                 regression_outputs.append(task_output)
 
             channel_offset += num_classes
 
-        return classification_outputs, regression_outputs
+        return segmentation_outputs, regression_outputs
 
     def _plot_input_row(self, axs_row, x, rgb_bands, ignore_idx):
         """Plot input image row."""
@@ -2399,7 +2399,7 @@ class MultiTaskUNet(BaseTask):
     def plot_batch(self, batch, n=10, rgb_bands=[2, 1, 0], max_null_ratio=0.7):
         """Plot a sample of n images from batch for multi-task models.
 
-        Works for any combination of classification and regression tasks.
+        Works for any combination of segmentation and regression tasks.
         Layout: 1 row (input) + 2 rows per task (target + prediction).
         """
         plt.rcParams["savefig.bbox"] = "tight"
@@ -2433,7 +2433,7 @@ class MultiTaskUNet(BaseTask):
             m, s = m[:num_c].clone(), s[:num_c].clone()
             if is_target:
                 for i, t in enumerate(self.task_types):
-                    if t == "classification" and i < len(m):
+                    if t == "segmentation" and i < len(m):
                         m[i], s[i] = 0.0, 1.0
             view_shape = [1] * tensor.ndim
             view_shape[-3] = num_c
@@ -2510,7 +2510,7 @@ class MultiTaskUNet(BaseTask):
                 title_t = f"{band_name}_true"
                 title_p = f"{band_name}_pred"
 
-                if task_type == "classification":
+                if task_type == "segmentation":
                     self._plot_segmentation(
                         axs[row_target, col_idx],
                         y_plot[col_idx, task_idx],

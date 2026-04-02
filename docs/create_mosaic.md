@@ -34,7 +34,7 @@ gdalwarp -of COG -r average -co COMPRESS=DEFLATE ... input1.tif input2.tif outpu
 
 **Resampling by Task Type**:
 - **Regression tasks** (cancov, qmd_dom, ba_ge_3): Uses `average` resampling for smooth transitions
-- **Classification** (fortypba): Uses `mode` resampling to preserve discrete class values
+- **Segmentation** (fortypba): Uses `mode` resampling to preserve discrete class values
 
 **Advantages**:
 - Fastest method for most use cases
@@ -120,7 +120,7 @@ The script supports these MultiTaskUNet outputs:
 | `cancov` | Regression | Canopy cover percentage |
 | `qmd_dom` | Regression | Quadratic mean diameter |
 | `ba_ge_3` | Regression | Basal area >= 3 inches |
-| `fortypba` | Classification | Forest type classification |
+| `fortypba` | Segmentation | Forest type segmentation |
 
 ## Usage Examples
 
@@ -211,9 +211,9 @@ All outputs are **Cloud-Optimized GeoTIFFs (COG)** with:
 | Format | COG (Cloud-Optimized GeoTIFF) |
 | Compression | DEFLATE (configurable) |
 | Tiling | 512x512 pixels |
-| Overviews | Automatic (nearest for classification, bilinear for regression) |
+| Overviews | Automatic (nearest for segmentation, bilinear for regression) |
 | NoData | Preserved from input tiles |
-| Data Type | Float32 (regression), UInt8 (classification) |
+| Data Type | Float32 (regression), UInt8 (segmentation) |
 
 ## Algorithm Details
 
